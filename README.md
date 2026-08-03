@@ -4,25 +4,31 @@ A tiny, single-file toy compiler that translates a C / small-C++ subset into
 x86_64 assembly. The whole compiler lives in **`simpleC++.c`** and builds with a
 stock GCC — no third-party libraries.
 
+It now compiles the bundled **`test.c`** all the way through to a running program.
+
 ---
 
-## Build (quick start)
+## Requirements
 
-### Requirements
-- A recent GCC with a hosted C library. Verified with:
+A recent GCC with a hosted C library, plus the standard binutils (`as`, `ld`,
+which come with GCC). Verified with:
 
-  ```
-  gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0
-  ```
+```
+gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0
+```
 
-- On a fresh Debian/Ubuntu machine, that is the only package you need:
+On a fresh Debian/Ubuntu machine that is the only package you need:
 
-  ```sh
-  sudo apt-get update
-  sudo apt-get install -y build-essential      # gcc + make
-  # optional, only if you want the CMake path:
-  sudo apt-get install -y cmake
-  ```
+```sh
+sudo apt-get update
+sudo apt-get install -y build-essential      # gcc + make + binutils
+# optional, only if you want the CMake path:
+sudo apt-get install -y cmake
+```
+
+---
+
+## Build the compiler
 
 ### Option A — Makefile (recommended)
 
@@ -48,60 +54,93 @@ Both paths compile **cleanly with zero warnings and zero errors**, even under
 
 ---
 
-## Run it
+## Run the compiler on `test.c` (full end-to-end demo)
 
-`nano_cc` takes a C source file and writes an x86_64 assembly file:
+One command does everything — compile `test.c` with `nano_cc`, assemble + link
+the result into a freestanding binary, and run it:
 
 ```sh
-./nano_cc <input.c> <output.s>
+make test
 ```
 
-A ready-made sample is included:
+Expected output:
+
+```
+./nano_cc test.c test.s
+Compiled test.c -> test.s
+cc -nostdlib -no-pie test.s -o test_prog
+---- ./test_prog output ----
+Hello from bare-metal nolibc!
+142
+3
+```
+
+(The `3` is the file descriptor returned by `open("/dev/null", 0)` — it can vary,
+but on a normal shell it is 3.)
+
+### Doing it by hand
 
 ```sh
-make run                 # compiles sample.c -> sample.s and prints the result
-# or manually:
+./nano_cc test.c test.s                       # nano_cc: C subset  -> x86_64 asm
+gcc -nostdlib -no-pie test.s -o test_prog      # GNU as + ld: asm -> freestanding ELF
+./test_prog                                    # run it
+```
+
+`nano_cc` emits GNU-assembler Intel syntax (`.intel_syntax noprefix`). The
+program is freestanding (talks to the kernel via raw `syscall`s from
+`nano-nolibc.h`), so it links with `-nostdlib -no-pie` and needs no libc.
+
+You can also compile your own small programs, e.g. the included `sample.c`:
+
+```sh
 ./nano_cc sample.c sample.s
+gcc -nostdlib -no-pie sample.s -o sample_prog
+./sample_prog; echo $?      # -> 5
 ```
-
-Expected console output:
-
-```
-Compiled sample.c -> sample.s
-```
-
-`sample.s` will contain the generated assembly for `add()` / `main()`.
 
 ---
 
-## What I changed (minimal source tweaks)
+## What the compiler supports
 
-The upstream source did **not** compile. The changes were kept as small as possible:
+Enough of C to compile `nano-nolibc.h` + `test.c`:
 
-1. **Fixed a conflicting declaration.** `parse_decl` was forward-declared as
-   `Type* parse_decl();` but defined as `void parse_decl()`. GCC rejects this as
-   a hard error. The prototype now matches the definition (`void`).
-2. **Removed unused variables** (`val`, `arg_idx`, `p`, `idx`, `param_count`)
-   that tripped `-Wall -Wextra`.
-3. **Silenced `-Wstringop-truncation`** (which fires at `-O2`) by replacing the
-   two `strncpy(dst, name, 63)` calls into fixed 64-byte buffers with the
-   guaranteed-terminated `snprintf(dst, sizeof(dst), "%s", name)`.
-4. **Fixed a parser bug** in `parse_assign`: the "not an assignment" rewind path
-   re-read the identifier from the wrong offset and produced an empty name,
-   which caused blank `call` / `lea [rip + ]` in the output. It now restores the
-   identifier correctly, so calls and variable references resolve.
+- **Preprocessor:** `#include "..."`, object-like `#define`, `#ifndef` /
+  `#ifdef` / `#else` / `#endif` include guards, `//` and `/* */` comments.
+- **Types:** `int`, `long`, `char`, `void`, pointers, `char` arrays, and the
+  `const` / `unsigned` / `static` / `inline` qualifiers (parsed and ignored).
+- **Expressions:** `+ - * / %`, `< > <= >= == !=`, `&& ||`, unary `- ! * &`,
+  postfix `++` / `--`, casts, function calls, array indexing `a[i]`, assignment
+  and compound assignment (`+= -= *= /= %=`), string/char literals with escapes.
+- **Statements:** `if/else`, `while`, `return`, blocks, and `__asm__("...")`
+  pass-through inline assembly.
+- **Codegen:** x86_64 System V, values in `rax`, up to 6 register arguments,
+  a freestanding `_start` that calls `main` and exits with its return value.
+
+---
+
+## Changes I made to the original repo
+
+The upstream repo **did not compile**, and once it did the bundled `test.c` was
+well beyond what the original parser could handle. Summary:
+
+1. **Build fixes** on the original single-pass compiler (mismatched `parse_decl`
+   prototype, unused variables, `strncpy` truncation warnings, a broken
+   identifier-rewind in `parse_assign`).
+2. **Rebuilt the compiler around a small AST** (still one file, `simpleC++.c`) so
+   it can actually parse and correctly generate code for the constructs `test.c`
+   and `nano-nolibc.h` use — general lvalues (`*p`, `a[i]`), pointer arithmetic,
+   postfix `++/--`, `&&`/`||`, casts, `long`, arrays, char/string escapes,
+   comma-declarations, and a real (if minimal) preprocessor.
+3. **Made the emitted assembly assemble & link** with GNU `as`/`ld`
+   (`.intel_syntax noprefix`, `.zero` for `.bss`) and added a freestanding
+   `_start`.
+4. **One small tweak to `nano-nolibc.h`:** the inline-asm syscall trampoline now
+   addresses its globals RIP-relative (`mov rax, [rip + _n]` instead of
+   `mov rax, _n`) so the generated code assembles and the syscalls actually fire.
+   That is the only change to the header; all the C in it is untouched.
 
 Added build/support files: `Makefile`, `CMakeLists.txt`, `sample.c`.
 
----
-
-## Note on the generated assembly (out of scope)
-
-The build task above is complete: the compiler compiles cleanly and runs. Worth
-being upfront, though — the assembly `nano_cc` *emits* uses Intel-syntax mnemonics
-plus a couple of NASM-style directives (e.g. `resb`), so it is not a drop-in for
-GNU `as` without a `.intel_syntax noprefix` prologue and directive tweaks, and the
-toy code generator still has rough edges (e.g. a simplistic local-vs-global rule).
-Fixing the code generator so the output assembles and links end-to-end is a
-larger, separate piece of work — happy to take that on if you'd like, just let me
-know.
+Verified on GCC 13.3.0: clean build (`-Wall -Wextra -pedantic`, both `-O0` and
+`-O2`), and `make test` compiles → assembles → links → runs `test.c` with the
+output shown above.
