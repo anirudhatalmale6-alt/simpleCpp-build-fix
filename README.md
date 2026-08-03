@@ -1,4 +1,8 @@
-# simpleC-
+# simpleC++
+
+gcc -o nano_cc nano_cc.c          # build the compiler
+./nano_cc kernel.c kernel.s       # compile your kernel
+gcc -nostdlib -T linker.ld kernel.s -o kernel.elf   # link for bare metal
 
 
 Feature,Status
