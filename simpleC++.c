@@ -234,7 +234,7 @@ Type* new_type(int ty) {
 }
 Sym* new_sym(const char *name, Type *type) {
     Sym *s = calloc(1, sizeof(Sym));
-    strncpy(s->name, name, 63);
+    snprintf(s->name, sizeof(s->name), "%s", name);
     s->type = type;
     return s;
 }
@@ -265,7 +265,7 @@ Type* parse_primary();
 void  parse_stmt();
 void  parse_block();
 Type* parse_decl_or_stmt();
-Type* parse_decl();
+void  parse_decl();
 Type* parse_struct_def();
 
 // =====================================================================
@@ -475,19 +475,20 @@ Type* parse_assign() {
             Sym *s = find_sym(name, locals);
             if (!s) s = find_sym(name, globals);
             if (!s) error("Assignment to undeclared variable");
-            Type *val = parse_assign();
+            parse_assign();
             if (s->is_global) emit("    lea rcx, [rip + %s]", name);
             else              emit("    lea rcx, [rbp - %d]", s->offset);
             emit("    mov [rcx], rax");
             return s->type;
         }
-        // Not an assignment — rewind and parse as normal expression
+        // Not an assignment — rewind and parse as a normal expression.
+        // saved_pos already points just past the identifier, so restore the
+        // lexer position/token and put the identifier text back into `id`
+        // (the intervening next() only read a punctuation token, which does
+        // not touch `id`, but we restore it explicitly to be safe).
         pos = saved_pos;
         tok = saved_tok;
-        // Re-read the identifier
-        int i = 0;
-        while (pos < src_len && (isalnum(src[pos]) || src[pos] == '_')) id[i++] = src[pos++];
-        id[i] = 0;
+        strcpy(id, name);
     }
     return parse_eq();
 }
@@ -584,7 +585,7 @@ Type* parse_struct_def() {
     next(); // consume 'struct' or 'class'
     char name[64]; strcpy(name, id); expect(T_ID);
     Type *st = new_type(TY_STRUCT);
-    strncpy(st->name, name, 63);
+    snprintf(st->name, sizeof(st->name), "%s", name);
     st->size = 0;
     Sym *tail = NULL;
     expect(T_LC);
@@ -653,7 +654,6 @@ void parse_decl() {
         locals = NULL; local_offset = 0;
 
         const char *regs[] = {"rdi","rsi","rdx","rcx","r8","r9"};
-        int arg_idx = 0;
         while (tok != T_RP) {
             Type *pt = int_type;
             if (tok == T_CHAR)      { pt = char_type; next(); }
@@ -667,15 +667,9 @@ void parse_decl() {
         }
         expect(T_RP);
 
-        // Assign offsets to parameters (they arrive in regs, we store on stack)
-        // Walk locals list (it's reversed), assign offsets
-        Sym *p = locals;
-        int idx = 0;
-        // Since locals is a reversed list, we need to re-reverse or just assign
-        // Simpler: re-walk in reverse by counting
-        int param_count = 0;
-        for (Sym *q = locals; q; q = q->next) param_count++;
-        // Assign offsets in reverse order of the list (which is forward order of params)
+        // Assign offsets to parameters (they arrive in regs, we store on stack).
+        // locals is a reversed list; collect into an array so we can assign
+        // offsets in forward (parameter) order.
         Sym *arr[16]; int ai = 0;
         for (Sym *q = locals; q; q = q->next) arr[ai++] = q;
         for (int i = ai - 1; i >= 0; i--) {
