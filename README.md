@@ -90,6 +90,13 @@ gcc -nostdlib -no-pie test.s -o test_prog      # GNU as + ld: asm -> freestandin
 program is freestanding (talks to the kernel via raw `syscall`s from
 `nano-nolibc.h`), so it links with `-nostdlib -no-pie` and needs no libc.
 
+There is also a control-flow / operator feature demo (`for`, `do/while`,
+`break`, `continue`, prefix `++/--`, ternary `?:`):
+
+```sh
+make demo
+```
+
 You can also compile your own small programs, e.g. the included `sample.c`:
 
 ```sh
@@ -109,10 +116,11 @@ Enough of C to compile `nano-nolibc.h` + `test.c`:
 - **Types:** `int`, `long`, `char`, `void`, pointers, `char` arrays, and the
   `const` / `unsigned` / `static` / `inline` qualifiers (parsed and ignored).
 - **Expressions:** `+ - * / %`, `< > <= >= == !=`, `&& ||`, unary `- ! * &`,
-  postfix `++` / `--`, casts, function calls, array indexing `a[i]`, assignment
-  and compound assignment (`+= -= *= /= %=`), string/char literals with escapes.
-- **Statements:** `if/else`, `while`, `return`, blocks, and `__asm__("...")`
-  pass-through inline assembly.
+  prefix and postfix `++` / `--`, the ternary `?:` operator, casts, function
+  calls, array indexing `a[i]`, assignment and compound assignment
+  (`+= -= *= /= %=`), string/char literals with escapes.
+- **Statements:** `if/else`, `while`, `for`, `do/while`, `break`, `continue`,
+  `return`, blocks, and `__asm__("...")` pass-through inline assembly.
 - **Codegen:** x86_64 System V, values in `rax`, up to 6 register arguments,
   a freestanding `_start` that calls `main` and exits with its return value.
 
