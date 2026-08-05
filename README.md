@@ -90,11 +90,11 @@ gcc -nostdlib -no-pie test.s -o test_prog      # GNU as + ld: asm -> freestandin
 program is freestanding (talks to the kernel via raw `syscall`s from
 `nano-nolibc.h`), so it links with `-nostdlib -no-pie` and needs no libc.
 
-There is also a control-flow / operator feature demo (`for`, `do/while`,
-`break`, `continue`, prefix `++/--`, ternary `?:`):
+There are also two feature demos:
 
 ```sh
-make demo
+make demo        # for, do/while, break, continue, prefix ++/--, ternary ?:
+make structs     # struct/union, member access . and ->, sizeof, string return
 ```
 
 You can also compile your own small programs, e.g. the included `sample.c`:
@@ -113,12 +113,15 @@ Enough of C to compile `nano-nolibc.h` + `test.c`:
 
 - **Preprocessor:** `#include "..."`, object-like `#define`, `#ifndef` /
   `#ifdef` / `#else` / `#endif` include guards, `//` and `/* */` comments.
-- **Types:** `int`, `long`, `char`, `void`, pointers, `char` arrays, and the
-  `const` / `unsigned` / `static` / `inline` qualifiers (parsed and ignored).
+- **Types:** `int`, `long`, `char`, `void`, pointers, arrays (of any element
+  type), `struct` and `union`, and the `const` / `unsigned` / `static` /
+  `inline` qualifiers (parsed and ignored). *(Note: `int` and `long` are both
+  64-bit internally for now — a real 32-bit `int` is a planned next step.)*
 - **Expressions:** `+ - * / %`, `< > <= >= == !=`, `&& ||`, unary `- ! * &`,
-  prefix and postfix `++` / `--`, the ternary `?:` operator, casts, function
-  calls, array indexing `a[i]`, assignment and compound assignment
-  (`+= -= *= /= %=`), string/char literals with escapes.
+  prefix and postfix `++` / `--`, the ternary `?:` operator, `sizeof`, casts,
+  function calls (including functions that return pointers/strings), array
+  indexing `a[i]`, struct member access `.` and `->`, assignment and compound
+  assignment (`+= -= *= /= %=`), string/char literals with escapes.
 - **Statements:** `if/else`, `while`, `for`, `do/while`, `break`, `continue`,
   `return`, blocks, and `__asm__("...")` pass-through inline assembly.
 - **Codegen:** x86_64 System V, values in `rax`, up to 6 register arguments,
