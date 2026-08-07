@@ -13,7 +13,7 @@ CFLAGS   ?= -std=c11 -O2 -Wall -Wextra
 SRC       = simpleC++.c
 BIN       = nano_cc
 
-.PHONY: all run test demo structs bitwise clean
+.PHONY: all run test demo structs bitwise printf clean
 
 all: $(BIN)
 
@@ -56,7 +56,14 @@ bitwise: $(BIN)
 	@echo "---- ./bitwise_prog output ----"
 	@./bitwise_prog
 
+# variadic functions -> a real printf() written in nano-nolibc.h.
+printf: $(BIN)
+	./$(BIN) printf.c printf.s
+	$(CC) -nostdlib -no-pie printf.s -o printf_prog
+	@echo "---- ./printf_prog output ----"
+	@./printf_prog
+
 clean:
 	rm -f $(BIN) sample.s sample_prog test.s test_prog \
 	      features.s features_prog structs.s structs_prog \
-	      bitwise.s bitwise_prog
+	      bitwise.s bitwise_prog printf.s printf_prog

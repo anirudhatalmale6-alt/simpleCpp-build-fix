@@ -100,6 +100,7 @@ There are also two feature demos:
 make demo        # for, do/while, break, continue, prefix ++/--, ternary ?:
 make structs     # struct/union, member access . and ->, sizeof, string return
 make bitwise     # bitwise & | ^ ~ << >> and function-like #define macros
+make printf      # variadic functions -> a real printf() (%d %x %c %s %%)
 ```
 
 You can also compile your own small programs, e.g. the included `sample.c`:
@@ -131,6 +132,9 @@ Enough of C to compile `nano-nolibc.h` + `test.c`:
   (including functions that return pointers/strings), array indexing `a[i]`,
   struct member access `.` and `->`, assignment and compound assignment
   (`+= -= *= /= %=`), string/char literals with escapes.
+- **Variadic functions:** `type f(args, ...)` with `__builtin_va_start` /
+  `__builtin_va_arg` / `__builtin_va_end` (wrapped as `va_start`/`va_arg`/
+  `va_end`), enough to write a real `printf()` — see `printf.c`.
 - **Statements:** `if/else`, `while`, `for`, `do/while`, `break`, `continue`,
   `return`, blocks, and `__asm__("...")` pass-through inline assembly.
 - **Codegen:** x86_64 System V, values in `rax`, up to 6 register arguments,

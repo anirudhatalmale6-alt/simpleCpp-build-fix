@@ -9,6 +9,7 @@ build/
 /features.s
 /structs.s
 /bitwise.s
+/printf.s
 
 # kernel build artifacts (boot32.s / boot64.s / blob.s are SOURCES — keep them)
 kernel/shell.s
@@ -16,4 +17,5 @@ kernel/kernel64.elf
 kernel/kernel64.bin
 kernel/kernel.elf
 kernel/serial.log
+kernel/serial.clean
 kernel/vga.ppm
