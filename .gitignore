@@ -1,4 +1,5 @@
 nano_cc
 build/
-sample.s
 *.o
+*.s
+*_prog

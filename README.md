@@ -95,6 +95,7 @@ There are also two feature demos:
 ```sh
 make demo        # for, do/while, break, continue, prefix ++/--, ternary ?:
 make structs     # struct/union, member access . and ->, sizeof, string return
+make bitwise     # bitwise & | ^ ~ << >> and function-like #define macros
 ```
 
 You can also compile your own small programs, e.g. the included `sample.c`:
@@ -111,17 +112,21 @@ gcc -nostdlib -no-pie sample.s -o sample_prog
 
 Enough of C to compile `nano-nolibc.h` + `test.c`:
 
-- **Preprocessor:** `#include "..."`, object-like `#define`, `#ifndef` /
-  `#ifdef` / `#else` / `#endif` include guards, `//` and `/* */` comments.
+- **Preprocessor:** `#include "..."`, object-like `#define`, **function-like
+  `#define` macros** (e.g. `#define MAX(a,b) ((a)>(b)?(a):(b))` — argument
+  substitution with nested-paren handling), `#ifndef` / `#ifdef` / `#else` /
+  `#endif` include guards, `//` and `/* */` comments.
 - **Types:** `int`, `long`, `char`, `void`, pointers, arrays (of any element
   type), `struct` and `union`, and the `const` / `unsigned` / `static` /
-  `inline` qualifiers (parsed and ignored). *(Note: `int` and `long` are both
+  `inline` / `extern` qualifiers (parsed and ignored). Function prototypes /
+  `extern` declarations (`char getc();`) are accepted. *(Note: `int` and `long` are both
   64-bit internally for now — a real 32-bit `int` is a planned next step.)*
-- **Expressions:** `+ - * / %`, `< > <= >= == !=`, `&& ||`, unary `- ! * &`,
-  prefix and postfix `++` / `--`, the ternary `?:` operator, `sizeof`, casts,
-  function calls (including functions that return pointers/strings), array
-  indexing `a[i]`, struct member access `.` and `->`, assignment and compound
-  assignment (`+= -= *= /= %=`), string/char literals with escapes.
+- **Expressions:** `+ - * / %`, `< > <= >= == !=`, `&& ||`, **bitwise
+  `& | ^ ~ << >>`** (full C precedence), unary `- ! ~ * &`, prefix and postfix
+  `++` / `--`, the ternary `?:` operator, `sizeof`, casts, function calls
+  (including functions that return pointers/strings), array indexing `a[i]`,
+  struct member access `.` and `->`, assignment and compound assignment
+  (`+= -= *= /= %=`), string/char literals with escapes.
 - **Statements:** `if/else`, `while`, `for`, `do/while`, `break`, `continue`,
   `return`, blocks, and `__asm__("...")` pass-through inline assembly.
 - **Codegen:** x86_64 System V, values in `rax`, up to 6 register arguments,

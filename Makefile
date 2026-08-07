@@ -13,7 +13,7 @@ CFLAGS   ?= -std=c11 -O2 -Wall -Wextra
 SRC       = simpleC++.c
 BIN       = nano_cc
 
-.PHONY: all run test demo structs clean
+.PHONY: all run test demo structs bitwise clean
 
 all: $(BIN)
 
@@ -49,6 +49,14 @@ structs: $(BIN)
 	@echo "---- ./structs_prog output ----"
 	@./structs_prog
 
+# bitwise operators + function-like macro demo.
+bitwise: $(BIN)
+	./$(BIN) bitwise.c bitwise.s
+	$(CC) -nostdlib -no-pie bitwise.s -o bitwise_prog
+	@echo "---- ./bitwise_prog output ----"
+	@./bitwise_prog
+
 clean:
 	rm -f $(BIN) sample.s sample_prog test.s test_prog \
-	      features.s features_prog structs.s structs_prog
+	      features.s features_prog structs.s structs_prog \
+	      bitwise.s bitwise_prog
