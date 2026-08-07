@@ -6,6 +6,10 @@ stock GCC — no third-party libraries.
 
 It now compiles the bundled **`test.c`** all the way through to a running program.
 
+It can even boot **bare metal**: `kernel/` builds a tiny interactive shell —
+compiled by `nano_cc` itself — that runs in 64-bit long mode under QEMU and
+reads a real PS/2 keyboard. See [`kernel/README.md`](kernel/README.md).
+
 ---
 
 ## Requirements

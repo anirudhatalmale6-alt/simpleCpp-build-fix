@@ -1,5 +1,19 @@
 nano_cc
 build/
 *.o
-*.s
 *_prog
+
+# generated assembly from the top-level demos
+/sample.s
+/test.s
+/features.s
+/structs.s
+/bitwise.s
+
+# kernel build artifacts (boot32.s / boot64.s / blob.s are SOURCES — keep them)
+kernel/shell.s
+kernel/kernel64.elf
+kernel/kernel64.bin
+kernel/kernel.elf
+kernel/serial.log
+kernel/vga.ppm
