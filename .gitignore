@@ -10,6 +10,7 @@ build/
 /structs.s
 /bitwise.s
 /printf.s
+/switch.s
 
 # kernel build artifacts (boot32.s / boot64.s / blob.s are SOURCES — keep them)
 kernel/shell.s

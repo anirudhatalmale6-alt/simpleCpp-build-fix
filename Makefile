@@ -13,7 +13,7 @@ CFLAGS   ?= -std=c11 -O2 -Wall -Wextra
 SRC       = simpleC++.c
 BIN       = nano_cc
 
-.PHONY: all run test demo structs bitwise printf clean
+.PHONY: all run test demo structs bitwise printf switch clean
 
 all: $(BIN)
 
@@ -63,7 +63,15 @@ printf: $(BIN)
 	@echo "---- ./printf_prog output ----"
 	@./printf_prog
 
+# switch / case / default (dispatch, fall-through, break, nested, in a loop).
+switch: $(BIN)
+	./$(BIN) switch.c switch.s
+	$(CC) -nostdlib -no-pie switch.s -o switch_prog
+	@echo "---- ./switch_prog output ----"
+	@./switch_prog
+
 clean:
 	rm -f $(BIN) sample.s sample_prog test.s test_prog \
 	      features.s features_prog structs.s structs_prog \
-	      bitwise.s bitwise_prog printf.s printf_prog
+	      bitwise.s bitwise_prog printf.s printf_prog \
+	      switch.s switch_prog
