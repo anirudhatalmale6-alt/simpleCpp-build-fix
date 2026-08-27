@@ -12,6 +12,20 @@
 extern int  inb(int port);
 extern void outb(int port, int val);
 
+// ---------- reading physical memory a field at a time ----------
+// Everything below 4 GiB is identity-mapped, so a physical address can be
+// dereferenced directly. These exist because nano_cc has no 16- or 32-bit
+// integer type: firmware tables are laid out in 1, 2, 4 and 8-byte fields and
+// the only way to read them correctly is a byte at a time.
+long mem8(long addr) {
+    char *p;
+    p = (char *)addr;
+    return p[0] & 255;
+}
+long mem16(long addr) { return mem8(addr) | (mem8(addr + 1) << 8); }
+long mem32(long addr) { return mem16(addr) | (mem16(addr + 2) << 16); }
+long mem64(long addr) { return mem32(addr) | (mem32(addr + 4) << 32); }
+
 // ---------- VGA text mode: 80x25 cells at physical 0xB8000 ----------
 int vga_row;
 int vga_col;

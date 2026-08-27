@@ -18,15 +18,7 @@
 #ifndef NANO_ACPI_H
 #define NANO_ACPI_H
 
-// ---------- little helpers for reading physical memory ----------
-long mem8(long addr) {
-    char *p;
-    p = (char *)addr;
-    return p[0] & 255;
-}
-long mem16(long addr) { return mem8(addr) | (mem8(addr + 1) << 8); }
-long mem32(long addr) { return mem16(addr) | (mem16(addr + 2) << 16); }
-long mem64(long addr) { return mem32(addr) | (mem32(addr + 4) << 32); }
+// mem8/mem16/mem32/mem64 live in nano-kernel.h -- nano-mm.h needs them too.
 
 long sig_matches(long addr, char *want) {
     long i;

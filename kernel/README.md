@@ -38,6 +38,9 @@ make intr       # interrupts: IDT, PIC, timer, idle, exception reporting
 make intrtest   # headless: the timer ticks, the core halts, faults report
 make acpi       # ACPI: find the tables, read the FADT/MADT, idle the CPU
 make acpitest   # headless: tables read, PM timer runs, core idles
+
+make mm         # memory: frame allocator, 4 KiB paging, kernel heap
+make mmtest     # headless: frames, mapping, heap reuse, unmap really unmaps
 ```
 
 `make test` needs no display; it drives real keystrokes through QEMU's
@@ -272,3 +275,80 @@ C1, and the shell says so rather than claiming otherwise.
 measure a halted core when a CPU-driven clock cannot. Over one second it
 advances about 3.55 million counts while the core wakes 101 times — once per
 timer tick. A spinning loop would show millions of wake-ups.
+
+---
+
+## Memory
+
+```
+$ make mmtest
+RAM: 130559 KiB usable, top 0x7fe0000
+kernel ends at 0x10b000, bitmap at 0x10b000 (4092 bytes)
+frames: 32450 free, 286 used, 32736 total
+distinct ok / accounting ok / free ok
+64 frames allocated, 0 overlapped the kernel or bitmap
+before: 0xc0000000 resolves to 0xc0000000 (identity)
+after:  0xc0000000 resolves to 0x161000 (frame 0x161000)
+map ok / write-through ok / split ok: neighbours untouched
+kmalloc distinct ok / contents ok / kfree returned memory ok
+reuse ok: the freed block came back
+coalesce ok / heap growth ok
+unmap ok: no translation
+*** EXCEPTION 14: page fault at 0xc0000000
+```
+
+Three layers, each built on the one below.
+
+**Which RAM exists** comes from the Multiboot memory map, not from a guess.
+The loader is the only thing that knows, and assuming "128 MiB, probably" is
+how a kernel comes to write into a memory hole. `boot32.s` parks the info
+pointer at a fixed address before its own page-table setup can clobber EBX.
+
+**The frame allocator** is a bitmap, one bit per 4 KiB page, placed just past
+the kernel image — and it marks itself used, because an allocator that can hand
+out the memory it is stored in does not last long. It starts with **everything
+marked used** and then frees what the map called available. The other way round
+— start free, mark the holes — hands out anything the map does not mention, and
+firmware tables live in exactly those gaps.
+
+**Paging at 4 KiB** means splitting what `boot32.s` built. That map is made of
+2 MiB pages, which cannot express a single 4 KiB mapping at all. `vmm_map`
+finds the 2 MiB page covering the address and replaces it with a page table of
+512 entries that say the same thing, and only then changes the one entry it
+came for. Without the split, mapping one page would silently unmap the other
+511. The test checks that explicitly — after mapping `0xC0000000`, the page
+below it must still resolve to itself.
+
+`tlb_invlpg` after every change is not optional. The CPU caches page-table
+walks, so an edited table keeps using the **old** mapping until something else
+happens to evict it, which makes the change appear to work intermittently.
+
+**The heap** is a first-fit free list with coalescing, on pages mapped at
+4 GiB — one byte past the identity map, so using it exercises the mapping code
+rather than quietly living in memory that was already there. Unlike the
+compiler's allocator, this one really frees: a kernel runs forever, and an
+allocator that only moves forward runs out. The test proves that rather than
+asserting it — free a block, ask for the same size, and require the **same
+address** back.
+
+Every block carries a magic number, so `kfree` on something that is not a heap
+block says so instead of corrupting the list silently.
+
+### The bug this work found in the compiler
+
+`kmalloc` returns `(char *)block + sizeof(struct Block)` and `kfree` computes
+`(char *)ptr - sizeof(struct Block)`. Those disagreed, and the reason was in
+the compiler: a cast was parsed with the full expression parser, so
+
+```c
+(char *)b + 40
+```
+
+became `(char *)(b + 40)`. The addition scaled by `sizeof(*b)` instead of by
+one, and the pointer landed forty times too far in. A cast binds to a
+*unary-expression*, not to whatever follows it.
+
+It had been there all along and never showed, because the common case is
+`(char *)p - 16` on a `void *`, where the element size is 0 or 1 and scaling by
+it changes nothing. See `casts.c` in the parent directory — every value there
+is checked against gcc.

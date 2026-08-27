@@ -99,3 +99,45 @@ mmio_read32:
     xor %eax, %eax
     mov (%rdi), %eax
     ret
+
+/* long kernel_end_addr(void) — the end of the loaded image, from the linker
+ * script. Physical memory below this is the kernel itself and must never be
+ * handed out as a free frame. */
+.globl kernel_end_addr
+kernel_end_addr:
+    lea _kernel_end(%rip), %rax
+    ret
+
+/* long multiboot_info_addr(void) — the pointer boot32.s parked at 0x7000
+ * before its own page-table setup could clobber EBX. */
+.globl multiboot_info_addr
+multiboot_info_addr:
+    mov $0x7000, %rax
+    mov (%rax), %eax            /* zero-extends: it is a 32-bit address */
+    ret
+
+/* void tlb_invlpg(long virt) — drop one page's cached translation.
+ *
+ * Named tlb_invlpg rather than invlpg: the instruction owns that word, and a
+ * global symbol with the same spelling is asking for trouble. The call itself
+ * matters more than it looks -- the CPU caches page-table walks, so a table
+ * edited without this keeps using the OLD mapping until something happens to
+ * evict it, which makes the change appear to work intermittently. */
+.globl tlb_invlpg
+tlb_invlpg:
+    invlpg (%rdi)
+    ret
+
+/* void tlb_flush(void) — reload CR3, dropping every non-global entry. */
+.globl tlb_flush
+tlb_flush:
+    mov %cr3, %rax
+    mov %rax, %cr3
+    ret
+
+/* long read_cr3_(void) — boot64 needs its own, since isr.s is not linked into
+ * every image here. */
+.globl read_cr3_
+read_cr3_:
+    mov %cr3, %rax
+    ret

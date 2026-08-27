@@ -11,6 +11,7 @@
 #include "nano-kernel.h"
 #include "nano-int.h"
 #include "nano-acpi.h"
+#include "nano-mm.h"
 
 #define COL_BG      0x0d1117
 #define COL_FG      0xc9d1d9
@@ -302,10 +303,79 @@ void cmd_fault() {
     *bad = 1;
 }
 
+void cmd_mem() {
+    printf("RAM %d KiB usable, top 0x%x\n", mm_ram_total / 1024, mm_ram_top);
+    printf("frames %d free / %d total (%d KiB free)\n",
+           mm_free_frames, mm_bitmap_frames, mm_free_frames * 4);
+    printf("kernel ends 0x%x, bitmap 0x%x\n", kernel_end_addr(), mm_bitmap);
+    printf("heap %d pages at 0x%x\n", heap_pages, HEAP_BASE);
+    printf("  %d bytes free in %d blocks, %d in use\n",
+           heap_bytes_free(), heap_blocks(1), heap_blocks(0));
+    printf("  %d kmalloc / %d kfree\n", kmalloc_calls, kfree_calls);
+}
+
+// Allocate, write, verify and free, so the heap is exercised rather than only
+// described. The addresses are printed because a heap that hands the same
+// block back after a free is the thing worth seeing.
+void cmd_heaptest() {
+    char *a;
+    char *b;
+    char *c;
+    long i;
+    a = (char *)kmalloc(1000);
+    b = (char *)kmalloc(2000);
+    c = (char *)kmalloc(4000);
+    printf("allocated 0x%x 0x%x 0x%x\n", a, b, c);
+    i = 0;
+    while (i < 1000) { a[i] = 'A'; i = i + 1; }
+    i = 0;
+    while (i < 2000) { b[i] = 'B'; i = i + 1; }
+    i = 0;
+    while (i < 4000) { c[i] = 'C'; i = i + 1; }
+    if (a[0] == 'A' && a[999] == 'A' && b[1999] == 'B' && c[3999] == 'C')
+        puts("contents intact\n");
+    else puts("BLOCKS OVERLAPPED\n");
+    kfree(b);
+    {
+        char *b2;
+        b2 = (char *)kmalloc(2000);
+        printf("freed then re-asked: 0x%x %s\n", b2,
+               b2 == b ? "(same block reused)" : "(different block)");
+        kfree(b2);
+    }
+    kfree(a);
+    kfree(c);
+    printf("after freeing: %d bytes free in %d blocks\n",
+           heap_bytes_free(), heap_blocks(1));
+}
+
+// Map a fresh physical frame over a virtual address, show that it moved, then
+// put it back. The identity map is what it was mapped to before.
+void cmd_maptest() {
+    long virt;
+    long phys;
+    virt = 0xD0000000;
+    printf("0x%x resolves to 0x%x\n", virt, vmm_resolve(virt));
+    phys = frame_alloc_zeroed();
+    if (!phys) { puts("out of frames\n"); return; }
+    vmm_map(virt, phys, PTE_WRITE);
+    printf("mapped to frame 0x%x, now resolves to 0x%x\n", phys, vmm_resolve(virt));
+    {
+        long *p;
+        p = (long *)virt;
+        p[0] = 0xFEEDFACE;
+        printf("wrote through it; the frame holds 0x%x\n", mem64(phys));
+    }
+    vmm_unmap(virt);
+    printf("unmapped, resolves to 0x%x\n", vmm_resolve(virt));
+    frame_free(phys);
+}
+
 void cmd_help() {
     puts("commands:\n");
     puts("  help clear ver fbinfo pci acpi\n");
     puts("  idle uptime fault\n");
+    puts("  mem heaptest maptest\n");
     puts("  demo bars grad lines circles font\n");
     puts("  echo <text>\n");
 }
@@ -352,6 +422,7 @@ int main() {
     serial_init();
     kbd_init();
     interrupts_init(100);          // IDT, PIC, 100 Hz timer, IRQ keyboard
+    mm_init();                     // frames, 4 KiB paging, kernel heap
     acpi_init();
     acpi_enable();
     acpi_pick_cstate();
@@ -371,7 +442,8 @@ int main() {
 
     splash();
     puts("framebuffer console up. type help.\n");
-    printf("timer %d Hz, %d CPU, idle %s\n\n", g_hz, acpi_cpus, acpi_cstate_name());
+    printf("timer %d Hz, %d CPU, idle %s\n", g_hz, acpi_cpus, acpi_cstate_name());
+    printf("%d KiB RAM, %d frames free\n\n", mm_ram_total / 1024, mm_free_frames);
 
     for (;;) {
         long c;
@@ -400,6 +472,9 @@ int main() {
         else if (!strcmp(line, "idle")) cmd_idle();
         else if (!strcmp(line, "uptime")) cmd_uptime();
         else if (!strcmp(line, "fault")) cmd_fault();
+        else if (!strcmp(line, "mem")) cmd_mem();
+        else if (!strcmp(line, "heaptest")) cmd_heaptest();
+        else if (!strcmp(line, "maptest")) cmd_maptest();
         else if (!strcmp(line, "demo")) cmd_demo();
         else if (!strcmp(line, "bars")) cmd_bars();
         else if (!strcmp(line, "grad")) cmd_grad();

@@ -27,3 +27,8 @@ intr.elf
 acpi64.elf
 acpi64.bin
 acpi.elf
+mm.s
+blob-mm.s
+mm64.elf
+mm64.bin
+mm.elf

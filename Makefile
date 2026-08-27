@@ -14,7 +14,7 @@ SRC       = simpleC++.c
 BIN       = nano_cc
 
 .PHONY: all run test demo structs bitwise printf switch minimal \
-        initializers typedefs gotos functions reserved libcheck checkall \
+        initializers typedefs gotos functions reserved libcheck casts checkall \
         selfhost clean
 
 all: $(BIN)
@@ -109,9 +109,13 @@ reserved: $(BIN)
 libcheck: $(BIN)
 	@sh gcc-check.sh libcheck.c $(MINIASM)
 
+# Cast precedence: a cast binds to a unary-expression, not to what follows.
+casts: $(BIN)
+	@sh gcc-check.sh casts.c $(MINIASM)
+
 # Every gcc-checked suite in one go.
 checkall: $(BIN)
-	@for f in initializers typedefs gotos functions reserved libcheck; do \
+	@for f in initializers typedefs gotos functions reserved libcheck casts; do \
 	    echo "== $$f.c"; sh gcc-check.sh $$f.c $(MINIASM) || exit 1; \
 	done
 
@@ -127,4 +131,4 @@ clean:
 	      switch.s switch_prog initializers.s initializers_prog \
 	      typedefs.s typedefs_prog gotos.s gotos_prog \
 	      functions.s functions_prog reserved.s reserved_prog \
-	      libcheck.s libcheck_prog libcheck.tmp
+	      libcheck.s libcheck_prog libcheck.tmp casts.s casts_prog

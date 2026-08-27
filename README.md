@@ -17,8 +17,9 @@ compiled by `nano_cc` itself — that runs in 64-bit long mode under QEMU, reads
 a real PS/2 keyboard, and brings up a **1024x768x32 graphics mode** with a
 framebuffer console, its own bitmap font and drawing primitives. It has an
 **IDT** with real exception reporting, the **8259s remapped**, a **PIT timer**,
-an interrupt-driven keyboard, and it reads the firmware's **ACPI** tables to
-decide how to idle the CPU. See [`kernel/README.md`](kernel/README.md).
+an interrupt-driven keyboard, a **physical frame allocator** with 4 KiB paging
+and a **kernel heap**, and it reads the firmware's **ACPI** tables to decide how
+to idle the CPU. See [`kernel/README.md`](kernel/README.md).
 
 ---
 
@@ -119,11 +120,12 @@ make gotos       # goto and labels
 make functions   # array parameters and function return types
 make reserved    # C names that are assembler keywords (sp, ax, flat, ...)
 make libcheck    # nano-libc.h, checked against glibc
-make checkall    # all six of the above in one go
+make casts       # cast precedence: a cast binds to a unary-expression
+make checkall    # all seven of the above in one go
 make selfhost    # the three-stage bootstrap
 ```
 
-The six checked suites do not print a demo — they compile the
+The seven checked suites do not print a demo — they compile the
 same source with gcc (swapping the system headers in for `nano-nolibc.h` or
 `nano-libc.h`) and require
 `nano_cc`'s output to match it line for line, in normal mode and in `--minimal`.

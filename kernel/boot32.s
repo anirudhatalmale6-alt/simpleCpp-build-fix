@@ -13,6 +13,7 @@
 .set PML4, 0x1000
 .set PDPT, 0x2000
 .set PD,   0x3000          /* four consecutive PDs: 0x3000..0x6fff */
+.set MBINFO, 0x7000        /* where we park the Multiboot info pointer */
 .set KERNEL64, 0x101000
 
 .section .multiboot, "a"
@@ -27,6 +28,13 @@
 _start:
     cli
     mov $0x90000, %esp
+
+    /* The Multiboot loader leaves the address of its information structure in
+       EBX. That structure carries the memory map, which is the only way to
+       know which physical RAM actually exists -- everything else here would be
+       guessing. EBX is a scratch register in the page-table loops below, so
+       save it before anything can touch it. */
+    movl %ebx, MBINFO
 
     /* zero the PML4 and PDPT pages (only the low entries are used; the rest
        must be zero or the CPU will follow garbage) */

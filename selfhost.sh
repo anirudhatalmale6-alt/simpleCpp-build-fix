@@ -98,7 +98,7 @@ echo "and stage1 has to agree with the gcc-built compiler on every demo:"
 HERE=$PWD
 cp ./*.c ./*.h "$W/" 2>/dev/null
 for d in test features structs bitwise printf switch initializers typedefs \
-         gotos functions reserved libcheck sample; do
+         gotos functions reserved libcheck casts sample; do
     [ -f "$HERE/$d.c" ] || continue
     # both compilers run in the same directory on the same file name, so any
     # difference is the code generator and not the path it was handed

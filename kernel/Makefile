@@ -14,7 +14,8 @@ QFLAGS := -kernel kernel.elf -no-reboot
 
 .PHONY: all run test shot gfx gfxrun gfxtest gfxshot \
         gshell gshellrun gshelltest gshellshot \
-        intr intrrun intrtest acpi acpirun acpitest clean
+        intr intrrun intrtest acpi acpirun acpitest \
+        mm mmrun mmtest clean
 
 all: kernel.elf
 
@@ -126,7 +127,8 @@ gfxshot: gfx.elf
 # The graphics shell: same keyboard-driven shell, drawn into the framebuffer,
 # with commands that draw.
 # ---------------------------------------------------------------------------
-gfxshell.s: gfxshell.c nano-kernel.h nano-fb.h nano-font.h nano-int.h nano-acpi.h $(NANO)
+gfxshell.s: gfxshell.c nano-kernel.h nano-fb.h nano-font.h nano-int.h \
+            nano-acpi.h nano-mm.h $(NANO)
 	$(NANO) --kernel gfxshell.c gfxshell.s
 
 gshell64.bin: boot64.s isr.s gfxshell.s kernel64.ld
@@ -156,7 +158,10 @@ gshelltest: gshell.elf
 	   sleep 0.4; for k in p c i ret; do echo "sendkey $$k"; sleep 0.18; done; \
 	   sleep 0.4; for k in a c p i ret; do echo "sendkey $$k"; sleep 0.18; done; \
 	   sleep 0.4; for k in i d l e ret; do echo "sendkey $$k"; sleep 0.18; done; \
-	   sleep 1.8; for k in b a r s ret; do echo "sendkey $$k"; sleep 0.18; done; \
+	   sleep 1.8; for k in m e m ret; do echo "sendkey $$k"; sleep 0.18; done; \
+	   sleep 0.4; for k in h e a p t e s t ret; do echo "sendkey $$k"; sleep 0.18; done; \
+	   sleep 0.6; for k in m a p t e s t ret; do echo "sendkey $$k"; sleep 0.18; done; \
+	   sleep 0.5; for k in b a r s ret; do echo "sendkey $$k"; sleep 0.18; done; \
 	   sleep 0.4; for k in e c h o spc h i ret; do echo "sendkey $$k"; sleep 0.18; done; \
 	   sleep 0.4; for k in f a u l t ret; do echo "sendkey $$k"; sleep 0.18; done; \
 	   sleep 1.2; echo quit ) | \
@@ -169,9 +174,12 @@ gshelltest: gshell.elf
 	   && grep -q "FACP" gshell-serial.clean \
 	   && grep -q "a spinning core would show" gshell-serial.clean \
 	   && grep -q "drew colour bars" gshell-serial.clean \
+	   && grep -q "contents intact" gshell-serial.clean \
+	   && grep -q "same block reused" gshell-serial.clean \
+	   && grep -q "wrote through it" gshell-serial.clean \
 	   && grep -qx "hi" gshell-serial.clean \
 	   && grep -q "EXCEPTION 14: page fault" gshell-serial.clean \
-	   && echo "PASS: graphics, IRQ keyboard, PCI, ACPI, idle and fault reporting" \
+	   && echo "PASS: graphics, keyboard, PCI, ACPI, idle, memory and faults" \
 	   || { echo "FAIL"; exit 1; }
 
 # Boot it, type a few commands, and photograph the screen.
@@ -180,6 +188,7 @@ gshellshot: gshell.elf
 	@( sleep 3; for k in a c p i ret; do echo "sendkey $$k"; sleep 0.18; done; \
 	   sleep 0.5; for k in i d l e ret; do echo "sendkey $$k"; sleep 0.18; done; \
 	   sleep 2; for k in u p t i m e ret; do echo "sendkey $$k"; sleep 0.18; done; \
+	   sleep 0.5; for k in m e m ret; do echo "sendkey $$k"; sleep 0.18; done; \
 	   sleep 0.5; for k in d e m o ret; do echo "sendkey $$k"; sleep 0.18; done; \
 	   sleep 1.5; echo "screendump gshell.ppm"; sleep 1; echo quit ) | \
 	 timeout 45 $(QEMU) -kernel gshell.elf -no-reboot -display none \
@@ -271,9 +280,57 @@ acpitest: acpi.elf
 	   && echo "PASS: ACPI tables read, PM timer runs, core idles" \
 	   || { echo "FAIL"; exit 1; }
 
+# ---------------------------------------------------------------------------
+# Memory: the Multiboot map, a physical frame allocator, 4 KiB paging over the
+# boot-time 2 MiB identity map, and a kernel heap that really frees.
+# ---------------------------------------------------------------------------
+mm.s: mm.c nano-kernel.h nano-int.h nano-mm.h $(NANO)
+	$(NANO) --kernel mm.c mm.s
+
+mm64.bin: boot64.s isr.s mm.s kernel64.ld
+	as --64 boot64.s -o boot64.o
+	as --64 isr.s    -o isr.o
+	as --64 mm.s     -o mm.o
+	ld -T kernel64.ld -o mm64.elf boot64.o isr.o mm.o
+	objcopy -O binary mm64.elf mm64.bin
+
+blob-mm.s:
+	@printf '.section .blob, "a"\n.incbin "mm64.bin"\n' > $@
+
+mm.elf: boot32.s blob-mm.s mm64.bin final.ld
+	as --32 boot32.s  -o boot32.o
+	as --32 blob-mm.s -o blob-mm.o
+	ld -m elf_i386 -T final.ld -o mm.elf boot32.o blob-mm.o
+
+mm: mm.elf
+
+mmrun: mm.elf
+	$(QEMU) -kernel mm.elf -no-reboot
+
+mmtest: mm.elf
+	@rm -f mm-serial.log
+	@( sleep 6; echo quit ) | \
+	 timeout 40 $(QEMU) -kernel mm.elf -no-reboot -display none \
+	   -serial file:mm-serial.log -monitor stdio >/dev/null 2>&1; \
+	 echo "---- serial output ----"; cat mm-serial.log; echo "-----------------------"; \
+	 tr -d '\r' < mm-serial.log > mm-serial.clean; \
+	 grep -q "distinct ok" mm-serial.clean \
+	   && grep -q "reservation ok" mm-serial.clean \
+	   && grep -q "map ok" mm-serial.clean \
+	   && grep -q "write-through ok" mm-serial.clean \
+	   && grep -q "split ok" mm-serial.clean \
+	   && grep -q "reuse ok" mm-serial.clean \
+	   && grep -q "coalesce ok" mm-serial.clean \
+	   && grep -q "heap growth ok" mm-serial.clean \
+	   && grep -q "unmap ok" mm-serial.clean \
+	   && grep -q "EXCEPTION 14: page fault" mm-serial.clean \
+	   && ! grep -q "UNREACHABLE" mm-serial.clean \
+	   && echo "PASS: frames, paging, heap, and unmapping really unmaps" \
+	   || { echo "FAIL"; exit 1; }
+
 clean:
-	rm -f *.o shell.s gfx.s gfxshell.s intr.s acpi.s \
-	      blob-gfx.s blob-gshell.s blob-intr.s blob-acpi.s \
+	rm -f *.o shell.s gfx.s gfxshell.s intr.s acpi.s mm.s \
+	      blob-gfx.s blob-gshell.s blob-intr.s blob-acpi.s blob-mm.s \
 	      kernel64.elf kernel64.bin kernel.elf \
 	      gfx64.elf gfx64.bin gfx.elf \
 	      gshell64.elf gshell64.bin gshell.elf \
@@ -281,4 +338,5 @@ clean:
 	      gshell-serial.log gshell-serial.clean \
 	      intr64.elf intr64.bin intr.elf intr-serial.log intr-serial.clean \
 	      acpi64.elf acpi64.bin acpi.elf acpi-serial.log acpi-serial.clean \
+	      mm64.elf mm64.bin mm.elf mm-serial.log mm-serial.clean \
 	      vga.ppm gfx.ppm gshell.ppm
