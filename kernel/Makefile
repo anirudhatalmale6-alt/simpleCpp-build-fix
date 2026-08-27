@@ -13,7 +13,8 @@ QEMU   := qemu-system-x86_64
 QFLAGS := -kernel kernel.elf -no-reboot
 
 .PHONY: all run test shot gfx gfxrun gfxtest gfxshot \
-        gshell gshellrun gshelltest gshellshot clean
+        gshell gshellrun gshelltest gshellshot \
+        intr intrrun intrtest acpi acpirun acpitest clean
 
 all: kernel.elf
 
@@ -125,13 +126,14 @@ gfxshot: gfx.elf
 # The graphics shell: same keyboard-driven shell, drawn into the framebuffer,
 # with commands that draw.
 # ---------------------------------------------------------------------------
-gfxshell.s: gfxshell.c nano-kernel.h nano-fb.h nano-font.h $(NANO)
+gfxshell.s: gfxshell.c nano-kernel.h nano-fb.h nano-font.h nano-int.h nano-acpi.h $(NANO)
 	$(NANO) --kernel gfxshell.c gfxshell.s
 
-gshell64.bin: boot64.s gfxshell.s kernel64.ld
+gshell64.bin: boot64.s isr.s gfxshell.s kernel64.ld
 	as --64 boot64.s   -o boot64.o
+	as --64 isr.s      -o isr.o
 	as --64 gfxshell.s -o gfxshell.o
-	ld -T kernel64.ld -o gshell64.elf boot64.o gfxshell.o
+	ld -T kernel64.ld -o gshell64.elf boot64.o isr.o gfxshell.o
 	objcopy -O binary gshell64.elf gshell64.bin
 
 blob-gshell.s:
@@ -152,37 +154,131 @@ gshelltest: gshell.elf
 	@rm -f gshell-serial.log
 	@( sleep 3; for k in f b i n f o ret; do echo "sendkey $$k"; sleep 0.18; done; \
 	   sleep 0.4; for k in p c i ret; do echo "sendkey $$k"; sleep 0.18; done; \
-	   sleep 0.4; for k in b a r s ret; do echo "sendkey $$k"; sleep 0.18; done; \
+	   sleep 0.4; for k in a c p i ret; do echo "sendkey $$k"; sleep 0.18; done; \
+	   sleep 0.4; for k in i d l e ret; do echo "sendkey $$k"; sleep 0.18; done; \
+	   sleep 1.8; for k in b a r s ret; do echo "sendkey $$k"; sleep 0.18; done; \
 	   sleep 0.4; for k in e c h o spc h i ret; do echo "sendkey $$k"; sleep 0.18; done; \
-	   sleep 0.8; echo quit ) | \
-	 timeout 45 $(QEMU) -kernel gshell.elf -no-reboot -display none \
+	   sleep 0.4; for k in f a u l t ret; do echo "sendkey $$k"; sleep 0.18; done; \
+	   sleep 1.2; echo quit ) | \
+	 timeout 60 $(QEMU) -kernel gshell.elf -no-reboot -display none \
 	   -serial file:gshell-serial.log -monitor stdio >/dev/null 2>&1; \
 	 echo "---- serial output ----"; cat gshell-serial.log; echo "-----------------------"; \
 	 tr -d '\r' < gshell-serial.log > gshell-serial.clean; \
 	 grep -q "resolution 1024x768 at 32 bpp" gshell-serial.clean \
 	   && grep -q "class 3" gshell-serial.clean \
+	   && grep -q "FACP" gshell-serial.clean \
+	   && grep -q "a spinning core would show" gshell-serial.clean \
 	   && grep -q "drew colour bars" gshell-serial.clean \
 	   && grep -qx "hi" gshell-serial.clean \
-	   && echo "PASS: graphics shell, keyboard, PCI scan and drawing all working" \
+	   && grep -q "EXCEPTION 14: page fault" gshell-serial.clean \
+	   && echo "PASS: graphics, IRQ keyboard, PCI, ACPI, idle and fault reporting" \
 	   || { echo "FAIL"; exit 1; }
 
 # Boot it, type a few commands, and photograph the screen.
 gshellshot: gshell.elf
 	@rm -f gshell.ppm gshell.png
-	@( sleep 3; for k in f b i n f o ret; do echo "sendkey $$k"; sleep 0.18; done; \
-	   sleep 0.4; for k in p c i ret; do echo "sendkey $$k"; sleep 0.18; done; \
-	   sleep 0.4; for k in d e m o ret; do echo "sendkey $$k"; sleep 0.18; done; \
-	   sleep 1.5; for k in e c h o spc h e l l o ret; do echo "sendkey $$k"; sleep 0.18; done; \
-	   sleep 1; echo "screendump gshell.ppm"; sleep 1; echo quit ) | \
+	@( sleep 3; for k in a c p i ret; do echo "sendkey $$k"; sleep 0.18; done; \
+	   sleep 0.5; for k in i d l e ret; do echo "sendkey $$k"; sleep 0.18; done; \
+	   sleep 2; for k in u p t i m e ret; do echo "sendkey $$k"; sleep 0.18; done; \
+	   sleep 0.5; for k in d e m o ret; do echo "sendkey $$k"; sleep 0.18; done; \
+	   sleep 1.5; echo "screendump gshell.ppm"; sleep 1; echo quit ) | \
 	 timeout 45 $(QEMU) -kernel gshell.elf -no-reboot -display none \
 	   -serial file:gshell-serial.log -monitor stdio >/dev/null 2>&1
 	@convert gshell.ppm gshell.png && echo "wrote gshell.png"
 
+# ---------------------------------------------------------------------------
+# Interrupts: IDT, exception reporting, PIC remap, PIT timer, IRQ keyboard and
+# a real idle loop. intr.c is the headless bring-up test.
+# ---------------------------------------------------------------------------
+intr.s: intr.c nano-kernel.h nano-int.h $(NANO)
+	$(NANO) --kernel intr.c intr.s
+
+intr64.bin: boot64.s isr.s intr.s kernel64.ld
+	as --64 boot64.s -o boot64.o
+	as --64 isr.s    -o isr.o
+	as --64 intr.s   -o intr.o
+	ld -T kernel64.ld -o intr64.elf boot64.o isr.o intr.o
+	objcopy -O binary intr64.elf intr64.bin
+
+blob-intr.s:
+	@printf '.section .blob, "a"\n.incbin "intr64.bin"\n' > $@
+
+intr.elf: boot32.s blob-intr.s intr64.bin final.ld
+	as --32 boot32.s    -o boot32.o
+	as --32 blob-intr.s -o blob-intr.o
+	ld -m elf_i386 -T final.ld -o intr.elf boot32.o blob-intr.o
+
+intr: intr.elf
+
+intrrun: intr.elf
+	$(QEMU) -kernel intr.elf -no-reboot
+
+# Every claim here is checked: the timer really ticked, the core really halted
+# rather than spun, and a deliberate page fault produced a report instead of a
+# silent reboot.
+intrtest: intr.elf
+	@rm -f intr-serial.log
+	@( sleep 6; echo quit ) | \
+	 timeout 40 $(QEMU) -kernel intr.elf -no-reboot -display none \
+	   -serial file:intr-serial.log -monitor stdio >/dev/null 2>&1; \
+	 echo "---- serial output ----"; cat intr-serial.log; echo "-----------------------"; \
+	 tr -d '\r' < intr-serial.log > intr-serial.clean; \
+	 grep -q "timer ok" intr-serial.clean \
+	   && grep -q "idle ok" intr-serial.clean \
+	   && grep -q "EXCEPTION 14: page fault" intr-serial.clean \
+	   && grep -q "page not present, on a write, from kernel mode" intr-serial.clean \
+	   && ! grep -q "UNREACHABLE" intr-serial.clean \
+	   && echo "PASS: timer ticks, core idles, faults are reported not silent" \
+	   || { echo "FAIL"; exit 1; }
+
+# ---------------------------------------------------------------------------
+# ACPI: find the firmware tables, read the FADT and MADT, and idle the CPU.
+# ---------------------------------------------------------------------------
+acpi.s: acpi.c nano-kernel.h nano-int.h nano-acpi.h $(NANO)
+	$(NANO) --kernel acpi.c acpi.s
+
+acpi64.bin: boot64.s isr.s acpi.s kernel64.ld
+	as --64 boot64.s -o boot64.o
+	as --64 isr.s    -o isr.o
+	as --64 acpi.s   -o acpi.o
+	ld -T kernel64.ld -o acpi64.elf boot64.o isr.o acpi.o
+	objcopy -O binary acpi64.elf acpi64.bin
+
+blob-acpi.s:
+	@printf '.section .blob, "a"\n.incbin "acpi64.bin"\n' > $@
+
+acpi.elf: boot32.s blob-acpi.s acpi64.bin final.ld
+	as --32 boot32.s    -o boot32.o
+	as --32 blob-acpi.s -o blob-acpi.o
+	ld -m elf_i386 -T final.ld -o acpi.elf boot32.o blob-acpi.o
+
+acpi: acpi.elf
+
+acpirun: acpi.elf
+	$(QEMU) -kernel acpi.elf -no-reboot
+
+acpitest: acpi.elf
+	@rm -f acpi-serial.log
+	@( sleep 8; echo quit ) | \
+	 timeout 40 $(QEMU) -kernel acpi.elf -no-reboot -display none \
+	   -serial file:acpi-serial.log -monitor stdio >/dev/null 2>&1; \
+	 echo "---- serial output ----"; cat acpi-serial.log; echo "-----------------------"; \
+	 tr -d '\r' < acpi-serial.log > acpi-serial.clean; \
+	 grep -q "FACP" acpi-serial.clean \
+	   && grep -q "pm timer ok" acpi-serial.clean \
+	   && grep -q "idle ok" acpi-serial.clean \
+	   && grep -q "acpi bring-up complete" acpi-serial.clean \
+	   && echo "PASS: ACPI tables read, PM timer runs, core idles" \
+	   || { echo "FAIL"; exit 1; }
+
 clean:
-	rm -f *.o shell.s gfx.s gfxshell.s blob-gfx.s blob-gshell.s \
+	rm -f *.o shell.s gfx.s gfxshell.s intr.s acpi.s \
+	      blob-gfx.s blob-gshell.s blob-intr.s blob-acpi.s \
 	      kernel64.elf kernel64.bin kernel.elf \
 	      gfx64.elf gfx64.bin gfx.elf \
 	      gshell64.elf gshell64.bin gshell.elf \
 	      serial.log serial.clean gfx-serial.log gfx-serial.clean \
 	      gshell-serial.log gshell-serial.clean \
+	      intr64.elf intr64.bin intr.elf intr-serial.log intr-serial.clean \
+	      acpi64.elf acpi64.bin acpi.elf acpi-serial.log acpi-serial.clean \
 	      vga.ppm gfx.ppm gshell.ppm

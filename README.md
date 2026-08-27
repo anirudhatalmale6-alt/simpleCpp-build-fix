@@ -14,11 +14,11 @@ builds it again with the result, and requires the two compilers to come out
 
 It can even boot **bare metal**: `kernel/` builds a tiny interactive shell —
 compiled by `nano_cc` itself — that runs in 64-bit long mode under QEMU, reads
-a real PS/2 keyboard, and now brings up a **1024x768x32 graphics mode** with a
-framebuffer console, its own bitmap font and drawing primitives. The mode is
-set through the Bochs VBE registers and the framebuffer address is read out of
-PCI configuration space, because in long mode there is no BIOS left to ask.
-See [`kernel/README.md`](kernel/README.md).
+a real PS/2 keyboard, and brings up a **1024x768x32 graphics mode** with a
+framebuffer console, its own bitmap font and drawing primitives. It has an
+**IDT** with real exception reporting, the **8259s remapped**, a **PIT timer**,
+an interrupt-driven keyboard, and it reads the firmware's **ACPI** tables to
+decide how to idle the CPU. See [`kernel/README.md`](kernel/README.md).
 
 ---
 

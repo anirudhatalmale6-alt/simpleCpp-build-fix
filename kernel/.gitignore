@@ -17,3 +17,13 @@ gfx.elf
 gshell64.elf
 gshell64.bin
 gshell.elf
+intr.s
+acpi.s
+blob-intr.s
+blob-acpi.s
+intr64.elf
+intr64.bin
+intr.elf
+acpi64.elf
+acpi64.bin
+acpi.elf

@@ -2404,6 +2404,11 @@ static void gen_func(Func *fn) {
     cur_va_off = va_off; cur_named = fn->nparams;
     int fs = (frame_size + 15) & ~15;
 
+    // Every function gets external linkage, which is what C says a
+    // non-static function has. Only `main` and `_start` used to be exported,
+    // so a second object file could not call anything here -- the kernel's
+    // assembly stubs could not reach their own C dispatcher.
+    emit(g_nasm ? "global %s" : "    .globl %s", asm_sym(fn->name));
     emit("%s:", asm_sym(fn->name));
     e_push("rbp");
     emit("    mov rbp, rsp");

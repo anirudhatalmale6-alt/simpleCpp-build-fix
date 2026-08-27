@@ -9,6 +9,8 @@
 
 #include "nano-fb.h"
 #include "nano-kernel.h"
+#include "nano-int.h"
+#include "nano-acpi.h"
 
 #define COL_BG      0x0d1117
 #define COL_FG      0xc9d1d9
@@ -233,9 +235,77 @@ void cmd_pci() {
     printf("%d devices on bus 0\n", found);
 }
 
+void print_sig(long table) {
+    long i;
+    i = 0;
+    while (i < 4) { putc(mem8(table + i)); i = i + 1; }
+}
+
+void cmd_acpi() {
+    long i;
+    if (!acpi_root) { puts("no ACPI tables found\n"); return; }
+    printf("RSDP 0x%x rev %d\n", acpi_rsdp, acpi_rev);
+    printf("%s at 0x%x, %d tables\n",
+           acpi_root_is_xsdt ? "XSDT" : "RSDT", acpi_root, acpi_ntables);
+    puts("tables:");
+    i = 0;
+    while (i < acpi_ntables) {
+        long t;
+        t = acpi_table_at(i);
+        if (t) { putc(' '); print_sig(t); }
+        i = i + 1;
+    }
+    putc('\n');
+    printf("CPUs %d, PM timer 0x%x\n", acpi_cpus, acpi_pm_tmr);
+    printf("C2 latency %d us, C3 %d us\n", acpi_c2_lat, acpi_c3_lat);
+    printf("idle state: %s\n", acpi_cstate_name());
+}
+
+// Idle over one second and report what fraction of it the core was stopped.
+// The ACPI PM timer keeps running while the core is halted, which is exactly
+// why it can measure this and a CPU-driven clock cannot.
+void cmd_idle() {
+    long t0;
+    long n;
+    long a;
+    long b;
+    long elapsed;
+    puts("measuring one second of idle...\n");
+    g_c1_entries = 0;
+    g_c2_entries = 0;
+    a = pm_timer_read();
+    t0 = g_ticks;
+    n = 0;
+    while (g_ticks < t0 + g_hz) { acpi_idle(); n = n + 1; }
+    b = pm_timer_read();
+    elapsed = pm_timer_delta(a, b);
+    printf("%d wake-ups in %d ticks\n", n, g_ticks - t0);
+    printf("C1 %d  C2 %d\n", g_c1_entries, g_c2_entries);
+    if (acpi_pm_tmr) printf("PM timer advanced %d\n", elapsed);
+    puts("a spinning core would show millions of wake-ups\n");
+}
+
+void cmd_uptime() {
+    long secs;
+    secs = g_ticks / g_hz;
+    printf("up %d ticks at %d Hz = %d seconds\n", g_ticks, g_hz, secs);
+    printf("keys dropped %d, spurious IRQs %d\n", g_kbd_dropped, g_spurious);
+}
+
+// A deliberate fault, so the exception reporter can be seen working rather
+// than only trusted. Before the IDT existed this rebooted the machine with no
+// message at all.
+void cmd_fault() {
+    long *bad;
+    puts("touching unmapped memory on purpose...\n");
+    bad = (long *)0x00007FFFFFFFF000;
+    *bad = 1;
+}
+
 void cmd_help() {
     puts("commands:\n");
-    puts("  help clear ver fbinfo pci\n");
+    puts("  help clear ver fbinfo pci acpi\n");
+    puts("  idle uptime fault\n");
     puts("  demo bars grad lines circles font\n");
     puts("  echo <text>\n");
 }
@@ -281,6 +351,10 @@ int main() {
 
     serial_init();
     kbd_init();
+    interrupts_init(100);          // IDT, PIC, 100 Hz timer, IRQ keyboard
+    acpi_init();
+    acpi_enable();
+    acpi_pick_cstate();
 
     if (!fb_init(1024, 768)) {
         vga_clear();
@@ -296,14 +370,15 @@ int main() {
     g_have_fb = 1;
 
     splash();
-    puts("framebuffer console up. type help.\n\n");
+    puts("framebuffer console up. type help.\n");
+    printf("timer %d Hz, %d CPU, idle %s\n\n", g_hz, acpi_cpus, acpi_cstate_name());
 
     for (;;) {
         long c;
         puts("> ");
         n = 0;
         for (;;) {
-            c = keyboard_getchar();
+            c = keyboard_getchar_irq();
             if (c == '\n') { putc('\n'); break; }
             if (c == '\b') {
                 if (n > 0) { n = n - 1; putc('\b'); }
@@ -321,6 +396,10 @@ int main() {
         else if (!strcmp(line, "ver")) puts("nano-os 0.2, framebuffer edition\n");
         else if (!strcmp(line, "fbinfo")) cmd_fbinfo();
         else if (!strcmp(line, "pci")) cmd_pci();
+        else if (!strcmp(line, "acpi")) cmd_acpi();
+        else if (!strcmp(line, "idle")) cmd_idle();
+        else if (!strcmp(line, "uptime")) cmd_uptime();
+        else if (!strcmp(line, "fault")) cmd_fault();
         else if (!strcmp(line, "demo")) cmd_demo();
         else if (!strcmp(line, "bars")) cmd_bars();
         else if (!strcmp(line, "grad")) cmd_grad();

@@ -33,6 +33,11 @@ make gshellshot # boot, type into it, save gshell.png
 make gfx        # a non-interactive framebuffer bring-up demo
 make gfxtest    # headless check that a mode was set and pixels read back
 make gfxshot    # save gfx.png
+
+make intr       # interrupts: IDT, PIC, timer, idle, exception reporting
+make intrtest   # headless: the timer ticks, the core halts, faults report
+make acpi       # ACPI: find the tables, read the FADT/MADT, idle the CPU
+make acpitest   # headless: tables read, PM timer runs, core idles
 ```
 
 `make test` needs no display; it drives real keystrokes through QEMU's
@@ -164,3 +169,106 @@ four times the bus traffic. `mmio_write32` and `mmio_read32` in `boot64.s` are
 the two instructions that gap needs, alongside `inw`/`outw` for the VBE
 registers and `inl`/`outl` for PCI configuration space, which are word and
 dword ports respectively and do not work a byte at a time.
+
+---
+
+## Interrupts
+
+Before this existed, every fault was a **triple fault**: the CPU could not find
+a handler, could not fault on that either, and reset. Under QEMU that looks
+like the machine silently rebooting — no message, no register dump, nothing to
+go on. Turning that into a page of text is most of the value here.
+
+```
+> fault
+touching unmapped memory on purpose...
+
+*** EXCEPTION 14: page fault
+error 0x2  rip 0x109728  cs 0x8
+rflags 0x246  rsp 0x8ff40  ss 0x10
+faulting address 0x7ffffffff000
+cause: page not present, on a write, from kernel mode
+rax 0x1  rbx 0x6003  rcx 0x7ffffffff000
+...
+halted.
+```
+
+`isr.s` holds 256 stubs, because the CPU arrives at a handler with a stack
+frame it expects to leave with `iretq`, which no C function can do. Two things
+the stubs exist to even out:
+
+* **Only some vectors push an error code** — 8, 10–14, 17, 21, 29, 30. The rest
+  do not. Without a zero pushed in its place, the stack layout differs by eight
+  bytes depending on which fault happened, and every field in the report is
+  off by one.
+* **The vector number is nowhere in the hardware frame.** The only thing that
+  knows which interrupt fired is the stub that was entered.
+
+Dispatch is by **number**, not through a table of function pointers, because
+`nano_cc` does not have function pointers. `isr_table` is a plain array of
+addresses that C reads to fill in the IDT.
+
+The 8259 PICs are remapped off vectors 8–15, where they collide with the CPU's
+own exception numbers — unremapped, a timer tick arrives looking exactly like a
+double fault. IRQ0 is the PIT at 100 Hz and IRQ1 is the keyboard, which now
+fills a ring buffer instead of being polled.
+
+Two details that are easy to get wrong and produce a hang rather than an error:
+
+* `cpu_idle` is `sti` then `hlt`, in that order. `sti` does not take effect
+  until after the *next* instruction, which is what makes the pair atomic —
+  written the other way round an interrupt can slip between them and leave the
+  core halted with nothing left to wake it.
+* IRQ7 and IRQ15 can fire with no device behind them. The primary PIC's
+  spurious interrupt must **not** be acknowledged, or a real interrupt later
+  has its EOI consumed by this one.
+
+## ACPI
+
+`make acpitest` reads the firmware's tables and uses what they describe:
+
+```
+RSDP  at 0xf5290, revision 0
+root  at 0x7fe1c52 (RSDT), 4 tables
+tables: FACP APIC HPET WAET
+MADT  at 0x7fe1b7a, 1 usable CPUs
+PM timer port 0x608, 24-bit
+P_LVL2 latency 4095 us, P_LVL3 latency 4095 us
+idle state chosen: C1 (hlt)
+  C2 not offered by this firmware (latency > 100us)
+PM timer moved 692924 counts in ~200ms
+over 100 ticks (1s): 100 idle entries
+  C1 100, C2 0
+idle ok: the core stopped between interrupts
+```
+
+**What this does and does not do.** It reads the *static* tables — the RSDP,
+the RSDT/XSDT directory, the FADT and the MADT. Those are plain structures at
+fixed offsets and can be read honestly.
+
+It does **not** interpret AML. Most of what ACPI can tell you, including the
+`_CST` method that describes a processor's real C-states, is bytecode in the
+DSDT, and running it needs an interpreter — a project, not a feature. The one
+AML thing done here is scanning the DSDT for the fixed-form `Processor`
+declaration (opcode `5B 83`), which carries the P_BLK address at a known offset
+inside it. That is a byte scan of a known encoding, and the result is
+sanity-checked as an I/O port before it is believed.
+
+So the C-state actually entered is decided from what the firmware says, not
+from what would sound impressive:
+
+| state | how | condition |
+|---|---|---|
+| C1 | `hlt` | always available |
+| C2 | a read from `P_BLK+4` | FADT `P_LVL2_LAT` ≤ 100 µs **and** a P_BLK was found |
+| C3 | `P_BLK+5` | `P_LVL3_LAT` ≤ 1000 µs — detected and reported, not entered, because it also needs bus-master traffic quiesced |
+
+Under QEMU both latencies read 4095 µs, which is the specification's way of
+saying the state does not exist, and no P_BLK is declared — so what you get is
+C1, and the shell says so rather than claiming otherwise.
+
+**The idle measurement is real.** The ACPI power-management timer runs at
+3.579545 MHz regardless of what the core is doing, which is exactly why it can
+measure a halted core when a CPU-driven clock cannot. Over one second it
+advances about 3.55 million counts while the core wakes 101 times — once per
+timer tick. A spinning loop would show millions of wake-ups.
