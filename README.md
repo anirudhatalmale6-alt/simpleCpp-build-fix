@@ -13,8 +13,12 @@ builds it again with the result, and requires the two compilers to come out
 [Self-hosting](#self-hosting).
 
 It can even boot **bare metal**: `kernel/` builds a tiny interactive shell —
-compiled by `nano_cc` itself — that runs in 64-bit long mode under QEMU and
-reads a real PS/2 keyboard. See [`kernel/README.md`](kernel/README.md).
+compiled by `nano_cc` itself — that runs in 64-bit long mode under QEMU, reads
+a real PS/2 keyboard, and now brings up a **1024x768x32 graphics mode** with a
+framebuffer console, its own bitmap font and drawing primitives. The mode is
+set through the Bochs VBE registers and the framebuffer address is read out of
+PCI configuration space, because in long mode there is no BIOS left to ask.
+See [`kernel/README.md`](kernel/README.md).
 
 ---
 

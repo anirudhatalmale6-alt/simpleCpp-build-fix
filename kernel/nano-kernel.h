@@ -64,10 +64,25 @@ void serial_put(int c) {
 }
 
 // ---------- combined character / string output ----------
+//
+// Where the characters go depends on whether a framebuffer console exists.
+// Include nano-fb.h BEFORE this file and text goes to the framebuffer; include
+// this file alone and it goes to VGA text mode at 0xB8000. The test for that
+// is the include guard, so the order matters and is checked at compile time
+// rather than producing a link error.
+//
+// The serial mirror is unconditional either way, because that is what the
+// headless tests read.
+int g_have_fb;      // set to 1 once a framebuffer console is up
+
 void putc(int c) {
     if (c == '\n') serial_put('\r');     // CR so serial terminals advance
     serial_put(c);
+#ifdef NANO_FB_H
+    if (g_have_fb) fb_putc(c); else vga_put(c);
+#else
     vga_put(c);
+#endif
 }
 
 void puts(char *s) {

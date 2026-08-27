@@ -1,0 +1,18 @@
+framebuffer console up. type help.
+
+> fbinfo
+resolution 1024x768 at 32 bpp
+pitch      4096 bytes per scanline
+base       0xfd000000 (from PCI BAR0)
+console    31x35 characters
+> pci
+00:0 vendor 8086 device 1237 class 6
+00:1 vendor 8086 device 7000 class 6
+00:2 vendor 1234 device 1111 class 3
+00:3 vendor 8086 device 100e class 2
+4 devices on bus 0
+> bars
+drew colour bars
+> echo hi
+hi
+> 

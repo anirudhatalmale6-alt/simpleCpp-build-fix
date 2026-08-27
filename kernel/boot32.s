@@ -12,7 +12,7 @@
 
 .set PML4, 0x1000
 .set PDPT, 0x2000
-.set PD,   0x3000
+.set PD,   0x3000          /* four consecutive PDs: 0x3000..0x6fff */
 .set KERNEL64, 0x101000
 
 .section .multiboot, "a"
@@ -28,7 +28,8 @@ _start:
     cli
     mov $0x90000, %esp
 
-    /* zero the PML4 and PDPT pages (only entry 0 is used; rest must be 0) */
+    /* zero the PML4 and PDPT pages (only the low entries are used; the rest
+       must be zero or the CPU will follow garbage) */
     xor %eax, %eax
     mov $PML4, %edi
     mov $1024, %ecx         /* 2 pages * 512 dwords */
@@ -36,21 +37,43 @@ _start:
 
     /* PML4[0] = PDPT | present|write */
     movl $(PDPT | 0x3), PML4
-    /* PDPT[0] = PD | present|write */
-    movl $(PD | 0x3), PDPT
 
-    /* PD[i] = (i*2MiB) | present|write|PS   for i = 0..511 */
+    /* PDPT[0..3] -> four page directories, i.e. identity-map the first FOUR
+       GiB rather than one. The PCI framebuffer aperture on QEMU's stdvga sits
+       around 0xFD000000, so a 1 GiB map cannot reach it at all: writing a
+       pixel would page-fault, and with no IDT that is a triple fault and a
+       silent reboot loop rather than an error. Everything below 4 GiB is
+       MMIO-or-RAM on this machine, so mapping all of it is the simple
+       answer. */
+    mov $PDPT, %edi
+    mov $PD, %eax
+    mov $0, %ecx
+.fill_pdpt:
+    mov %eax, %ebx
+    or  $0x3, %ebx
+    mov %ebx, (%edi)
+    movl $0, 4(%edi)
+    add $0x1000, %eax       /* next page directory */
+    add $8, %edi
+    inc %ecx
+    cmp $4, %ecx
+    jne .fill_pdpt
+
+    /* PD[i] = (i*2MiB) | present|write|PS  for i = 0..2047 (4 GiB of 2 MiB
+       pages, laid out consecutively across the four directories) */
     mov $0, %ecx
     mov $PD, %edi
 .fill_pd:
     mov %ecx, %eax
-    shl $21, %eax
+    shl $21, %eax           /* low 32 bits of i * 2 MiB */
     or  $0x83, %eax
     mov %eax, (%edi)
-    movl $0, 4(%edi)
+    mov %ecx, %eax
+    shr $11, %eax           /* high 32 bits: i * 2 MiB >> 32 */
+    mov %eax, 4(%edi)
     add $8, %edi
     inc %ecx
-    cmp $512, %ecx
+    cmp $2048, %ecx
     jne .fill_pd
 
     /* CR3 = PML4 */

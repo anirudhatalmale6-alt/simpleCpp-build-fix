@@ -1,0 +1,5 @@
+nano-os graphics bring-up
+FB: 1024x768 at 32 bpp, pitch 4096
+FB: base 0xfd000000
+FB: readback 0x10203 (want 0x10203)
+FB: drawing complete
