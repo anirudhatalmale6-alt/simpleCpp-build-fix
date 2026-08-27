@@ -102,6 +102,56 @@ make structs     # struct/union, member access . and ->, sizeof, string return
 make bitwise     # bitwise & | ^ ~ << >> and function-like #define macros
 make printf      # variadic functions -> a real printf() (%d %x %c %s %%)
 make switch      # switch / case / default: dispatch, fall-through, nesting
+make minimal     # --minimal: compile every demo with the reduced instruction set
+```
+
+### `--minimal`: a reduced instruction set
+
+`nano_cc --minimal` restricts the back end to the instruction set a small
+bootstrap assembler can encode:
+
+```
+mov  add  or  and  sub  xor  cmp  shl  shr  sar
+jmp  je/jz  jne/jnz  jl  jle  jg  jge  jb  jbe  ja  jae
+call  ret  syscall
+```
+
+plus 64-bit and 8-bit `mov` to and from memory. Everything the back end would
+normally reach for is synthesised from those:
+
+| normally | with `--minimal` |
+|---|---|
+| `push rax` | `sub rsp, 8` / `mov [rsp], rax` |
+| `pop rcx` | `mov rcx, [rsp]` / `add rsp, 8` |
+| `lea rax, [rbp - N]` | `mov rax, rbp` / `sub rax, N` |
+| `lea rax, [rip + sym]` | `mov rax, offset sym` |
+| `leave` | `mov rsp, rbp` / `mov rbp, [rsp]` / `add rsp, 8` |
+| `test rax, rax` | `cmp rax, 0` |
+| `setcc al` + `movzx` | `mov rax, 1` / `jcc` / `mov rax, 0` |
+| `movsx rax, byte ptr [rax]` | `mov al, [rax]` / `and rax, 255` / `shl rax, 56` / `sar rax, 56` |
+| `neg rax` | `mov rcx, 0` / `sub rcx, rax` / `mov rax, rcx` |
+| `not rax` | `xor rax, -1` |
+| `imul rax, N` | shift-add over the set bits of N |
+| `imul rax, rcx` | shift-add loop over the bits of rcx |
+| `cqo` + `idiv rcx` | `call __nano_divmod`, a restoring shift-subtract routine |
+
+The one thing that is **not** synthesised is the 8-bit load and store. A 1-byte
+store cannot be built from 8-byte operations without a read-modify-write of the
+seven bytes around it, which may not be mapped and is not the same operation.
+`char`, strings and `printf` all depend on it, so `mov al, [mem]` and
+`mov [mem], al` stay in the required set.
+
+`make minimal` compiles every demo both ways, requires identical output and exit
+status, and checks the minimal assembly contains nothing outside the set. The
+cost is roughly 50% more instructions:
+
+```
+PASS test: same output, only the minimal set, 1128 -> 1702 lines
+PASS features: same output, only the minimal set, 1392 -> 2068 lines
+PASS structs: same output, only the minimal set, 1333 -> 2002 lines
+PASS bitwise: same output, only the minimal set, 1366 -> 2026 lines
+PASS printf: same output, only the minimal set, 1141 -> 1722 lines
+PASS switch: same output, only the minimal set, 1489 -> 2177 lines
 ```
 
 You can also compile your own small programs, e.g. the included `sample.c`:

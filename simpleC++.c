@@ -986,13 +986,217 @@ static int cur_va_off = 0, cur_named = 0;
 static Type *gen_expr(Node *n);       // fwd
 static void  gen_stmt(Node *n);
 
+// =====================================================================
+// 6b. MINIMAL-ISA EMISSION HELPERS
+// =====================================================================
+// With --minimal the back end restricts itself to the instruction set a small
+// bootstrap assembler can encode:
+//
+//     mov  add  or  and  sub  xor  cmp  shl  shr  sar
+//     jmp  je/jz  jne/jnz  jl  jle  jg  jge  jb  jbe  ja  jae
+//     call  ret  syscall
+//
+// plus 64-bit and 8-bit mov to and from memory. Everything else the back end
+// would normally reach for - push, pop, lea, leave, test, setcc, movzx, movsx,
+// neg, not, imul, idiv, cqo - is synthesised from those. The code is longer and
+// slower; that is the trade for a target any small assembler can encode.
+//
+// The one thing that is NOT synthesised is the 8-bit load and store. A 1-byte
+// store cannot be built from 8-byte operations without a read-modify-write of
+// the seven bytes around it, which may not be mapped and is not the same
+// operation. char, strings and printf all depend on it.
+static int g_minimal = 0;
+
+static void e_push(const char *r) {
+    if (!g_minimal) { emit("    push %s", r); return; }
+    emit("    sub rsp, 8");
+    emit("    mov [rsp], %s", r);
+}
+static void e_pop(const char *r) {
+    if (!g_minimal) { emit("    pop %s", r); return; }
+    emit("    mov %s, [rsp]", r);
+    emit("    add rsp, 8");
+}
+// test rax, rax  ->  cmp rax, 0   (same flags for the zero test)
+static void e_test_rax(void) {
+    if (!g_minimal) { e_test_rax(); return; }
+    emit("    cmp rax, 0");
+}
+static void e_neg_rax(void) {
+    if (!g_minimal) { emit("    neg rax"); return; }
+    emit("    mov rcx, 0");
+    emit("    sub rcx, rax");
+    emit("    mov rax, rcx");
+}
+static void e_not_rax(void) {
+    if (!g_minimal) { emit("    not rax"); return; }
+    emit("    xor rax, -1");
+}
+static void e_leave(void) {
+    if (!g_minimal) { emit("    leave"); return; }
+    emit("    mov rsp, rbp");
+    emit("    mov rbp, [rsp]");
+    emit("    add rsp, 8");
+}
+// rax = address of a RIP-relative global. Without lea the address is taken as
+// an absolute immediate, which is fine for the -no-pie image these binaries are.
+static void e_lea_rip(const char *sym) {
+    if (!g_minimal) { emit("    lea rax, [rip + %s]", sym); return; }
+    // GAS Intel syntax reads a bare symbol as memory CONTENTS, so the address
+    // has to be asked for explicitly. In NASM syntax this is plain `mov rax, sym`.
+    emit("    mov rax, offset %s", sym);
+}
+static void e_lea_local(int off) {          // rax = rbp - off
+    if (!g_minimal) { emit("    lea rax, [rbp - %d]", off); return; }
+    emit("    mov rax, rbp");
+    emit("    sub rax, %d", off);
+}
+// rax = *rax as a signed char, without movsx: mask then sign-extend by shifting.
+static void e_load_sbyte(void) {
+    if (!g_minimal) { emit("    movsx rax, byte ptr [rax]"); return; }
+    emit("    mov al, [rax]");
+    emit("    and rax, 255");
+    emit("    shl rax, 56");
+    emit("    sar rax, 56");
+}
+
+static int g_need_divmod = 0;
+
+// A comparison has already been emitted; leave 1 or 0 in rax.
+static void e_setcc(const char *setname, const char *jcc) {
+    if (!g_minimal) { emit("    %s al", setname); emit("    movzx rax, al"); return; }
+    int l = label_id++;
+    emit("    mov rax, 1");
+    emit("    %s .L%d", jcc, l);
+    emit("    mov rax, 0");
+    emit(".L%d:", l);
+}
+
+// reg = reg * n, with n a positive compile-time constant. Shift-add, so the
+// length is fixed by the number of set bits rather than by the value.
+// reg must not be r8 or r9; the call sites use rax and rcx.
+static void e_imul_const(const char *reg, int n) {
+    if (!g_minimal) { emit("    imul %s, %d", reg, n); return; }
+    emit("    mov r8, %s", reg);
+    emit("    mov %s, 0", reg);
+    for (int i = 0; i < 31; i++) {
+        if (!(n & (1 << i))) continue;
+        emit("    mov r9, r8");
+        if (i) emit("    shl r9, %d", i);
+        emit("    add %s, r9", reg);
+    }
+}
+
+// rax = rax * rcx. Shift-add over the bits of rcx. The low 64 bits of a product
+// are the same for signed and unsigned operands, so no sign handling is needed.
+static void e_imul_rax_rcx(void) {
+    if (!g_minimal) { emit("    imul rax, rcx"); return; }
+    int top = label_id++, skip = label_id++, done = label_id++;
+    emit("    mov rdx, rax");
+    emit("    mov rax, 0");
+    emit(".L%d:", top);
+    emit("    cmp rcx, 0");
+    emit("    je .L%d", done);
+    emit("    mov r8, rcx");
+    emit("    and r8, 1");
+    emit("    cmp r8, 0");
+    emit("    je .L%d", skip);
+    emit("    add rax, rdx");
+    emit(".L%d:", skip);
+    emit("    shl rdx, 1");
+    emit("    shr rcx, 1");
+    emit("    jmp .L%d", top);
+    emit(".L%d:", done);
+}
+
+// rax / rcx. Quotient in rax, remainder in rdx.
+static void e_divmod(int want_rem) {
+    if (!g_minimal) {
+        emit("    cqo"); emit("    idiv rcx");
+        if (want_rem) emit("    mov rax, rdx");
+        return;
+    }
+    g_need_divmod = 1;
+    emit("    call __nano_divmod");
+    if (want_rem) emit("    mov rax, rdx");
+}
+
+// Restoring shift-subtract division, emitted once per translation unit.
+// Signs are stripped first and reapplied after, because C rounds the quotient
+// toward zero while an arithmetic shift rounds toward minus infinity, and the
+// remainder takes the sign of the dividend.
+// Clobbers rsi and r8-r11, all caller-saved and dead mid-expression here.
+static void gen_divmod_routine(void) {
+    emit("__nano_divmod:");
+    emit("    mov r8, 0");                 // quotient negative?
+    emit("    mov r9, 0");                 // remainder negative?
+    emit("    cmp rax, 0");
+    emit("    jge .Ldm_a");
+    emit("    mov r9, 1");
+    emit("    mov r8, 1");
+    emit("    mov r10, 0");
+    emit("    sub r10, rax");
+    emit("    mov rax, r10");
+    emit(".Ldm_a:");
+    emit("    cmp rcx, 0");
+    emit("    jge .Ldm_b");
+    emit("    xor r8, 1");
+    emit("    mov r10, 0");
+    emit("    sub r10, rcx");
+    emit("    mov rcx, r10");
+    emit(".Ldm_b:");
+    emit("    mov rdx, 0");                // running remainder
+    emit("    mov r11, 0");                // running quotient
+    emit("    cmp rcx, 0");
+    emit("    je .Ldm_dz");
+    emit("    mov r10, 64");
+    emit(".Ldm_loop:");
+    emit("    cmp r10, 0");
+    emit("    je .Ldm_fin");
+    emit("    shl rdx, 1");
+    emit("    mov rsi, rax");
+    emit("    shr rsi, 63");                // next bit of the dividend
+    emit("    add rdx, rsi");
+    emit("    shl rax, 1");
+    emit("    shl r11, 1");
+    emit("    cmp rdx, rcx");
+    emit("    jb .Ldm_nosub");              // unsigned compare
+    emit("    sub rdx, rcx");
+    emit("    add r11, 1");
+    emit(".Ldm_nosub:");
+    emit("    sub r10, 1");
+    emit("    jmp .Ldm_loop");
+    emit(".Ldm_fin:");
+    emit("    mov rax, r11");
+    emit("    jmp .Ldm_fix");
+    emit(".Ldm_dz:");                       // division by zero yields 0, 0
+    emit("    mov rax, 0");
+    emit("    mov rdx, 0");
+    emit("    ret");
+    emit(".Ldm_fix:");
+    emit("    cmp r8, 0");
+    emit("    je .Ldm_qpos");
+    emit("    mov r10, 0");
+    emit("    sub r10, rax");
+    emit("    mov rax, r10");
+    emit(".Ldm_qpos:");
+    emit("    cmp r9, 0");
+    emit("    je .Ldm_rpos");
+    emit("    mov r10, 0");
+    emit("    sub r10, rdx");
+    emit("    mov rdx, r10");
+    emit(".Ldm_rpos:");
+    emit("    ret");
+}
+
+
 static Sym *lookup(const char *name) {
     Sym *s = sym_find(locals, name);
     if (!s) s = sym_find(globals, name);
     return s;
 }
 static void load_rax(int size) {                 // rax = *rax (size-aware, signed char)
-    if (size == 1) emit("    movsx rax, byte ptr [rax]");
+    if (size == 1) e_load_sbyte();
     else           emit("    mov rax, [rax]");
 }
 static void store_rcx_rax(int size) {            // *rcx = rax
@@ -1005,8 +1209,8 @@ static Type *gen_addr(Node *n) {
     if (n->kind == N_VAR) {
         Sym *s = lookup(n->name);
         if (!s) die("undeclared identifier");
-        if (s->is_global) emit("    lea rax, [rip + %s]", n->name);
-        else              emit("    lea rax, [rbp - %d]", s->offset);
+        if (s->is_global) e_lea_rip(n->name);
+        else              e_lea_local(s->offset);
         return s->type;
     }
     if (n->kind == N_DEREF) {                      // &*p  ==  p
@@ -1053,7 +1257,7 @@ static void gen_string(Node *n) {
     }
     fputs("\"\n", fout);
     emit("    .section .text");
-    emit("    lea rax, [rip + .LC%d]", id);
+    { char b[64]; snprintf(b, sizeof b, ".LC%d", id); e_lea_rip(b); }
 }
 
 static Type *gen_expr(Node *n) {
@@ -1092,9 +1296,9 @@ static Type *gen_expr(Node *n) {
     }
     case N_ASSIGN: {
         Type *lt = gen_addr(n->lhs);
-        emit("    push rax");
+        e_push("rax");
         gen_expr(n->rhs);
-        emit("    pop rcx");
+        e_pop("rcx");
         store_rcx_rax(ty_size(lt));
         return lt;
     }
@@ -1102,7 +1306,7 @@ static Type *gen_expr(Node *n) {
         Type *lt = gen_addr(n->lhs);
         int step = is_ptrish(lt) ? elem_size(lt) : 1;
         int sz = ty_size(lt);
-        emit("    push rax");                      // save &x
+        e_push("rax");                      // save &x
         load_rax(sz);                              // rax = old
         emit("    mov rcx, rax");
         if (n->op == T_INC) emit("    add rcx, %d", step);
@@ -1116,7 +1320,7 @@ static Type *gen_expr(Node *n) {
         Type *lt = gen_addr(n->lhs);
         int step = is_ptrish(lt) ? elem_size(lt) : 1;
         int sz = ty_size(lt);
-        emit("    push rax");                      // save &x
+        e_push("rax");                      // save &x
         load_rax(sz);                              // rax = old
         if (n->op == T_INC) emit("    add rax, %d", step);
         else                emit("    sub rax, %d", step);
@@ -1127,7 +1331,7 @@ static Type *gen_expr(Node *n) {
     }
     case N_TERNARY: {
         int els = label_id++, end = label_id++;
-        gen_expr(n->cond); emit("    test rax, rax"); emit("    jz .L%d", els);
+        gen_expr(n->cond); e_test_rax(); emit("    jz .L%d", els);
         gen_expr(n->lhs);  emit("    jmp .L%d", end);
         emit(".L%d:", els); gen_expr(n->rhs);
         emit(".L%d:", end);
@@ -1135,22 +1339,22 @@ static Type *gen_expr(Node *n) {
     }
     case N_UNARY:
         gen_expr(n->lhs);
-        if      (n->op == T_MINUS)  emit("    neg rax");
-        else if (n->op == T_BITNOT) emit("    not rax");
-        else { emit("    test rax, rax"); emit("    sete al"); emit("    movzx rax, al"); }
+        if      (n->op == T_MINUS)  e_neg_rax();
+        else if (n->op == T_BITNOT) e_not_rax();
+        else { e_test_rax(); e_setcc("sete", "je"); }
         return ty_long();
     case N_LOGAND: {
         int f = label_id++, e = label_id++;
-        gen_expr(n->lhs); emit("    test rax, rax"); emit("    jz .L%d", f);
-        gen_expr(n->rhs); emit("    test rax, rax"); emit("    jz .L%d", f);
+        gen_expr(n->lhs); e_test_rax(); emit("    jz .L%d", f);
+        gen_expr(n->rhs); e_test_rax(); emit("    jz .L%d", f);
         emit("    mov rax, 1"); emit("    jmp .L%d", e);
         emit(".L%d:", f); emit("    mov rax, 0"); emit(".L%d:", e);
         return ty_long();
     }
     case N_LOGOR: {
         int tl = label_id++, e = label_id++;
-        gen_expr(n->lhs); emit("    test rax, rax"); emit("    jnz .L%d", tl);
-        gen_expr(n->rhs); emit("    test rax, rax"); emit("    jnz .L%d", tl);
+        gen_expr(n->lhs); e_test_rax(); emit("    jnz .L%d", tl);
+        gen_expr(n->rhs); e_test_rax(); emit("    jnz .L%d", tl);
         emit("    mov rax, 0"); emit("    jmp .L%d", e);
         emit(".L%d:", tl); emit("    mov rax, 1"); emit(".L%d:", e);
         return ty_long();
@@ -1160,7 +1364,7 @@ static Type *gen_expr(Node *n) {
         if (!strcmp(n->name, "__builtin_va_start")) {
             gen_addr(n->args[0]);                  // rax = &ap
             emit("    mov rcx, rax");
-            emit("    lea rax, [rbp - %d]", cur_va_off - cur_named * 8);  // &save[named]
+            e_lea_local(cur_va_off - cur_named * 8);                      // &save[named]
             emit("    mov [rcx], rax");            // ap = first vararg slot
             return ty_long();
         }
@@ -1176,30 +1380,32 @@ static Type *gen_expr(Node *n) {
         }
         if (!strcmp(n->name, "__builtin_va_end")) return ty_long();   // no-op
 
-        for (int i = 0; i < n->nargs; i++) { gen_expr(n->args[i]); emit("    push rax"); }
-        for (int i = n->nargs - 1; i >= 0; i--) emit("    pop %s", ARGREG[i]);
-        emit("    xor eax, eax");                  // variadic-safe; harmless otherwise
+        for (int i = 0; i < n->nargs; i++) { gen_expr(n->args[i]); e_push("rax"); }
+        for (int i = n->nargs - 1; i >= 0; i--) e_pop(ARGREG[i]);
+        // eax is a 32-bit register, which the minimal target has no encoding for
+        if (g_minimal) emit("    mov rax, 0");
+        else           emit("    xor eax, eax");   // variadic-safe; harmless otherwise
         emit("    call %s", n->name);
         return ty_long();
     }
     case N_BIN: {
-        Type *lt = gen_expr(n->lhs); emit("    push rax");
-        Type *rt = gen_expr(n->rhs); emit("    mov rcx, rax"); emit("    pop rax");
+        Type *lt = gen_expr(n->lhs); e_push("rax");
+        Type *rt = gen_expr(n->rhs); emit("    mov rcx, rax"); e_pop("rax");
         // rax = left, rcx = right
         int op = n->op;
         if (op == T_PLUS || op == T_MINUS) {
             if (is_ptrish(lt) && !is_ptrish(rt)) {
-                int s = elem_size(lt); if (s > 1) emit("    imul rcx, %d", s);
+                int s = elem_size(lt); if (s > 1) e_imul_const("rcx", s);
             } else if (!is_ptrish(lt) && is_ptrish(rt) && op == T_PLUS) {
-                int s = elem_size(rt); if (s > 1) emit("    imul rax, %d", s);
+                int s = elem_size(rt); if (s > 1) e_imul_const("rax", s);
             }
             emit(op == T_PLUS ? "    add rax, rcx" : "    sub rax, rcx");
             return is_ptrish(lt) ? lt : (is_ptrish(rt) ? rt : ty_long());
         }
         switch (op) {
-        case T_STAR:    emit("    imul rax, rcx"); break;
-        case T_SLASH:   emit("    cqo"); emit("    idiv rcx"); break;
-        case T_PERCENT: emit("    cqo"); emit("    idiv rcx"); emit("    mov rax, rdx"); break;
+        case T_STAR:    e_imul_rax_rcx(); break;
+        case T_SLASH:   e_divmod(0); break;
+        case T_PERCENT: e_divmod(1); break;
         case T_AMP:     emit("    and rax, rcx"); break;
         case T_BITOR:   emit("    or rax, rcx");  break;
         case T_BITXOR:  emit("    xor rax, rcx"); break;
@@ -1209,7 +1415,9 @@ static Type *gen_expr(Node *n) {
             emit("    cmp rax, rcx");
             const char *cc = op==T_LT?"setl":op==T_GT?"setg":op==T_LE?"setle":
                              op==T_GE?"setge":op==T_EQ?"sete":"setne";
-            emit("    %s al", cc); emit("    movzx rax, al");
+            const char *jc = op==T_LT?"jl"  :op==T_GT?"jg"  :op==T_LE?"jle" :
+                             op==T_GE?"jge" :op==T_EQ?"je"  :"jne";
+            e_setcc(cc, jc);
             break;
         }
         default: die("bad binary operator");
@@ -1308,21 +1516,21 @@ static void gen_stmt(Node *n) {
     case N_DECL:
         if (n->init) {
             Sym *s = lookup(n->name);
-            emit("    lea rax, [rbp - %d]", s->offset);
-            emit("    push rax");
+            e_lea_local(s->offset);
+            e_push("rax");
             gen_expr(n->init);
-            emit("    pop rcx");
+            e_pop("rcx");
             store_rcx_rax(ty_size(s->type));
         }
         break;
     case N_EXPR: gen_expr(n->lhs); break;
     case N_RETURN:
         if (n->lhs) gen_expr(n->lhs);
-        emit("    leave"); emit("    ret");
+        e_leave(); emit("    ret");
         break;
     case N_IF: {
         int els = label_id++, end = label_id++;
-        gen_expr(n->cond); emit("    test rax, rax"); emit("    jz .L%d", els);
+        gen_expr(n->cond); e_test_rax(); emit("    jz .L%d", els);
         gen_stmt(n->lhs);  emit("    jmp .L%d", end);
         emit(".L%d:", els); if (n->els) gen_stmt(n->els);
         emit(".L%d:", end);
@@ -1331,7 +1539,7 @@ static void gen_stmt(Node *n) {
     case N_WHILE: {
         int top = label_id++, end = label_id++;
         emit(".L%d:", top);
-        gen_expr(n->cond); emit("    test rax, rax"); emit("    jz .L%d", end);
+        gen_expr(n->cond); e_test_rax(); emit("    jz .L%d", end);
         loop_push(end, top); gen_stmt(n->lhs); loop_pop();
         emit("    jmp .L%d", top);
         emit(".L%d:", end);
@@ -1342,7 +1550,7 @@ static void gen_stmt(Node *n) {
         emit(".L%d:", top);
         loop_push(end, cont); gen_stmt(n->lhs); loop_pop();
         emit(".L%d:", cont);
-        gen_expr(n->cond); emit("    test rax, rax"); emit("    jnz .L%d", top);
+        gen_expr(n->cond); e_test_rax(); emit("    jnz .L%d", top);
         emit(".L%d:", end);
         break;
     }
@@ -1350,7 +1558,7 @@ static void gen_stmt(Node *n) {
         int top = label_id++, cont = label_id++, end = label_id++;
         if (n->init) gen_stmt(n->init);
         emit(".L%d:", top);
-        if (n->cond) { gen_expr(n->cond); emit("    test rax, rax"); emit("    jz .L%d", end); }
+        if (n->cond) { gen_expr(n->cond); e_test_rax(); emit("    jz .L%d", end); }
         loop_push(end, cont); gen_stmt(n->lhs); loop_pop();
         emit(".L%d:", cont);
         if (n->rhs) gen_expr(n->rhs);                 // step
@@ -1373,7 +1581,7 @@ static void gen_stmt(Node *n) {
         int def = find_default_label(n->lhs);
 
         gen_expr(n->cond);              // switch value in rax
-        emit("    push rax");           // keep it on the stack for every comparison
+        e_push("rax");           // keep it on the stack for every comparison
         emit_case_jumps(n->lhs);        // jump to the matching case label
         emit("    add rsp, 8");         // discard the saved switch value
         if (def != -1) emit("    jmp .L%d", def);   // no match -> default
@@ -1409,7 +1617,7 @@ static void gen_func(Func *fn) {
     int fs = (frame_size + 15) & ~15;
 
     emit("%s:", fn->name);
-    emit("    push rbp");
+    e_push("rbp");
     emit("    mov rbp, rsp");
     if (fs > 0) emit("    sub rsp, %d", fs);
     for (int i = 0; i < fn->nparams && i < 6; i++) {
@@ -1425,7 +1633,7 @@ static void gen_func(Func *fn) {
         for (int i = 0; i < 6; i++) emit("    mov [rbp - %d], %s", va_off - i * 8, r[i]);
     }
     gen_stmt(fn->body);
-    emit("    leave"); emit("    ret");             // safety epilogue
+    e_leave(); emit("    ret");                     // safety epilogue
 }
 
 // =====================================================================
@@ -1439,11 +1647,12 @@ int main(int argc, char **argv) {
     const char *inpath = NULL, *outpath = NULL;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--kernel") || !strcmp(argv[i], "-k")) kernel_mode = 1;
+        else if (!strcmp(argv[i], "--minimal")) g_minimal = 1;
         else if (!inpath)  inpath  = argv[i];
         else if (!outpath) outpath = argv[i];
     }
     if (!inpath || !outpath) {
-        fprintf(stderr, "Usage: %s [--kernel] <input.c> <output.s>\n", argv[0]);
+        fprintf(stderr, "Usage: %s [--kernel] [--minimal] <input.c> <output.s>\n", argv[0]);
         return 1;
     }
 
@@ -1471,6 +1680,7 @@ int main(int argc, char **argv) {
     }
 
     for (Func *f = funcs; f; f = f->next) gen_func(f);
+    if (g_need_divmod) gen_divmod_routine();
 
     // Globals.  Hosted mode puts them in .bss (zeroed by the loader).  Kernel
     // mode uses .data so the zero bytes are emitted into the object and survive

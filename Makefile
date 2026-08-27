@@ -13,7 +13,7 @@ CFLAGS   ?= -std=c11 -O2 -Wall -Wextra
 SRC       = simpleC++.c
 BIN       = nano_cc
 
-.PHONY: all run test demo structs bitwise printf switch clean
+.PHONY: all run test demo structs bitwise printf switch minimal clean
 
 all: $(BIN)
 
@@ -69,6 +69,12 @@ switch: $(BIN)
 	$(CC) -nostdlib -no-pie switch.s -o switch_prog
 	@echo "---- ./switch_prog output ----"
 	@./switch_prog
+
+# --minimal: emit only the instruction set the bootstrap assembler implements
+# (mov add or and sub xor cmp shl shr sar jcc call ret syscall, plus 8-bit mov).
+# Checks every demo still behaves identically and uses nothing outside that set.
+minimal: $(BIN)
+	@sh minimal-check.sh
 
 clean:
 	rm -f $(BIN) sample.s sample_prog test.s test_prog \
