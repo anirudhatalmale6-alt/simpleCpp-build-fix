@@ -220,10 +220,25 @@ long isr_dispatch(struct Regs *r) {
     v = r->vec;
 
     if (v < 32) {
-        // A CPU exception. Nothing here can meaningfully continue, so report
-        // it fully and stop, rather than returning into the same instruction
-        // and faulting forever.
+        // A CPU exception. Returning into the same instruction would just
+        // fault again forever, so the only choices are to stop the machine or
+        // to stop the thread.
         dump_regs(r);
+#ifdef NANO_THREAD_H
+        // With a scheduler running, a fault does not have to be fatal to
+        // everything: kill the thread that caused it and schedule someone
+        // else. The supervisor can then restart it.
+        //
+        // What this DOES contain: a thread that crashes. What it does NOT
+        // contain: a thread that corrupted someone else's memory before
+        // crashing, or one that died holding a lock. Both need separate
+        // address spaces, which is a later milestone -- saying otherwise
+        // because the word "microkernel" is in play would be a lie.
+        if (g_sched_on && thread_fault_kill()) {
+            puts("thread killed; the rest of the system continues\n");
+            return sched_switch((long)r);
+        }
+#endif
         puts("\nhalted.\n");
         cpu_halt_forever();
         return (long)r;
@@ -343,6 +358,18 @@ char keyboard_getchar_irq() {
         cpu_idle();
     }
 }
+
+#ifdef NANO_THREAD_H
+// The threaded sleep: give the CPU to someone else until the deadline, rather
+// than halting the core. Lives here rather than in nano-thread.h because it
+// needs the timer, and nano-thread.h is included first so that the dispatcher
+// can see the scheduler.
+void thread_sleep_ms(long ms) {
+    long target;
+    target = g_ticks + (ms * g_hz) / 1000;
+    while (g_ticks < target) thread_yield();
+}
+#endif
 
 // Sleep for roughly n milliseconds, using the timer rather than a spin.
 void sleep_ms(long ms) {

@@ -15,7 +15,8 @@ QFLAGS := -kernel kernel.elf -no-reboot
 .PHONY: all run test shot gfx gfxrun gfxtest gfxshot \
         gshell gshellrun gshelltest gshellshot \
         intr intrrun intrtest acpi acpirun acpitest \
-        mm mmrun mmtest threads threadsrun threadstest clean
+        mm mmrun mmtest threads threadsrun threadstest \
+        srv srvrun srvtest clean
 
 all: kernel.elf
 
@@ -128,7 +129,7 @@ gfxshot: gfx.elf
 # with commands that draw.
 # ---------------------------------------------------------------------------
 gfxshell.s: gfxshell.c nano-kernel.h nano-fb.h nano-font.h nano-int.h \
-            nano-acpi.h nano-mm.h nano-thread.h $(NANO)
+            nano-acpi.h nano-mm.h nano-thread.h nano-srv.h $(NANO)
 	$(NANO) --kernel gfxshell.c gfxshell.s
 
 gshell64.bin: boot64.s isr.s gfxshell.s kernel64.ld
@@ -164,6 +165,9 @@ gshelltest: gshell.elf
 	   sleep 0.5; for k in s p a w n ret; do echo "sendkey $$k"; sleep 0.18; done; \
 	   sleep 0.4; for k in s p a w n ret; do echo "sendkey $$k"; sleep 0.18; done; \
 	   sleep 0.4; for k in p s ret; do echo "sendkey $$k"; sleep 0.18; done; \
+	   sleep 0.4; for k in s r v ret; do echo "sendkey $$k"; sleep 0.18; done; \
+	   sleep 0.4; for k in c r a s h ret; do echo "sendkey $$k"; sleep 0.18; done; \
+	   sleep 1.2; for k in s r v ret; do echo "sendkey $$k"; sleep 0.18; done; \
 	   sleep 0.5; for k in b a r s ret; do echo "sendkey $$k"; sleep 0.18; done; \
 	   sleep 0.4; for k in e c h o spc h i ret; do echo "sendkey $$k"; sleep 0.18; done; \
 	   sleep 0.4; for k in f a u l t ret; do echo "sendkey $$k"; sleep 0.18; done; \
@@ -182,6 +186,7 @@ gshelltest: gshell.elf
 	   && grep -q "wrote through it" gshell-serial.clean \
 	   && grep -q "the shell stays usable" gshell-serial.clean \
 	   && grep -q "context switches so far" gshell-serial.clean \
+	   && grep -q "this shell never stopped" gshell-serial.clean \
 	   && grep -qx "hi" gshell-serial.clean \
 	   && grep -q "EXCEPTION 14: page fault" gshell-serial.clean \
 	   && echo "PASS: graphics, keyboard, PCI, ACPI, idle, memory and faults" \
@@ -197,8 +202,10 @@ gshellshot: gshell.elf
 	   sleep 0.5; for k in s p a w n ret; do echo "sendkey $$k"; sleep 0.18; done; \
 	   sleep 0.3; for k in s p a w n ret; do echo "sendkey $$k"; sleep 0.18; done; \
 	   sleep 0.3; for k in s p a w n ret; do echo "sendkey $$k"; sleep 0.18; done; \
-	   sleep 0.3; for k in p s ret; do echo "sendkey $$k"; sleep 0.18; done; \
-	   sleep 1.5; echo "screendump gshell.ppm"; sleep 1; echo quit ) | \
+	   sleep 0.3; for k in s r v ret; do echo "sendkey $$k"; sleep 0.18; done; \
+	   sleep 0.4; for k in c r a s h ret; do echo "sendkey $$k"; sleep 0.18; done; \
+	   sleep 1.2; for k in s r v ret; do echo "sendkey $$k"; sleep 0.18; done; \
+	   sleep 1.2; echo "screendump gshell.ppm"; sleep 1; echo quit ) | \
 	 timeout 45 $(QEMU) -kernel gshell.elf -no-reboot -display none \
 	   -serial file:gshell-serial.log -monitor stdio >/dev/null 2>&1
 	@convert gshell.ppm gshell.png && echo "wrote gshell.png"
@@ -380,10 +387,54 @@ threadstest: threads.elf
 	   && echo "PASS: preemption, joins, a real race, a mutex that stops it" \
 	   || { echo "FAIL"; exit 1; }
 
+# ---------------------------------------------------------------------------
+# Servers: a registry, heartbeats, a supervisor, and faults that kill only the
+# server that caused them.
+# ---------------------------------------------------------------------------
+srv.s: srv.c nano-kernel.h nano-mm.h nano-thread.h nano-int.h nano-srv.h $(NANO)
+	$(NANO) --kernel srv.c srv.s
+
+srv64.bin: boot64.s isr.s srv.s kernel64.ld
+	as --64 boot64.s -o boot64.o
+	as --64 isr.s    -o isr.o
+	as --64 srv.s    -o srv.o
+	ld -T kernel64.ld -o srv64.elf boot64.o isr.o srv.o
+	objcopy -O binary srv64.elf srv64.bin
+
+blob-srv.s:
+	@printf '.section .blob, "a"\n.incbin "srv64.bin"\n' > $@
+
+srv.elf: boot32.s blob-srv.s srv64.bin final.ld
+	as --32 boot32.s   -o boot32.o
+	as --32 blob-srv.s -o blob-srv.o
+	ld -m elf_i386 -T final.ld -o srv.elf boot32.o blob-srv.o
+
+srv: srv.elf
+
+srvrun: srv.elf
+	$(QEMU) -kernel srv.elf -no-reboot
+
+srvtest: srv.elf
+	@rm -f srv-serial.log
+	@( sleep 14; echo quit ) | \
+	 timeout 60 $(QEMU) -kernel srv.elf -no-reboot -display none \
+	   -serial file:srv-serial.log -monitor stdio >/dev/null 2>&1; \
+	 echo "---- serial output ----"; cat srv-serial.log; echo "-----------------------"; \
+	 tr -d '\r' < srv-serial.log > srv-serial.clean; \
+	 grep -q "crash recovery ok" srv-serial.clean \
+	   && grep -q "isolation ok" srv-serial.clean \
+	   && grep -q "hang detected" srv-serial.clean \
+	   && grep -q "hang recovery ok" srv-serial.clean \
+	   && grep -q "repeat recovery ok" srv-serial.clean \
+	   && grep -q "healthy server still counting" srv-serial.clean \
+	   && grep -q "server bring-up complete" srv-serial.clean \
+	   && echo "PASS: crashes and hangs both recovered, the rest kept running" \
+	   || { echo "FAIL"; exit 1; }
+
 clean:
-	rm -f *.o shell.s gfx.s gfxshell.s intr.s acpi.s mm.s threads.s \
+	rm -f *.o shell.s gfx.s gfxshell.s intr.s acpi.s mm.s threads.s srv.s \
 	      blob-gfx.s blob-gshell.s blob-intr.s blob-acpi.s blob-mm.s \
-	      blob-threads.s \
+	      blob-threads.s blob-srv.s \
 	      kernel64.elf kernel64.bin kernel.elf \
 	      gfx64.elf gfx64.bin gfx.elf \
 	      gshell64.elf gshell64.bin gshell.elf \
@@ -393,5 +444,6 @@ clean:
 	      acpi64.elf acpi64.bin acpi.elf acpi-serial.log acpi-serial.clean \
 	      mm64.elf mm64.bin mm.elf mm-serial.log mm-serial.clean \
 	      threads64.elf threads64.bin threads.elf \
+	      srv64.elf srv64.bin srv.elf srv-serial.log srv-serial.clean \
 	      threads-serial.log threads-serial.clean \
 	      vga.ppm gfx.ppm gshell.ppm

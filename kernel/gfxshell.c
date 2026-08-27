@@ -13,6 +13,7 @@
 #include "nano-thread.h"
 #include "nano-int.h"
 #include "nano-acpi.h"
+#include "nano-srv.h"
 
 #define COL_BG      0x0d1117
 #define COL_FG      0xc9d1d9
@@ -375,15 +376,6 @@ void cmd_maptest() {
 // ---------------------------------------------------------------------------
 // Threads
 // ---------------------------------------------------------------------------
-// Defined here rather than in nano-thread.h because it needs the timer, and
-// nano-thread.h is included before nano-int.h so that the dispatcher can see
-// the scheduler.
-void thread_sleep_ms(long ms) {
-    long target;
-    target = g_ticks + (ms * g_hz) / 1000;
-    while (g_ticks < target) thread_yield();
-}
-
 long g_anim_stop;
 long g_anim_count;
 
@@ -423,6 +415,82 @@ void animator(long seed) {
     }
     fb_fill(x, y, w, w, 0x010409);
     thread_exit(0);
+}
+
+// ---------------------------------------------------------------------------
+// Servers
+// ---------------------------------------------------------------------------
+long g_crash_req;
+long g_blink_srv;
+long g_crash_srv;
+
+// A supervised service: a small indicator in the corner of the title bar that
+// blinks while it is healthy. If it stops, you can see that it stopped.
+void blinker_server(long unused) {
+    long on;
+    long me;
+    me = srv_self();
+    on = 0;
+    for (;;) {
+        srv_beat(me);
+        fb_fill(fb_width - 24, 8, 10, 10, on ? 0x3fb950 : 0x0d3018);
+        on = !on;
+        thread_sleep_ms(250);
+    }
+}
+
+// A service that faults on request, so the recovery can be watched rather than
+// described. Writing through a null pointer is the ordinary way a driver dies,
+// and page 0 is unmapped at boot precisely so that it faults instead of
+// quietly scribbling on the interrupt vector table.
+void crasher_server(long unused) {
+    long me;
+    me = srv_self();
+    for (;;) {
+        srv_beat(me);
+        if (g_crash_req) {
+            long *p;
+            g_crash_req = 0;
+            p = (long *)0;
+            p[0] = 1;
+        }
+        thread_sleep_ms(40);
+    }
+}
+
+// The kernel printf has no field width, so pad by hand rather than write
+// "%-9s" and have every following column read the wrong argument.
+void pad_to(char *s, long width) {
+    long n;
+    n = 0;
+    while (s[n]) { putc(s[n]); n = n + 1; }
+    while (n < width) { putc(' '); n = n + 1; }
+}
+
+void cmd_srv() {
+    long i;
+    puts("name      state    thr restarts faults hangs\n");
+    i = 0;
+    while (i < g_nsrv) {
+        pad_to(g_srv[i].name, 10);
+        pad_to(srv_state_name(g_srv[i].state), 9);
+        printf("%d   %d", g_srv[i].thread, g_srv[i].restarts);
+        printf("        %d      %d\n", g_srv[i].faults, g_srv[i].hangs);
+        i = i + 1;
+    }
+    printf("supervisor: %d checks, %d restarts\n", g_sup_checks, g_sup_restarts);
+}
+
+void cmd_crash() {
+    long before;
+    before = g_srv[g_crash_srv].restarts;
+    puts("asking the crasher service to dereference a null pointer...\n");
+    g_crash_req = 1;
+    thread_sleep_ms(600);
+    printf("restarts %d -> %d. this shell never stopped.\n",
+           before, g_srv[g_crash_srv].restarts);
+    puts("a crash is contained. corruption would not be -- that needs\n");
+    puts("a separate address space per server, which is the next step.\n");
 }
 
 char *state_name(long st) {
@@ -468,6 +536,7 @@ void cmd_help() {
     puts("  idle uptime fault\n");
     puts("  mem heaptest maptest\n");
     puts("  ps spawn stopall\n");
+    puts("  srv crash\n");
     puts("  demo bars grad lines circles font\n");
     puts("  echo <text>\n");
 }
@@ -514,6 +583,14 @@ void shell_thread(long unused) {
     char line[128];
     long n;
 
+    // Services start once the scheduler is live, so the supervisor has
+    // something to schedule.
+    srv_init(100);
+    g_blink_srv = srv_register("blinker", (long)blinker_server, 0, 100);
+    g_crash_srv = srv_register("crasher", (long)crasher_server, 0, 100);
+    srv_start(g_blink_srv);
+    srv_start(g_crash_srv);
+
     splash();
     puts("framebuffer console up. type help.\n");
     printf("timer %d Hz, %d CPU, idle %s\n", g_hz, acpi_cpus, acpi_cstate_name());
@@ -552,6 +629,8 @@ void shell_thread(long unused) {
         else if (!strcmp(line, "ps")) cmd_ps();
         else if (!strcmp(line, "spawn")) cmd_spawn();
         else if (!strcmp(line, "stopall")) cmd_stopall();
+        else if (!strcmp(line, "srv")) cmd_srv();
+        else if (!strcmp(line, "crash")) cmd_crash();
         else if (!strcmp(line, "demo")) cmd_demo();
         else if (!strcmp(line, "bars")) cmd_bars();
         else if (!strcmp(line, "grad")) cmd_grad();
@@ -570,9 +649,13 @@ int main() {
     mm_init();                     // frames, 4 KiB paging, kernel heap
     g_anim_stop = 0;
     g_anim_count = 0;
-    acpi_init();
+    acpi_init();                   // reads the EBDA pointer at 0x40E...
     acpi_enable();
     acpi_pick_cstate();
+    mm_protect_null();             // ...so unmap page 0 only after that.
+                                   // Without this a null dereference lands in
+                                   // the interrupt vector table and succeeds.
+    g_crash_req = 0;
 
     if (!fb_init(1024, 768)) {
         vga_clear();

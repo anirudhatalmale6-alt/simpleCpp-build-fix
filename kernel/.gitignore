@@ -37,3 +37,8 @@ blob-threads.s
 threads64.elf
 threads64.bin
 threads.elf
+srv.s
+blob-srv.s
+srv64.elf
+srv64.bin
+srv.elf

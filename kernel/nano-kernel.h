@@ -133,7 +133,14 @@ void _put_uint(long n, int base) {
     while (i > 0) { i = i - 1; putc(buf[i]); }
 }
 
-// printf straight to the VGA screen (and serial mirror).  %d %x %c %s %%.
+// printf straight to the framebuffer or VGA screen (and the serial mirror).
+//
+// %d %x %c %s and %% ONLY -- no flags, no field width, no precision. Writing
+// "%-9s" here does not pad, it prints "%-9s" literally and then reads the NEXT
+// argument for the following conversion, so every column after it is one
+// argument out. If you want columns, pad them yourself. nano-libc.h has the
+// full formatter; this one is deliberately small because it is what the kernel
+// uses before there is a heap.
 void printf(char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);

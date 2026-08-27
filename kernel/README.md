@@ -44,6 +44,9 @@ make mmtest     # headless: frames, mapping, heap reuse, unmap really unmaps
 
 make threads    # preemptive threads, locking, thread-safe heap
 make threadstest # headless: preemption, joins, a real race, a mutex
+
+make srv        # servers, heartbeats, a supervisor that restarts them
+make srvtest    # headless: a crash and a hang, both recovered
 ```
 
 `make test` needs no display; it drives real keystrokes through QEMU's
@@ -473,3 +476,93 @@ That is the core of the API and **not** the whole of it — detach,
 cancellation, condition variables, barriers, thread-local storage and
 attributes are not implemented, and calling this "pthreads" without saying so
 would be a lie.
+
+---
+
+## Servers and supervision
+
+```
+$ make srvtest
+-- all three servers up --
+name      state    thr restarts faults hangs beats
+ticker    running  2   0        0      0     11
+crasher   running  3   0        0      0     11
+hanger    running  4   0        0      0     11
+
+-- making the crasher dereference a null pointer --
+*** EXCEPTION 14: page fault ... faulting address 0x0
+thread 3 (crasher) faulted
+thread killed; the rest of the system continues
+supervisor: crasher died, restarting
+
+ticker    running  2   0        0      0     40      <- kept counting
+crasher   running  3   1        1      0     28      <- back up
+
+-- making the hanger stop answering (still scheduled) --
+supervisor: hanger stopped answering, restarting
+```
+
+Named services with their own threads, a registry, heartbeats, and a
+supervisor that restarts anything which dies or goes quiet. A fault inside a
+server now kills **that server**, not the machine.
+
+### What this contains, and what it does not
+
+| failure | contained? | how |
+|---|---|---|
+| a server crashes | yes | the exception handler kills the thread and the supervisor restarts it |
+| a server hangs | yes | its heartbeat goes stale and the supervisor restarts it |
+| a server **corrupts another's memory** | **no** | it keeps answering its health check perfectly while the damage is already done |
+
+That third row is the whole reason real microkernels give each server its own
+address space and run them unprivileged. Everything here is ring 0 in one
+address space, so a wild pointer in one service lands in another's data and
+nothing detects it. **Health checks catch crashes and hangs; only address
+spaces catch corruption.** Calling this fault-tolerant without saying which of
+the three it handles would be a lie.
+
+There is also a dependency nobody can design away: **a supervisor cannot
+restart the thing it needs in order to restart anything.** This one allocates a
+stack from the heap, so it can restart a filesystem or a driver, and it could
+not restart the memory manager. MINIX 3 has the same problem and handles its VM
+server specially for exactly that reason. Restarting the HAL is worse again —
+it owns the interrupt controller, so during the restart there is no timer to
+run the supervisor with.
+
+### Two things that make the test worth running
+
+**A healthy server has to keep counting throughout.** A recovery test with
+nothing else running proves the machine survived; it does not prove the *rest
+of the system* did. The ticker's count going from 11 to 40 across the crash is
+the actual claim.
+
+**The hang case is separate from the crash case on purpose.** The hanging
+server has not crashed — its thread is alive and being scheduled normally.
+Only the missing heartbeat gives it away, and a supervisor that only watches
+for dead threads misses it entirely.
+
+### Null now faults
+
+`mm_protect_null()` unmaps the first page at boot. Without it, writing through
+a null pointer lands in the interrupt vector table and **succeeds** — the whole
+first 4 GiB is identity-mapped. The most common bug in C silently corrupting
+low memory and surfacing later as something unrelated is not a good default.
+
+It has to be called *after* anything that reads the BIOS data area, because the
+ACPI RSDP search reads the EBDA segment from `0x40E`, which is in that page.
+
+### In the shell
+
+`srv` lists the services; `crash` asks one to dereference a null pointer so the
+recovery can be watched rather than described. The green square in the title
+bar is a supervised service blinking — if it stops, you can see that it
+stopped.
+
+### A trap in the kernel printf
+
+The kernel's `printf` handles `%d %x %c %s %%` and **nothing else** — no flags,
+no field width. Writing `"%-9s"` does not pad: it prints `%-9s` literally and
+then reads the *next* argument for the following conversion, so every column
+after it is one argument out. It looks like a formatting problem and is
+actually a wrong-data problem. Pad by hand, or use `nano-libc.h`, which has the
+full formatter.

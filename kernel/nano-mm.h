@@ -623,6 +623,19 @@ long heap_bytes_free() {
     return n;
 }
 
+// Unmap the first page, so that dereferencing a null pointer faults.
+//
+// It does not, otherwise: the identity map covers the whole first 4 GiB, so a
+// write to address 0 lands in the interrupt vector table and SUCCEEDS. The
+// most common bug in C -- following a null pointer -- silently corrupts low
+// memory and shows up later as something unrelated.
+//
+// Call this AFTER anything that reads the BIOS data area, because the ACPI
+// RSDP search reads the EBDA segment from 0x40E, which is in this page.
+long mm_protect_null() {
+    return vmm_unmap(0);
+}
+
 long mm_init() {
     if (!mm_init_frames()) return 0;
     if (!heap_init(16)) return 0;              // 64 KiB to start

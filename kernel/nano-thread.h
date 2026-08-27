@@ -49,6 +49,7 @@ struct Thread {
     long retval;
     long joiner;               // id of a thread waiting on this one, or -1
     long slices;               // how many times it has been scheduled
+    long faulted;              // 1 if it died from a CPU exception
     char name[32];
 };
 
@@ -145,6 +146,7 @@ long thread_create(long entry, long arg, char *nm) {
     g_threads[slot].retval = 0;
     g_threads[slot].joiner = -1;
     g_threads[slot].slices = 0;
+    g_threads[slot].faulted = 0;
     g_threads[slot].id = slot;
     thread_name(slot, nm);
     // 16-byte align the top, and leave a word spare: the ABI wants rsp+8
@@ -287,6 +289,48 @@ void thread_init() {
     g_switches = 0;
     g_sched_on = 0;
     g_stack_smashed = 0;
+    g_thread_faults = 0;
+}
+
+// Called from the exception handler when the running thread has faulted.
+// Returns 1 if it was safe to kill just this thread, 0 if the fault has to be
+// fatal to the whole machine.
+//
+// It is NOT safe when the faulting thread is the only one that can run: with
+// nothing left to schedule, returning would resume the dead thread and fault
+// again immediately. Better to say so and stop than to loop.
+long g_thread_faults;
+
+long thread_fault_kill() {
+    long other;
+    long i;
+    long n;
+
+    if (!g_sched_on) return 0;
+
+    // is there anything else to run?
+    other = 0;
+    n = 0;
+    i = 0;
+    while (i < MAX_THREADS) {
+        if (i != g_current &&
+            (g_threads[i].state == T_READY || g_threads[i].state == T_RUNNING))
+            other = 1;
+        i = i + 1;
+    }
+    if (!other) return 0;
+
+    printf("thread %d (%s) faulted\n", g_current, g_threads[g_current].name);
+    g_thread_faults = g_thread_faults + 1;
+    g_threads[g_current].state = T_DONE;
+    g_threads[g_current].retval = -1;
+    g_threads[g_current].faulted = 1;
+    if (g_threads[g_current].joiner >= 0) {
+        long j;
+        j = g_threads[g_current].joiner;
+        if (g_threads[j].state == T_BLOCKED) g_threads[j].state = T_READY;
+    }
+    return 1;
 }
 
 // ---------- locks ----------
@@ -350,6 +394,26 @@ void mutex_lock(struct Mutex *m) {
         // a slice that the holder needs in order to release it.
         thread_yield();
     }
+}
+
+// A thread that dies holding a mutex leaves it locked forever, and everyone
+// waiting on it blocks for good. Real isolation solves this by giving each
+// server its own address space and its own locks; here, the supervisor calls
+// this for the locks it knows about when it reaps a dead server. Anything it
+// does not know about stays stuck -- which is precisely the limitation that
+// address-space separation exists to remove.
+long mutex_release_if_owner(struct Mutex *m, long owner) {
+    long f;
+    long freed;
+    f = irq_save();
+    freed = 0;
+    if (m->locked && m->owner == owner) {
+        m->locked = 0;
+        m->owner = -1;
+        freed = 1;
+    }
+    irq_restore(f);
+    return freed;
 }
 
 long mutex_trylock(struct Mutex *m) {
