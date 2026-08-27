@@ -13,7 +13,8 @@ CFLAGS   ?= -std=c11 -O2 -Wall -Wextra
 SRC       = simpleC++.c
 BIN       = nano_cc
 
-.PHONY: all run test demo structs bitwise printf switch minimal initializers clean
+.PHONY: all run test demo structs bitwise printf switch minimal \
+        initializers typedefs gotos functions reserved checkall selfhost clean
 
 all: $(BIN)
 
@@ -76,15 +77,48 @@ switch: $(BIN)
 minimal: $(BIN)
 	@sh minimal-check.sh
 
-# Brace initialisers, local and global, checked against gcc compiling the same
-# source. Pass MINIASM=/path/to/mini-asm to include the no-binutils leg:
+# Checked against gcc compiling the same source, in normal and --minimal mode.
+# Pass MINIASM=/path/to/mini-asm to include the no-binutils leg:
 #   make initializers MINIASM=../sha-audit/build/fixed
 MINIASM ?=
+
+# Brace initialisers, local and global.
 initializers: $(BIN)
-	@sh init-check.sh $(MINIASM)
+	@sh gcc-check.sh initializers.c $(MINIASM)
+
+# typedef and enum: typedef'd builtins, structs, pointers and arrays, the
+# self-referential idiom, enumerator auto-increment, enums as array sizes and
+# case labels, and block-scope typedefs.
+typedefs: $(BIN)
+	@sh gcc-check.sh typedefs.c $(MINIASM)
+
+# goto and labels: forward, backward, out of nested loops, inside a switch.
+gotos: $(BIN)
+	@sh gcc-check.sh gotos.c $(MINIASM)
+
+# array parameters (long m[4][3] is long (*m)[3]) and function return types.
+functions: $(BIN)
+	@sh gcc-check.sh functions.c $(MINIASM)
+
+# C names that are assembler keywords (sp, ax, ch, gs, flat, ptr, word).
+reserved: $(BIN)
+	@sh gcc-check.sh reserved.c $(MINIASM)
+
+# Every gcc-checked suite in one go.
+checkall: $(BIN)
+	@for f in initializers typedefs gotos functions reserved; do \
+	    echo "== $$f.c"; sh gcc-check.sh $$f.c $(MINIASM) || exit 1; \
+	done
+
+# How far is nano_cc from compiling itself? Prints what it can already handle
+# and the exact list of what is still missing. See selfhost-shim.h.
+selfhost: $(BIN)
+	@sh selfhost.sh
 
 clean:
 	rm -f $(BIN) sample.s sample_prog test.s test_prog \
 	      features.s features_prog structs.s structs_prog \
 	      bitwise.s bitwise_prog printf.s printf_prog \
-	      switch.s switch_prog initializers.s initializers_prog
+	      switch.s switch_prog initializers.s initializers_prog \
+	      typedefs.s typedefs_prog gotos.s gotos_prog \
+	      functions.s functions_prog reserved.s reserved_prog

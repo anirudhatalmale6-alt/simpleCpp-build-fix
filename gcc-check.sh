@@ -1,19 +1,20 @@
 #!/bin/sh
-# init-check.sh — brace initialisers, checked against gcc in every mode.
+# gcc-check.sh — run one test program through every nano_cc mode and require
+# each one to print exactly what gcc prints for the SAME source.
 #
-# The reference is gcc compiling the SAME source with <stdio.h> swapped in for
-# nano-nolibc.h, so every printed value is an independent second opinion rather
-# than a number I decided was right.
+# The reference is gcc compiling that source with <stdio.h> swapped in for
+# nano-nolibc.h, so every printed value is an independent second opinion
+# rather than a number I decided was right.
 #
-#   normal   nano_cc            -> GNU as
-#   minimal  nano_cc --minimal  -> GNU as     (bootstrap instruction set only)
+#   normal   nano_cc                  -> GNU as
+#   minimal  nano_cc --minimal        -> GNU as     (bootstrap instruction set)
 #   nasm     nano_cc --minimal --nasm -> mini-asm, if one is available
 #
-#   sh init-check.sh [path-to-mini-asm]
+#   sh gcc-check.sh <source.c> [path-to-mini-asm]
 
 set -u
-SRC=initializers.c
-MINIASM=${1:-}
+SRC=${1:?usage: gcc-check.sh <source.c> [path-to-mini-asm]}
+MINIASM=${2:-}
 W=$(mktemp -d)
 trap 'rm -rf "$W"' EXIT
 FAIL=0
