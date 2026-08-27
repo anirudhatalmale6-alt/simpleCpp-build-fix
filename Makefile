@@ -13,7 +13,7 @@ CFLAGS   ?= -std=c11 -O2 -Wall -Wextra
 SRC       = simpleC++.c
 BIN       = nano_cc
 
-.PHONY: all run test demo structs bitwise printf switch minimal clean
+.PHONY: all run test demo structs bitwise printf switch minimal initializers clean
 
 all: $(BIN)
 
@@ -76,8 +76,15 @@ switch: $(BIN)
 minimal: $(BIN)
 	@sh minimal-check.sh
 
+# Brace initialisers, local and global, checked against gcc compiling the same
+# source. Pass MINIASM=/path/to/mini-asm to include the no-binutils leg:
+#   make initializers MINIASM=../sha-audit/build/fixed
+MINIASM ?=
+initializers: $(BIN)
+	@sh init-check.sh $(MINIASM)
+
 clean:
 	rm -f $(BIN) sample.s sample_prog test.s test_prog \
 	      features.s features_prog structs.s structs_prog \
 	      bitwise.s bitwise_prog printf.s printf_prog \
-	      switch.s switch_prog
+	      switch.s switch_prog initializers.s initializers_prog

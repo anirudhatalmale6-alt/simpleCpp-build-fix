@@ -213,8 +213,24 @@ Enough of C to compile `nano-nolibc.h` + `test.c`:
 - **Statements:** `if/else`, `while`, `for`, `do/while`, `switch` / `case` /
   `default` (with C fall-through, `break`, and nesting), `break`, `continue`,
   `return`, blocks, and `__asm__("...")` pass-through inline assembly.
+- **Initialisers:** brace initialisers for arrays, structs and nested
+  combinations of the two (`int t[4] = {1,2,3,4}`, `struct Line l = {{1,2},
+  {3,4},99}`, `long m[2][3] = {{1,2,3},{4,5,6}}`), multi-dimensional arrays,
+  length inference (`int t[] = {1,2,3}`, `char s[] = "hi"`), string
+  initialisers for `char` arrays, arrays of string pointers
+  (`char *r[3] = {"a","b","c"}`), and partial initialisers — anything not
+  named is zeroed, as C requires. Global initialisers are folded to a byte
+  image at compile time; local ones become element-wise stores over a zeroed
+  object. See `initializers.c` and `make initializers`.
 - **Codegen:** x86_64 System V, values in `rax`, up to 6 register arguments,
   a freestanding `_start` that calls `main` and exits with its return value.
+
+### Not supported yet
+
+`typedef`, `enum`, real (32-bit) `int`, real `unsigned` arithmetic —
+`unsigned` currently parses and is **ignored** — function pointers, floating
+point, and calls with more than 6 arguments (which now report an error rather
+than generating wrong code).
 
 ---
 
