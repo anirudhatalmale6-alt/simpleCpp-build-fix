@@ -42,3 +42,8 @@ blob-srv.s
 srv64.elf
 srv64.bin
 srv.elf
+fs.s
+blob-fs.s
+fs64.elf
+fs64.bin
+fs.elf

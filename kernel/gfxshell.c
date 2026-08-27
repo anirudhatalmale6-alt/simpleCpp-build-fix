@@ -14,6 +14,7 @@
 #include "nano-int.h"
 #include "nano-acpi.h"
 #include "nano-srv.h"
+#include "nano-fs.h"
 
 #define COL_BG      0x0d1117
 #define COL_FG      0xc9d1d9
@@ -493,6 +494,200 @@ void cmd_crash() {
     puts("a separate address space per server, which is the next step.\n");
 }
 
+// ---------------------------------------------------------------------------
+// Shell tools
+// ---------------------------------------------------------------------------
+char g_cwd[256];
+char g_path[512];
+char g_path2[512];
+char g_iobuf[4096];
+
+// Resolve a possibly-relative path against the working directory.
+char *resolve(char *p, char *out) {
+    long i;
+    long k;
+    if (p[0] == '/') {
+        k = 0;
+        while (p[k] && k < 500) { out[k] = p[k]; k = k + 1; }
+        out[k] = 0;
+        return out;
+    }
+    k = 0;
+    while (g_cwd[k] && k < 250) { out[k] = g_cwd[k]; k = k + 1; }
+    if (k == 0 || out[k - 1] != '/') { out[k] = '/'; k = k + 1; }
+    i = 0;
+    while (p[i] && k < 500) { out[k] = p[i]; k = k + 1; i = i + 1; }
+    out[k] = 0;
+    return out;
+}
+
+// Split a command line into words in place. Returns the count; argv points
+// into `line`, which the caller owns.
+long split(char *line, char **argv, long maxv) {
+    long n;
+    long i;
+    n = 0;
+    i = 0;
+    for (;;) {
+        while (line[i] == ' ') { line[i] = 0; i = i + 1; }
+        if (!line[i]) return n;
+        if (n >= maxv) return n;
+        argv[n] = line + i;
+        n = n + 1;
+        while (line[i] && line[i] != ' ') i = i + 1;
+    }
+}
+
+void cmd_ls(char *path) {
+    long dir;
+    long i;
+    char nm[64];
+    dir = fs_lookup(resolve(path, g_path));
+    if (!dir) { printf("ls: %s: not found\n", g_path); return; }
+    if (fs_type(dir) != T_DIR) {
+        printf("%s  %d bytes\n", g_path, fs_size(dir));
+        return;
+    }
+    i = 0;
+    for (;;) {
+        long ino;
+        ino = fs_readdir(dir, i, nm);
+        if (!ino) break;
+        if (strcmp(nm, ".") && strcmp(nm, "..")) {
+            if (fs_type(ino) == T_DIR) { puts(nm); puts("/\n"); }
+            else printf("%s  %d\n", nm, fs_size(ino));
+        }
+        i = i + 1;
+    }
+}
+
+void cmd_cat(char *path) {
+    long ino;
+    long off;
+    ino = fs_lookup(resolve(path, g_path));
+    if (!ino) { printf("cat: %s: not found\n", g_path); return; }
+    if (fs_type(ino) == T_DIR) { printf("cat: %s is a directory\n", g_path); return; }
+    off = 0;
+    for (;;) {
+        long n;
+        long i;
+        n = fs_read(ino, off, g_iobuf, 4096);
+        if (n <= 0) break;
+        i = 0;
+        while (i < n) { putc(g_iobuf[i]); i = i + 1; }
+        off = off + n;
+    }
+}
+
+void cmd_mkdir(char *path) {
+    if (!fs_mkdir(resolve(path, g_path))) printf("mkdir: %s failed\n", g_path);
+}
+
+void cmd_rm(char *path) {
+    if (!fs_unlink(resolve(path, g_path)))
+        printf("rm: %s failed (missing, or a non-empty directory)\n", g_path);
+}
+
+void cmd_touch(char *path) {
+    if (!fs_create(resolve(path, g_path))) printf("touch: %s failed\n", g_path);
+}
+
+// cp really copies the bytes. mv does not -- see cmd_mv.
+void cmd_cp(char *from, char *to) {
+    long src;
+    long dst;
+    long off;
+    src = fs_lookup(resolve(from, g_path));
+    if (!src) { printf("cp: %s: not found\n", g_path); return; }
+    if (fs_type(src) == T_DIR) { puts("cp: cannot copy a directory\n"); return; }
+    resolve(to, g_path2);
+    dst = fs_lookup(g_path2);
+    if (dst) fs_truncate(dst);
+    else dst = fs_create(g_path2);
+    if (!dst) { printf("cp: cannot create %s\n", g_path2); return; }
+    off = 0;
+    for (;;) {
+        long n;
+        n = fs_read(src, off, g_iobuf, 4096);
+        if (n <= 0) break;
+        if (fs_write(dst, off, g_iobuf, n) != n) { puts("cp: write failed\n"); return; }
+        off = off + n;
+    }
+    printf("copied %d bytes\n", off);
+}
+
+// mv is a directory operation: the inode does not move, so a large file
+// renames in the time it takes to rewrite two 32-byte entries. cp above has to
+// read and write every byte; this does not.
+void cmd_mv(char *from, char *to) {
+    resolve(from, g_path);
+    resolve(to, g_path2);
+    if (!fs_rename(g_path, g_path2)) printf("mv: %s -> %s failed\n", g_path, g_path2);
+}
+
+void cmd_write(char *path, char *text, long append) {
+    long ino;
+    long off;
+    long n;
+    resolve(path, g_path);
+    ino = fs_lookup(g_path);
+    if (!ino) ino = fs_create(g_path);
+    if (!ino) { printf("write: %s failed\n", g_path); return; }
+    off = append ? fs_size(ino) : 0;
+    if (!append) fs_truncate(ino);
+    n = strlen(text);
+    fs_write(ino, off, text, n);
+    fs_write(ino, off + n, "\n", 1);
+}
+
+void cmd_cd(char *path) {
+    long ino;
+    resolve(path, g_path);
+    ino = fs_lookup(g_path);
+    if (!ino) { printf("cd: %s: not found\n", g_path); return; }
+    if (fs_type(ino) != T_DIR) { printf("cd: %s is not a directory\n", g_path); return; }
+    strcpy(g_cwd, g_path);
+}
+
+void cmd_df() {
+    long free_blocks;
+    free_blocks = blocks_free();
+    printf("%d blocks of %d bytes\n", sb_nblocks, BLK_SIZE);
+    printf("%d free (%d KiB), %d used\n",
+           free_blocks, free_blocks / 2, sb_nblocks - sb_data_start - free_blocks);
+    printf("inodes: %d, data starts at block %d\n", sb_ninodes, sb_data_start);
+}
+
+// Write a whole string to a file. The length comes from strlen rather than
+// being counted by hand -- a hardcoded length that is one too long reads past
+// the end of the literal and writes whatever follows it in memory into the
+// file, which is exactly what happened the first time.
+void put_file(char *path, char *text) {
+    long ino;
+    ino = fs_create(path);
+    if (ino) fs_write(ino, 0, text, strlen(text));
+}
+
+// Something to look at on the first boot, so `ls` is not an empty room.
+void fs_populate() {
+    fs_mkdir("/src");
+    fs_mkdir("/doc");
+    put_file("/doc/readme",
+        "nano-os\n"
+        "\n"
+        "everything here was compiled by nano_cc, which compiled itself.\n"
+        "the filesystem is a ram disk with a unix-shaped layout:\n"
+        "superblock, bitmaps, inodes, directory entries.\n"
+        "\n"
+        "try: ls, cat, cp, mv, mkdir, rm, write, df\n");
+    put_file("/src/hello.c",
+        "int main() {\n"
+        "    puts(\"hello from a file\\n\");\n"
+        "    return 0;\n"
+        "}\n");
+    strcpy(g_cwd, "/");
+}
+
 char *state_name(long st) {
     if (st == T_UNUSED) return "unused ";
     if (st == T_READY) return "ready  ";
@@ -537,6 +732,7 @@ void cmd_help() {
     puts("  mem heaptest maptest\n");
     puts("  ps spawn stopall\n");
     puts("  srv crash\n");
+    puts("  ls cat mkdir rm touch cp mv write append cd pwd df\n");
     puts("  demo bars grad lines circles font\n");
     puts("  echo <text>\n");
 }
@@ -585,6 +781,9 @@ void shell_thread(long unused) {
 
     // Services start once the scheduler is live, so the supervisor has
     // something to schedule.
+    if (!fs_format(2048, 128)) puts("filesystem format failed\n");
+    else fs_populate();
+
     srv_init(100);
     g_blink_srv = srv_register("blinker", (long)blinker_server, 0, 100);
     g_crash_srv = srv_register("crasher", (long)crasher_server, 0, 100);
@@ -598,6 +797,7 @@ void shell_thread(long unused) {
 
     for (;;) {
         long c;
+        puts(g_cwd);
         puts("> ");
         n = 0;
         for (;;) {
@@ -638,7 +838,32 @@ void shell_thread(long unused) {
         else if (!strcmp(line, "circles")) cmd_circles();
         else if (!strcmp(line, "font")) cmd_font();
         else if (starts_with(line, "echo ")) { puts(line + 5); putc('\n'); }
-        else { puts("unknown: "); puts(line); putc('\n'); }
+        else if (!strcmp(line, "pwd")) { puts(g_cwd); putc('\n'); }
+        else if (!strcmp(line, "df")) cmd_df();
+        else if (!strcmp(line, "ls")) cmd_ls(g_cwd);
+        else {
+            // Anything with arguments. `write` and `append` keep the rest of
+            // the line verbatim, so the text can contain spaces.
+            char work[128];
+            char *av[8];
+            long ac;
+            strcpy(work, line);
+            ac = split(work, av, 8);
+            if (ac == 0) { }
+            else if (!strcmp(av[0], "ls") && ac >= 2) cmd_ls(av[1]);
+            else if (!strcmp(av[0], "cat") && ac >= 2) cmd_cat(av[1]);
+            else if (!strcmp(av[0], "mkdir") && ac >= 2) cmd_mkdir(av[1]);
+            else if (!strcmp(av[0], "rm") && ac >= 2) cmd_rm(av[1]);
+            else if (!strcmp(av[0], "touch") && ac >= 2) cmd_touch(av[1]);
+            else if (!strcmp(av[0], "cd") && ac >= 2) cmd_cd(av[1]);
+            else if (!strcmp(av[0], "cp") && ac >= 3) cmd_cp(av[1], av[2]);
+            else if (!strcmp(av[0], "mv") && ac >= 3) cmd_mv(av[1], av[2]);
+            else if (starts_with(line, "write ") && ac >= 3)
+                cmd_write(av[1], line + 6 + strlen(av[1]) + 1, 0);
+            else if (starts_with(line, "append ") && ac >= 3)
+                cmd_write(av[1], line + 7 + strlen(av[1]) + 1, 1);
+            else { puts("unknown: "); puts(line); putc('\n'); }
+        }
     }
 }
 

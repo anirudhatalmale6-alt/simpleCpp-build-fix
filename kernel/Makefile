@@ -16,7 +16,7 @@ QFLAGS := -kernel kernel.elf -no-reboot
         gshell gshellrun gshelltest gshellshot \
         intr intrrun intrtest acpi acpirun acpitest \
         mm mmrun mmtest threads threadsrun threadstest \
-        srv srvrun srvtest clean
+        srv srvrun srvtest fs fsrun fstest clean
 
 all: kernel.elf
 
@@ -129,7 +129,7 @@ gfxshot: gfx.elf
 # with commands that draw.
 # ---------------------------------------------------------------------------
 gfxshell.s: gfxshell.c nano-kernel.h nano-fb.h nano-font.h nano-int.h \
-            nano-acpi.h nano-mm.h nano-thread.h nano-srv.h $(NANO)
+            nano-acpi.h nano-mm.h nano-thread.h nano-srv.h nano-fs.h $(NANO)
 	$(NANO) --kernel gfxshell.c gfxshell.s
 
 gshell64.bin: boot64.s isr.s gfxshell.s kernel64.ld
@@ -167,7 +167,15 @@ gshelltest: gshell.elf
 	   sleep 0.4; for k in p s ret; do echo "sendkey $$k"; sleep 0.18; done; \
 	   sleep 0.4; for k in s r v ret; do echo "sendkey $$k"; sleep 0.18; done; \
 	   sleep 0.4; for k in c r a s h ret; do echo "sendkey $$k"; sleep 0.18; done; \
-	   sleep 1.2; for k in s r v ret; do echo "sendkey $$k"; sleep 0.18; done; \
+	   sleep 1.2; for k in l s ret; do echo "sendkey $$k"; sleep 0.18; done; \
+	   sleep 0.4; for k in c a t spc slash d o c slash r e a d m e ret; \
+	     do echo "sendkey $$k"; sleep 0.15; done; \
+	   sleep 0.5; for k in c p spc slash d o c slash r e a d m e spc slash r 2 ret; \
+	     do echo "sendkey $$k"; sleep 0.15; done; \
+	   sleep 0.5; for k in m v spc slash r 2 spc slash r 3 ret; \
+	     do echo "sendkey $$k"; sleep 0.15; done; \
+	   sleep 0.5; for k in l s ret; do echo "sendkey $$k"; sleep 0.18; done; \
+	   sleep 0.4; for k in d f ret; do echo "sendkey $$k"; sleep 0.18; done; \
 	   sleep 0.5; for k in b a r s ret; do echo "sendkey $$k"; sleep 0.18; done; \
 	   sleep 0.4; for k in e c h o spc h i ret; do echo "sendkey $$k"; sleep 0.18; done; \
 	   sleep 0.4; for k in f a u l t ret; do echo "sendkey $$k"; sleep 0.18; done; \
@@ -187,6 +195,10 @@ gshelltest: gshell.elf
 	   && grep -q "the shell stays usable" gshell-serial.clean \
 	   && grep -q "context switches so far" gshell-serial.clean \
 	   && grep -q "this shell never stopped" gshell-serial.clean \
+	   && grep -q "everything here was compiled by nano_cc" gshell-serial.clean \
+	   && grep -q "^copied 22[0-9] bytes" gshell-serial.clean \
+	   && grep -q "^r3  22[0-9]$$" gshell-serial.clean \
+	   && grep -q "blocks of 512 bytes" gshell-serial.clean \
 	   && grep -qx "hi" gshell-serial.clean \
 	   && grep -q "EXCEPTION 14: page fault" gshell-serial.clean \
 	   && echo "PASS: graphics, keyboard, PCI, ACPI, idle, memory and faults" \
@@ -202,9 +214,13 @@ gshellshot: gshell.elf
 	   sleep 0.5; for k in s p a w n ret; do echo "sendkey $$k"; sleep 0.18; done; \
 	   sleep 0.3; for k in s p a w n ret; do echo "sendkey $$k"; sleep 0.18; done; \
 	   sleep 0.3; for k in s p a w n ret; do echo "sendkey $$k"; sleep 0.18; done; \
-	   sleep 0.3; for k in s r v ret; do echo "sendkey $$k"; sleep 0.18; done; \
-	   sleep 0.4; for k in c r a s h ret; do echo "sendkey $$k"; sleep 0.18; done; \
-	   sleep 1.2; for k in s r v ret; do echo "sendkey $$k"; sleep 0.18; done; \
+	   sleep 0.3; for k in l s ret; do echo "sendkey $$k"; sleep 0.18; done; \
+	   sleep 0.4; for k in c a t spc slash d o c slash r e a d m e ret; \
+	     do echo "sendkey $$k"; sleep 0.15; done; \
+	   sleep 0.6; for k in c p spc slash d o c slash r e a d m e spc slash n o t e s ret; \
+	     do echo "sendkey $$k"; sleep 0.15; done; \
+	   sleep 0.6; for k in l s ret; do echo "sendkey $$k"; sleep 0.18; done; \
+	   sleep 0.4; for k in d f ret; do echo "sendkey $$k"; sleep 0.18; done; \
 	   sleep 1.2; echo "screendump gshell.ppm"; sleep 1; echo quit ) | \
 	 timeout 45 $(QEMU) -kernel gshell.elf -no-reboot -display none \
 	   -serial file:gshell-serial.log -monitor stdio >/dev/null 2>&1
@@ -431,10 +447,57 @@ srvtest: srv.elf
 	   && echo "PASS: crashes and hangs both recovered, the rest kept running" \
 	   || { echo "FAIL"; exit 1; }
 
+# ---------------------------------------------------------------------------
+# Filesystem: a RAM disk, a Unix-shaped layout (superblock, bitmaps, inodes,
+# directory entries), and the operations the shell tools need.
+# ---------------------------------------------------------------------------
+fs.s: fs.c nano-kernel.h nano-mm.h nano-thread.h nano-int.h nano-fs.h $(NANO)
+	$(NANO) --kernel fs.c fs.s
+
+fs64.bin: boot64.s isr.s fs.s kernel64.ld
+	as --64 boot64.s -o boot64.o
+	as --64 isr.s    -o isr.o
+	as --64 fs.s     -o fs.o
+	ld -T kernel64.ld -o fs64.elf boot64.o isr.o fs.o
+	objcopy -O binary fs64.elf fs64.bin
+
+blob-fs.s:
+	@printf '.section .blob, "a"\n.incbin "fs64.bin"\n' > $@
+
+fs.elf: boot32.s blob-fs.s fs64.bin final.ld
+	as --32 boot32.s  -o boot32.o
+	as --32 blob-fs.s -o blob-fs.o
+	ld -m elf_i386 -T final.ld -o fs.elf boot32.o blob-fs.o
+
+fs: fs.elf
+
+fsrun: fs.elf
+	$(QEMU) -kernel fs.elf -no-reboot
+
+fstest: fs.elf
+	@rm -f fs-serial.log
+	@( sleep 10; echo quit ) | \
+	 timeout 60 $(QEMU) -kernel fs.elf -no-reboot -display none \
+	   -serial file:fs-serial.log -monitor stdio >/dev/null 2>&1; \
+	 echo "---- serial output ----"; cat fs-serial.log; echo "-----------------------"; \
+	 tr -d '\r' < fs-serial.log > fs-serial.clean; \
+	 grep -q "read/write ok" fs-serial.clean \
+	   && grep -q "indirect block ok" fs-serial.clean \
+	   && grep -q "short read at EOF ok" fs-serial.clean \
+	   && grep -q "nested path lookup ok" fs-serial.clean \
+	   && grep -q "unlink freed the blocks ok" fs-serial.clean \
+	   && grep -q "reused space ok" fs-serial.clean \
+	   && grep -q "rename moved the name, not the data" fs-serial.clean \
+	   && grep -q "refused to remove a non-empty directory ok" fs-serial.clean \
+	   && grep -q "concurrent fs ok" fs-serial.clean \
+	   && grep -q "each file kept its own data ok" fs-serial.clean \
+	   && echo "PASS: files, directories, indirect blocks, rename, concurrency" \
+	   || { echo "FAIL"; exit 1; }
+
 clean:
-	rm -f *.o shell.s gfx.s gfxshell.s intr.s acpi.s mm.s threads.s srv.s \
+	rm -f *.o shell.s gfx.s gfxshell.s intr.s acpi.s mm.s threads.s srv.s fs.s \
 	      blob-gfx.s blob-gshell.s blob-intr.s blob-acpi.s blob-mm.s \
-	      blob-threads.s blob-srv.s \
+	      blob-threads.s blob-srv.s blob-fs.s \
 	      kernel64.elf kernel64.bin kernel.elf \
 	      gfx64.elf gfx64.bin gfx.elf \
 	      gshell64.elf gshell64.bin gshell.elf \
@@ -445,5 +508,6 @@ clean:
 	      mm64.elf mm64.bin mm.elf mm-serial.log mm-serial.clean \
 	      threads64.elf threads64.bin threads.elf \
 	      srv64.elf srv64.bin srv.elf srv-serial.log srv-serial.clean \
+	      fs64.elf fs64.bin fs.elf fs-serial.log fs-serial.clean \
 	      threads-serial.log threads-serial.clean \
 	      vga.ppm gfx.ppm gshell.ppm

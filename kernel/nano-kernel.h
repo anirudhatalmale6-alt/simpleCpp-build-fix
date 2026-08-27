@@ -113,6 +113,67 @@ void print_int(long n) {
     while (i > 0) { i = i - 1; putc(buf[i]); }
 }
 
+// The handful of string and memory routines the kernel needs. nano-base.h has
+// the same set for the hosted side; they are duplicated rather than shared
+// because that file also drags in Linux syscalls, which mean nothing here.
+long strlen(char *s) { long n; n = 0; while (s[n]) n = n + 1; return n; }
+
+void *memcpy(void *d, void *s, long n) {
+    char *a; char *b;
+    a = (char *)d; b = (char *)s;
+    while (n > 0) { *a = *b; a = a + 1; b = b + 1; n = n - 1; }
+    return d;
+}
+
+// Overlap-safe, unlike memcpy. The filesystem shuffles directory entries
+// within one block, which is exactly the overlapping case.
+void *memmove(void *d, void *s, long n) {
+    char *a; char *b;
+    a = (char *)d; b = (char *)s;
+    if (a == b || n <= 0) return d;
+    if (a < b) { while (n > 0) { *a = *b; a = a + 1; b = b + 1; n = n - 1; } return d; }
+    a = a + n; b = b + n;
+    while (n > 0) { a = a - 1; b = b - 1; *a = *b; n = n - 1; }
+    return d;
+}
+
+void *memset(void *d, int c, long n) {
+    char *a;
+    a = (char *)d;
+    while (n > 0) { *a = (char)c; a = a + 1; n = n - 1; }
+    return d;
+}
+
+int memcmp(void *p, void *q, long n) {
+    char *a; char *b;
+    a = (char *)p; b = (char *)q;
+    while (n > 0) {
+        int d;
+        d = (*a & 255) - (*b & 255);
+        if (d) return d;
+        a = a + 1; b = b + 1; n = n - 1;
+    }
+    return 0;
+}
+
+char *strcpy(char *d, char *s) {
+    char *r;
+    r = d;
+    while (*s) { *d = *s; d = d + 1; s = s + 1; }
+    *d = 0;
+    return r;
+}
+
+int strncmp(char *a, char *b, long n) {
+    while (n > 0) {
+        int d;
+        d = (*a & 255) - (*b & 255);
+        if (d || !*a) return d;
+        a = a + 1; b = b + 1; n = n - 1;
+    }
+    return 0;
+}
+
 int strcmp(char *a, char *b) {
     while (*a && (*a == *b)) { a = a + 1; b = b + 1; }
     return *a - *b;
@@ -174,9 +235,17 @@ void printf(char *fmt, ...) {
 // ---------- PS/2 keyboard ----------
 // US-QWERTY scancode set 1 -> ASCII, built once into a .bss table.
 char g_keymap[128];
+char g_shiftmap[128];
+long g_shift_down;
+
+// Scancodes for the two shift keys. A press is the code; a release is the same
+// code with bit 7 set, which is how the driver knows shift went back up.
+#define SC_LSHIFT 0x2A
+#define SC_RSHIFT 0x36
 
 void kbd_init() {
     int i;
+    g_shift_down = 0;
     i = 0;
     while (i < 128) { g_keymap[i] = 0; i = i + 1; }
     g_keymap[0x02] = '1'; g_keymap[0x03] = '2'; g_keymap[0x04] = '3';
@@ -196,6 +265,38 @@ void kbd_init() {
     g_keymap[0x39] = ' ';       // space
     g_keymap[0x1C] = '\n';      // enter
     g_keymap[0x0E] = '\b';      // backspace
+
+    // Punctuation. Without these a shell cannot type a path: `/` alone makes
+    // the difference between a usable prompt and one that can only name things
+    // in the current directory.
+    g_keymap[0x0C] = '-'; g_keymap[0x0D] = '=';
+    g_keymap[0x1A] = '['; g_keymap[0x1B] = ']';
+    g_keymap[0x27] = ';'; g_keymap[0x28] = '\'';
+    g_keymap[0x29] = '`'; g_keymap[0x2B] = '\\';
+    g_keymap[0x33] = ','; g_keymap[0x34] = '.';
+    g_keymap[0x35] = '/'; g_keymap[0x0F] = ' ';    // tab behaves as a space
+
+    // The shifted table. Built here rather than by adding 32 to a letter,
+    // because the symbol row does not follow that rule at all.
+    i = 0;
+    while (i < 128) { g_shiftmap[i] = 0; i = i + 1; }
+    i = 0;
+    while (i < 128) {
+        char c;
+        c = g_keymap[i];
+        if (c >= 'a' && c <= 'z') g_shiftmap[i] = c - 32;
+        else g_shiftmap[i] = c;
+        i = i + 1;
+    }
+    g_shiftmap[0x02] = '!'; g_shiftmap[0x03] = '@'; g_shiftmap[0x04] = '#';
+    g_shiftmap[0x05] = '$'; g_shiftmap[0x06] = '%'; g_shiftmap[0x07] = '^';
+    g_shiftmap[0x08] = '&'; g_shiftmap[0x09] = '*'; g_shiftmap[0x0A] = '(';
+    g_shiftmap[0x0B] = ')'; g_shiftmap[0x0C] = '_'; g_shiftmap[0x0D] = '+';
+    g_shiftmap[0x1A] = '{'; g_shiftmap[0x1B] = '}';
+    g_shiftmap[0x27] = ':'; g_shiftmap[0x28] = '"';
+    g_shiftmap[0x29] = '~'; g_shiftmap[0x2B] = '|';
+    g_shiftmap[0x33] = '<'; g_shiftmap[0x34] = '>';
+    g_shiftmap[0x35] = '?';
 }
 
 // Block until a key is pressed; return its ASCII value.  A genuine hardware
@@ -207,9 +308,11 @@ char keyboard_getchar() {
     for (;;) {
         while ((inb(0x64) & 1) == 0) { }    // wait for a byte
         sc = inb(0x60);
+        if (sc == SC_LSHIFT || sc == SC_RSHIFT) { g_shift_down = 1; continue; }
+        if (sc == (SC_LSHIFT | 128) || sc == (SC_RSHIFT | 128)) { g_shift_down = 0; continue; }
         if (sc < 128) {                     // press (not release)
             char ch;
-            ch = g_keymap[sc];
+            ch = g_shift_down ? g_shiftmap[sc] : g_keymap[sc];
             if (ch != 0) return ch;
         }
     }

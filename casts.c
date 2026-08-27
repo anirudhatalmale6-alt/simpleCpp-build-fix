@@ -62,6 +62,33 @@ int main() {
     printf("byte 7 of g_words  = %d\n", (int)(((char *)g_words)[7]));
     printf("(char*)g_words + 8 = %d\n", (int)((char *)g_words + 8 - (char *)g_words));
 
+    printf("-- narrowing casts --\n");
+    // A cast has to CONVERT, not just relabel. (char)129 is -127, and while
+    // the cast was a no-op, `(char)129 == c` was false even when c held
+    // exactly that byte. It surfaced in a filesystem test comparing a byte
+    // read back off disk against the expression that produced it.
+    printf("(char)129          = %d\n", (char)129);
+    printf("(char)255          = %d\n", (char)255);
+    printf("(char)128          = %d\n", (char)128);
+    printf("(char)127          = %d\n", (char)127);
+    printf("(char)256          = %d\n", (char)256);
+    printf("(char)257          = %d\n", (char)257);
+    printf("(char)-1           = %d\n", (char)-1);
+    printf("(char)0x1234567890ABCDEF = %d\n", (char)0x1234567890ABCDEF);
+    printf("(char)200 & 255    = %d\n", (char)200 & 255);
+    printf("(long)(char)200    = %d\n", (long)(char)200);
+    {
+        char cb[4];
+        long i;
+        i = 18;
+        cb[0] = (char)((i * 7 + 3) & 255);
+        printf("stored vs cast     = %d\n", cb[0] == (char)((i * 7 + 3) & 255));
+        printf("stored value       = %d\n", cb[0]);
+    }
+    // and a cast that does NOT narrow must leave the value alone
+    printf("(long)300          = %d\n", (long)300);
+    printf("(int)300           = %d\n", (int)300);
+
     printf("-- nested casts --\n");
     printf("(long)(char*)b - (long)base = %d\n", (long)(char *)b - (long)base);
     printf("(int)(long)300 + 1 = %d\n", (int)(long)300 + 1);

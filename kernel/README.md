@@ -47,6 +47,9 @@ make threadstest # headless: preemption, joins, a real race, a mutex
 
 make srv        # servers, heartbeats, a supervisor that restarts them
 make srvtest    # headless: a crash and a hang, both recovered
+
+make fs         # a RAM disk with a Unix-shaped filesystem
+make fstest     # headless: indirect blocks, rename, delete, concurrency
 ```
 
 `make test` needs no display; it drives real keystrokes through QEMU's
@@ -566,3 +569,89 @@ then reads the *next* argument for the following conversion, so every column
 after it is one argument out. It looks like a formatting problem and is
 actually a wrong-data problem. Pad by hand, or use `nano-libc.h`, which has the
 full formatter.
+
+---
+
+## Filesystem
+
+```
+$ make fstest
+formatted: 2048 blocks, 128 inodes, data starts at 35
+read/write ok
+big file: wrote 6000, size 6000, used 13 blocks
+indirect block ok
+/src contains: . .. kernel main.c util.c
+deleting big.bin returned 13 blocks
+unlink freed the blocks ok / reused space ok
+inode before 2, after 2 -> rename moved the name, not the data
+refused to remove a non-empty directory ok
+three concurrent writers: 0 errors
+```
+
+The classic Unix layout on a RAM disk — superblock, inode bitmap, block
+bitmap, inode table, then data. **Not FAT16**, deliberately: FAT is the
+interoperable choice and it is three times the code for the same
+demonstration (BPB parsing, cluster chains, 8.3 names, long-name entries, two
+copies of the table to keep in step). This one supports real directories and
+hard links naturally and can be read top to bottom.
+
+Every on-disk field is 8 bytes wide, which is wasteful and worth explaining:
+`nano_cc` has no 16- or 32-bit integer type, so a struct with mixed field
+widths cannot be declared correctly at all. That is the same limit that blocks
+uACPI, seen from the other side.
+
+### The tests that a plausible-but-wrong implementation would fail
+
+* **A file past the direct blocks.** Eight direct pointers reach 4 KiB, so the
+  test writes 6000 bytes — the indirect block is genuinely used rather than
+  merely present. A 1 KiB test file leaves that path completely unexercised.
+* **Deleting has to give the blocks back**, and the space has to be *reusable*,
+  not merely counted. The test frees a file, writes another over the same
+  blocks and reads it back.
+* **Rename must not copy.** The inode number is checked before and after: it
+  has to be the same one, because a rename that copies is a rename that takes
+  a second per megabyte and runs out of disk halfway.
+* **Removing a non-empty directory must be refused**, or its contents are
+  orphaned and their blocks are lost with no way to find them again.
+* **Three threads writing at once.** Before the filesystem took a lock, two of
+  them inside `balloc` at the same time walked away with the same block.
+
+### Shell tools
+
+`ls cat mkdir rm touch cp mv write append cd pwd df`, with a working directory
+in the prompt.
+
+`cp` reads and writes every byte. `mv` does not: it is a directory operation,
+so a large file renames in the time it takes to rewrite two 32-byte entries.
+That difference is the reason both exist.
+
+### The keyboard grew punctuation
+
+The map had letters, digits, space, enter and backspace — and no `/`. A shell
+that cannot type a path can only name things in the current directory, so the
+symbol row and a shift table are in now. Shift is handled as *state*: its
+release matters as much as its press, which is why the release codes are
+checked before the "is this a press" test.
+
+### A compiler bug this found
+
+`(char)129` is `-127`. Until this work, the cast was a **no-op** — it relabelled
+the value without converting it — so
+
+```c
+buf[0] = (char)((i * 7 + 3) & 255);
+buf[0] == (char)((i * 7 + 3) & 255)     // false
+```
+
+The stored byte came back sign-extended as `-127`; the cast produced `129`. It
+surfaced here as a filesystem test reporting corruption when the data on disk
+was perfectly correct — the comparison was wrong, not the bytes. A cast has to
+*convert*. See `casts.c` in the parent directory.
+
+### What this is not, yet
+
+The filesystem is a **library the shell calls directly**, not a server reached
+by message passing. Its state and locking are arranged so it can become one,
+but a genuine server needs IPC, and IPC only buys anything once each server has
+its own address space. Registering it as a supervised heartbeat thread that
+does no actual serving would look like progress and would be theatre.

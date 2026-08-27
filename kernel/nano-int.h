@@ -268,9 +268,14 @@ long isr_dispatch(struct Regs *r) {
     if (v == IRQ_BASE + 1) {                    // keyboard
         int sc;
         sc = inb(0x60);
-        if (sc < 128) {
+        // Shift is not a character: it is a state the next keypress reads.
+        // Its release matters as much as its press, which is why the release
+        // codes are checked before the "is this a press" test below.
+        if (sc == SC_LSHIFT || sc == SC_RSHIFT) g_shift_down = 1;
+        else if (sc == (SC_LSHIFT | 128) || sc == (SC_RSHIFT | 128)) g_shift_down = 0;
+        else if (sc < 128) {
             char ch;
-            ch = g_keymap[sc];
+            ch = g_shift_down ? g_shiftmap[sc] : g_keymap[sc];
             if (ch != 0) kbd_push(ch);
         }
         pic_eoi(1);
