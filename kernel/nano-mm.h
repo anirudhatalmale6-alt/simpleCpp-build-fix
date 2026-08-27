@@ -14,6 +14,16 @@
 #ifndef NANO_MM_H
 #define NANO_MM_H
 
+// Preemption can arrive between any two instructions here, and every one of
+// these structures has a window where it is half-updated: the frame bitmap
+// between testing a bit and setting it, the page tables between allocating a
+// table and installing it, the heap's free list between unlinking a block and
+// relinking it. Masking interrupts around each is what makes them atomic --
+// see the note in nano-thread.h about why that is the right lock on one core
+// and what has to change on more.
+extern long irq_save();
+extern void irq_restore(long were_enabled);
+
 extern long kernel_end_addr();
 extern long multiboot_info_addr();
 extern void tlb_invlpg(long virt);
@@ -146,23 +156,33 @@ void frame_mark_range(long base, long len, long used) {
 long frame_alloc() {
     long i;
     long tries;
+    long f;
+    long got;
+    f = irq_save();               // test-then-set is not atomic on its own
     i = mm_next_hint;
     tries = 0;
+    got = 0;
     while (tries < mm_bitmap_frames) {
         if (i >= mm_bitmap_frames) i = 0;
         if (!frame_is_used(i)) {
             frame_mark_used(i);
             mm_next_hint = i + 1;
-            return i << PAGE_SHIFT;
+            got = i << PAGE_SHIFT;
+            tries = mm_bitmap_frames;
+        } else {
+            i = i + 1;
+            tries = tries + 1;
         }
-        i = i + 1;
-        tries = tries + 1;
     }
-    return 0;
+    irq_restore(f);
+    return got;
 }
 
 void frame_free(long phys) {
+    long f;
+    f = irq_save();
     frame_mark_free(phys >> PAGE_SHIFT);
+    irq_restore(f);
 }
 
 // Writing to a physical address directly is only legal because the first
@@ -317,12 +337,16 @@ long vmm_map(long virt, long phys, long flags) {
     long pd;
     long pt;
     long *e;
+    long irqf;
 
+    // A table allocated but not yet installed is invisible to anyone else; a
+    // 2 MiB page half-way through being split is worse than either state.
+    irqf = irq_save();
     cr3 = read_cr3_() & PTE_ADDR;
     pdpt = pt_next(cr3, pt_index(virt, 4), 1);
-    if (!pdpt) return 0;
+    if (!pdpt) { irq_restore(irqf); return 0; }
     pd = pt_next(pdpt, pt_index(virt, 3), 1);
-    if (!pd) return 0;
+    if (!pd) { irq_restore(irqf); return 0; }
 
     // The PD entry may be a 2 MiB page; split it before touching one 4 KiB
     // slot inside it.
@@ -331,16 +355,17 @@ long vmm_map(long virt, long phys, long flags) {
         pde = (long *)(pd + pt_index(virt, 2) * 8);
         if ((pde[0] & PTE_PRESENT) && (pde[0] & PTE_HUGE)) {
             pt = pd_split(pd, pt_index(virt, 2));
-            if (!pt) return 0;
+            if (!pt) { irq_restore(irqf); return 0; }
         } else {
             pt = pt_next(pd, pt_index(virt, 2), 1);
-            if (!pt) return 0;
+            if (!pt) { irq_restore(irqf); return 0; }
         }
     }
 
     e = (long *)(pt + pt_index(virt, 1) * 8);
     e[0] = (phys & PTE_ADDR) | flags | PTE_PRESENT;
     tlb_invlpg(virt);
+    irq_restore(irqf);
     return 1;
 }
 
@@ -475,7 +500,13 @@ void block_split(struct Block *b, long want) {
 
 void *kmalloc(long n) {
     struct Block *b;
+    long f;
     if (!heap_head) return 0;                  // heap_init has not run
+    // The whole search-split-mark sequence has to be one step. Preempted
+    // between finding a free block and marking it used, two threads walk away
+    // with the same block and the second one's writes land in the first one's
+    // memory.
+    f = irq_save();
     kmalloc_calls = kmalloc_calls + 1;
     if (n < 1) n = 1;
     n = (n + 15) & ~15;                        // keep every payload 16-aligned
@@ -485,6 +516,7 @@ void *kmalloc(long n) {
         if (b->free && b->size >= n) {
             block_split(b, n);
             b->free = 0;
+            irq_restore(f);
             return (void *)((char *)b + sizeof(struct Block));
         }
         if (!b->next) break;
@@ -499,7 +531,7 @@ void *kmalloc(long n) {
         struct Block *nb;
         tail = b;
         added = heap_grow(n + sizeof(struct Block));
-        if (!added) return 0;
+        if (!added) { irq_restore(f); return 0; }
         nb = (struct Block *)((char *)tail + sizeof(struct Block) + tail->size);
         nb->magic = HEAP_MAGIC;
         nb->size = added - sizeof(struct Block);
@@ -515,6 +547,7 @@ void *kmalloc(long n) {
         }
         block_split(nb, n);
         nb->free = 0;
+        irq_restore(f);
         return (void *)((char *)nb + sizeof(struct Block));
     }
 }
@@ -533,16 +566,20 @@ void *kcalloc(long count, long size) {
 
 void kfree(void *ptr) {
     struct Block *b;
+    long f;
     if (!ptr) return;
+    f = irq_save();                            // coalescing relinks neighbours
     kfree_calls = kfree_calls + 1;
     b = (struct Block *)((char *)ptr - sizeof(struct Block));
     // A wrong pointer here corrupts the whole heap silently. The magic turns
     // that into a message.
     if (b->magic != HEAP_MAGIC) {
+        irq_restore(f);
         puts("kfree: not a heap block (bad magic)\n");
         return;
     }
     if (b->free) {
+        irq_restore(f);
         puts("kfree: double free\n");
         return;
     }
@@ -559,6 +596,7 @@ void kfree(void *ptr) {
         b->prev->next = b->next;
         if (b->next) b->next->prev = b->prev;
     }
+    irq_restore(f);
 }
 
 long heap_blocks(long want_free) {

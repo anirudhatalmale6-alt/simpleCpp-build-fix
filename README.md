@@ -17,9 +17,10 @@ compiled by `nano_cc` itself — that runs in 64-bit long mode under QEMU, reads
 a real PS/2 keyboard, and brings up a **1024x768x32 graphics mode** with a
 framebuffer console, its own bitmap font and drawing primitives. It has an
 **IDT** with real exception reporting, the **8259s remapped**, a **PIT timer**,
-an interrupt-driven keyboard, a **physical frame allocator** with 4 KiB paging
-and a **kernel heap**, and it reads the firmware's **ACPI** tables to decide how
-to idle the CPU. See [`kernel/README.md`](kernel/README.md).
+an interrupt-driven keyboard, a **physical frame allocator** with 4 KiB paging,
+a **kernel heap**, **preemptive threads** with locking and a pthreads-shaped
+API, and it reads the firmware's **ACPI** tables to decide how to idle the CPU.
+See [`kernel/README.md`](kernel/README.md).
 
 ---
 

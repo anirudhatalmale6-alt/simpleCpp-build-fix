@@ -15,7 +15,7 @@ QFLAGS := -kernel kernel.elf -no-reboot
 .PHONY: all run test shot gfx gfxrun gfxtest gfxshot \
         gshell gshellrun gshelltest gshellshot \
         intr intrrun intrtest acpi acpirun acpitest \
-        mm mmrun mmtest clean
+        mm mmrun mmtest threads threadsrun threadstest clean
 
 all: kernel.elf
 
@@ -128,7 +128,7 @@ gfxshot: gfx.elf
 # with commands that draw.
 # ---------------------------------------------------------------------------
 gfxshell.s: gfxshell.c nano-kernel.h nano-fb.h nano-font.h nano-int.h \
-            nano-acpi.h nano-mm.h $(NANO)
+            nano-acpi.h nano-mm.h nano-thread.h $(NANO)
 	$(NANO) --kernel gfxshell.c gfxshell.s
 
 gshell64.bin: boot64.s isr.s gfxshell.s kernel64.ld
@@ -161,6 +161,9 @@ gshelltest: gshell.elf
 	   sleep 1.8; for k in m e m ret; do echo "sendkey $$k"; sleep 0.18; done; \
 	   sleep 0.4; for k in h e a p t e s t ret; do echo "sendkey $$k"; sleep 0.18; done; \
 	   sleep 0.6; for k in m a p t e s t ret; do echo "sendkey $$k"; sleep 0.18; done; \
+	   sleep 0.5; for k in s p a w n ret; do echo "sendkey $$k"; sleep 0.18; done; \
+	   sleep 0.4; for k in s p a w n ret; do echo "sendkey $$k"; sleep 0.18; done; \
+	   sleep 0.4; for k in p s ret; do echo "sendkey $$k"; sleep 0.18; done; \
 	   sleep 0.5; for k in b a r s ret; do echo "sendkey $$k"; sleep 0.18; done; \
 	   sleep 0.4; for k in e c h o spc h i ret; do echo "sendkey $$k"; sleep 0.18; done; \
 	   sleep 0.4; for k in f a u l t ret; do echo "sendkey $$k"; sleep 0.18; done; \
@@ -177,6 +180,8 @@ gshelltest: gshell.elf
 	   && grep -q "contents intact" gshell-serial.clean \
 	   && grep -q "same block reused" gshell-serial.clean \
 	   && grep -q "wrote through it" gshell-serial.clean \
+	   && grep -q "the shell stays usable" gshell-serial.clean \
+	   && grep -q "context switches so far" gshell-serial.clean \
 	   && grep -qx "hi" gshell-serial.clean \
 	   && grep -q "EXCEPTION 14: page fault" gshell-serial.clean \
 	   && echo "PASS: graphics, keyboard, PCI, ACPI, idle, memory and faults" \
@@ -189,7 +194,10 @@ gshellshot: gshell.elf
 	   sleep 0.5; for k in i d l e ret; do echo "sendkey $$k"; sleep 0.18; done; \
 	   sleep 2; for k in u p t i m e ret; do echo "sendkey $$k"; sleep 0.18; done; \
 	   sleep 0.5; for k in m e m ret; do echo "sendkey $$k"; sleep 0.18; done; \
-	   sleep 0.5; for k in d e m o ret; do echo "sendkey $$k"; sleep 0.18; done; \
+	   sleep 0.5; for k in s p a w n ret; do echo "sendkey $$k"; sleep 0.18; done; \
+	   sleep 0.3; for k in s p a w n ret; do echo "sendkey $$k"; sleep 0.18; done; \
+	   sleep 0.3; for k in s p a w n ret; do echo "sendkey $$k"; sleep 0.18; done; \
+	   sleep 0.3; for k in p s ret; do echo "sendkey $$k"; sleep 0.18; done; \
 	   sleep 1.5; echo "screendump gshell.ppm"; sleep 1; echo quit ) | \
 	 timeout 45 $(QEMU) -kernel gshell.elf -no-reboot -display none \
 	   -serial file:gshell-serial.log -monitor stdio >/dev/null 2>&1
@@ -328,9 +336,54 @@ mmtest: mm.elf
 	   && echo "PASS: frames, paging, heap, and unmapping really unmaps" \
 	   || { echo "FAIL"; exit 1; }
 
+# ---------------------------------------------------------------------------
+# Threads: a preemptive round-robin scheduler, real context switching on the
+# timer, locking, and a heap that survives being used from several threads.
+# ---------------------------------------------------------------------------
+threads.s: threads.c nano-kernel.h nano-mm.h nano-thread.h nano-int.h $(NANO)
+	$(NANO) --kernel threads.c threads.s
+
+threads64.bin: boot64.s isr.s threads.s kernel64.ld
+	as --64 boot64.s  -o boot64.o
+	as --64 isr.s     -o isr.o
+	as --64 threads.s -o threads.o
+	ld -T kernel64.ld -o threads64.elf boot64.o isr.o threads.o
+	objcopy -O binary threads64.elf threads64.bin
+
+blob-threads.s:
+	@printf '.section .blob, "a"\n.incbin "threads64.bin"\n' > $@
+
+threads.elf: boot32.s blob-threads.s threads64.bin final.ld
+	as --32 boot32.s       -o boot32.o
+	as --32 blob-threads.s -o blob-threads.o
+	ld -m elf_i386 -T final.ld -o threads.elf boot32.o blob-threads.o
+
+threads: threads.elf
+
+threadsrun: threads.elf
+	$(QEMU) -kernel threads.elf -no-reboot
+
+threadstest: threads.elf
+	@rm -f threads-serial.log
+	@( sleep 10; echo quit ) | \
+	 timeout 60 $(QEMU) -kernel threads.elf -no-reboot -display none \
+	   -serial file:threads-serial.log -monitor stdio >/dev/null 2>&1; \
+	 echo "---- serial output ----"; cat threads-serial.log; echo "-----------------------"; \
+	 tr -d '\r' < threads-serial.log > threads-serial.clean; \
+	 grep -q "interleave ok" threads-serial.clean \
+	   && grep -q "join ok" threads-serial.clean \
+	   && grep -q "race ok" threads-serial.clean \
+	   && grep -q "mutex ok" threads-serial.clean \
+	   && grep -q "heap ok" threads-serial.clean \
+	   && grep -q "preemption ok" threads-serial.clean \
+	   && grep -q "thread bring-up complete" threads-serial.clean \
+	   && echo "PASS: preemption, joins, a real race, a mutex that stops it" \
+	   || { echo "FAIL"; exit 1; }
+
 clean:
-	rm -f *.o shell.s gfx.s gfxshell.s intr.s acpi.s mm.s \
+	rm -f *.o shell.s gfx.s gfxshell.s intr.s acpi.s mm.s threads.s \
 	      blob-gfx.s blob-gshell.s blob-intr.s blob-acpi.s blob-mm.s \
+	      blob-threads.s \
 	      kernel64.elf kernel64.bin kernel.elf \
 	      gfx64.elf gfx64.bin gfx.elf \
 	      gshell64.elf gshell64.bin gshell.elf \
@@ -339,4 +392,6 @@ clean:
 	      intr64.elf intr64.bin intr.elf intr-serial.log intr-serial.clean \
 	      acpi64.elf acpi64.bin acpi.elf acpi-serial.log acpi-serial.clean \
 	      mm64.elf mm64.bin mm.elf mm-serial.log mm-serial.clean \
+	      threads64.elf threads64.bin threads.elf \
+	      threads-serial.log threads-serial.clean \
 	      vga.ppm gfx.ppm gshell.ppm

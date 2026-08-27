@@ -9,9 +9,10 @@
 
 #include "nano-fb.h"
 #include "nano-kernel.h"
+#include "nano-mm.h"
+#include "nano-thread.h"
 #include "nano-int.h"
 #include "nano-acpi.h"
-#include "nano-mm.h"
 
 #define COL_BG      0x0d1117
 #define COL_FG      0xc9d1d9
@@ -371,11 +372,102 @@ void cmd_maptest() {
     frame_free(phys);
 }
 
+// ---------------------------------------------------------------------------
+// Threads
+// ---------------------------------------------------------------------------
+// Defined here rather than in nano-thread.h because it needs the timer, and
+// nano-thread.h is included before nano-int.h so that the dispatcher can see
+// the scheduler.
+void thread_sleep_ms(long ms) {
+    long target;
+    target = g_ticks + (ms * g_hz) / 1000;
+    while (g_ticks < target) thread_yield();
+}
+
+long g_anim_stop;
+long g_anim_count;
+
+// A box bouncing around the panel, redrawn from its own thread. The point is
+// that the shell stays usable while this runs -- you can type, and commands
+// answer, with no cooperation from the animation at all.
+void animator(long seed) {
+    long x;
+    long y;
+    long dx;
+    long dy;
+    long w;
+    long col;
+    long id;
+
+    id = g_anim_count;
+    g_anim_count = g_anim_count + 1;
+
+    w = 26;
+    x = g_panel_x + 20 + (seed * 37) % (g_panel_w - 80);
+    y = g_panel_y + 40 + (seed * 53) % (g_panel_h - 120);
+    dx = (seed % 2) ? 4 : -4;
+    dy = (seed % 3) ? 3 : -3;
+    col = rgb(60 + (seed * 71) % 190, 90 + (seed * 37) % 160, 120 + (seed * 53) % 130);
+
+    while (!g_anim_stop) {
+        fb_fill(x, y, w, w, 0x010409);            // erase
+        x = x + dx;
+        y = y + dy;
+        if (x < g_panel_x + 4) { x = g_panel_x + 4; dx = 0 - dx; }
+        if (x + w > g_panel_x + g_panel_w - 4) { x = g_panel_x + g_panel_w - 4 - w; dx = 0 - dx; }
+        if (y < g_panel_y + 24) { y = g_panel_y + 24; dy = 0 - dy; }
+        if (y + w > g_panel_y + g_panel_h - 24) { y = g_panel_y + g_panel_h - 24 - w; dy = 0 - dy; }
+        fb_fill(x, y, w, w, col);
+        fb_rect(x, y, w, w, 0xffffff);
+        thread_sleep_ms(30);
+    }
+    fb_fill(x, y, w, w, 0x010409);
+    thread_exit(0);
+}
+
+char *state_name(long st) {
+    if (st == T_UNUSED) return "unused ";
+    if (st == T_READY) return "ready  ";
+    if (st == T_RUNNING) return "running";
+    if (st == T_BLOCKED) return "blocked";
+    return "done   ";
+}
+
+void cmd_ps() {
+    long i;
+    printf("id state   slices name\n");
+    i = 0;
+    while (i < MAX_THREADS) {
+        if (g_threads[i].state != T_UNUSED) {
+            printf("%d  %s %d %s\n", i, state_name(g_threads[i].state),
+                   g_threads[i].slices, g_threads[i].name);
+        }
+        i = i + 1;
+    }
+    printf("%d context switches so far\n", g_switches);
+}
+
+void cmd_spawn() {
+    long id;
+    g_anim_stop = 0;
+    id = thread_create((long)animator, g_anim_count + 1, "anim");
+    if (id < 0) { puts("no free thread slot\n"); return; }
+    printf("spawned thread %d; the shell stays usable\n", id);
+}
+
+void cmd_stopall() {
+    g_anim_stop = 1;
+    thread_sleep_ms(120);
+    puts("animators asked to stop\n");
+    panel_clear();
+}
+
 void cmd_help() {
     puts("commands:\n");
     puts("  help clear ver fbinfo pci acpi\n");
     puts("  idle uptime fault\n");
     puts("  mem heaptest maptest\n");
+    puts("  ps spawn stopall\n");
     puts("  demo bars grad lines circles font\n");
     puts("  echo <text>\n");
 }
@@ -415,30 +507,12 @@ int starts_with(char *s, char *p) {
     return 1;
 }
 
-int main() {
+// The shell, as a thread. Everything from here on runs with the scheduler
+// live, which is what lets a background animation and a keyboard prompt
+// coexist without either knowing about the other.
+void shell_thread(long unused) {
     char line[128];
     long n;
-
-    serial_init();
-    kbd_init();
-    interrupts_init(100);          // IDT, PIC, 100 Hz timer, IRQ keyboard
-    mm_init();                     // frames, 4 KiB paging, kernel heap
-    acpi_init();
-    acpi_enable();
-    acpi_pick_cstate();
-
-    if (!fb_init(1024, 768)) {
-        vga_clear();
-        puts("no Bochs VBE adapter; cannot start the graphics shell\n");
-        for (;;) { }
-    }
-
-    fb_console_init(2, COL_FG, COL_BG);       // 16x16 cells, readable at 1024x768
-    chrome();
-    // the console lives under the title bar, in the left column, and stops
-    // short of the drawing panel so a scroll never touches it
-    fb_console_at(12, 44, 500, fb_height - 60);
-    g_have_fb = 1;
 
     splash();
     puts("framebuffer console up. type help.\n");
@@ -465,7 +539,7 @@ int main() {
         if (n == 0) { }
         else if (!strcmp(line, "help")) cmd_help();
         else if (!strcmp(line, "clear")) { chrome(); fb_cx = 0; fb_cy = 0; }
-        else if (!strcmp(line, "ver")) puts("nano-os 0.2, framebuffer edition\n");
+        else if (!strcmp(line, "ver")) puts("nano-os 0.4, threaded\n");
         else if (!strcmp(line, "fbinfo")) cmd_fbinfo();
         else if (!strcmp(line, "pci")) cmd_pci();
         else if (!strcmp(line, "acpi")) cmd_acpi();
@@ -475,6 +549,9 @@ int main() {
         else if (!strcmp(line, "mem")) cmd_mem();
         else if (!strcmp(line, "heaptest")) cmd_heaptest();
         else if (!strcmp(line, "maptest")) cmd_maptest();
+        else if (!strcmp(line, "ps")) cmd_ps();
+        else if (!strcmp(line, "spawn")) cmd_spawn();
+        else if (!strcmp(line, "stopall")) cmd_stopall();
         else if (!strcmp(line, "demo")) cmd_demo();
         else if (!strcmp(line, "bars")) cmd_bars();
         else if (!strcmp(line, "grad")) cmd_grad();
@@ -484,5 +561,36 @@ int main() {
         else if (starts_with(line, "echo ")) { puts(line + 5); putc('\n'); }
         else { puts("unknown: "); puts(line); putc('\n'); }
     }
+}
+
+int main() {
+    serial_init();
+    kbd_init();
+    interrupts_init(100);          // IDT, PIC, 100 Hz timer, IRQ keyboard
+    mm_init();                     // frames, 4 KiB paging, kernel heap
+    g_anim_stop = 0;
+    g_anim_count = 0;
+    acpi_init();
+    acpi_enable();
+    acpi_pick_cstate();
+
+    if (!fb_init(1024, 768)) {
+        vga_clear();
+        puts("no Bochs VBE adapter; cannot start the graphics shell\n");
+        for (;;) { }
+    }
+
+    fb_console_init(2, COL_FG, COL_BG);       // 16x16 cells, readable at 1024x768
+    chrome();
+    // the console lives under the title bar, in the left column, and stops
+    // short of the drawing panel so a scroll never touches it
+    fb_console_at(12, 44, 500, fb_height - 60);
+    g_have_fb = 1;
+
+    thread_init();
+    thread_create((long)shell_thread, 0, "shell");
+    sched_start();                 // does not return
+
+    puts("UNREACHABLE\n");
     return 0;
 }

@@ -9,7 +9,10 @@
 // the machine silently rebooting, with no message and nothing to go on. Half
 // the value here is turning that into a page of text.
 //
-// Include AFTER nano-fb.h and nano-kernel.h, since the fault report prints.
+// Include AFTER nano-fb.h and nano-kernel.h, since the fault report prints,
+// and AFTER nano-thread.h if you want preemptive scheduling -- the dispatcher
+// switches on that file's include guard, the same way nano-kernel.h switches on
+// the framebuffer's. Without it the timer just counts.
 
 #ifndef NANO_INT_H
 #define NANO_INT_H
@@ -204,10 +207,15 @@ void dump_regs(struct Regs *r) {
 // there are no function pointers; a small number of interrupts matter and they
 // are named here.
 #define IRQ_BASE 32
+#define VEC_YIELD 0x81          // software interrupt: give up the time slice
 
 long g_spurious;
 
-void isr_dispatch(struct Regs *r) {
+// Returns the stack pointer to resume on. Normally that is the one it was
+// handed; when a scheduler is present and decides to switch, it is the other
+// thread's saved stack, and isr_common's `mov %rax, %rsp` performs the whole
+// context switch in one instruction.
+long isr_dispatch(struct Regs *r) {
     long v;
     v = r->vec;
 
@@ -218,13 +226,28 @@ void isr_dispatch(struct Regs *r) {
         dump_regs(r);
         puts("\nhalted.\n");
         cpu_halt_forever();
-        return;
+        return (long)r;
     }
 
     if (v == IRQ_BASE + 0) {                    // timer
         g_ticks = g_ticks + 1;
+        // The EOI has to happen BEFORE any context switch. Switch first and
+        // this interrupt is never acknowledged, so the timer never fires
+        // again and the machine freezes with the scheduler apparently working.
         pic_eoi(0);
-        return;
+#ifdef NANO_THREAD_H
+        return sched_switch((long)r);
+#else
+        return (long)r;
+#endif
+    }
+
+    if (v == VEC_YIELD) {                       // a voluntary yield
+#ifdef NANO_THREAD_H
+        return sched_switch((long)r);
+#else
+        return (long)r;
+#endif
     }
 
     if (v == IRQ_BASE + 1) {                    // keyboard
@@ -236,16 +259,21 @@ void isr_dispatch(struct Regs *r) {
             if (ch != 0) kbd_push(ch);
         }
         pic_eoi(1);
-        return;
+        return (long)r;
     }
 
     // IRQ7 and IRQ15 can fire with nothing behind them -- a spurious interrupt
     // from line noise or a race in the PIC. The primary's must NOT be
     // acknowledged, or a real interrupt gets its EOI consumed by this one.
-    if (v == IRQ_BASE + 7) { g_spurious = g_spurious + 1; return; }
-    if (v == IRQ_BASE + 15) { g_spurious = g_spurious + 1; outb(PIC2_CMD, PIC_EOI); return; }
+    if (v == IRQ_BASE + 7) { g_spurious = g_spurious + 1; return (long)r; }
+    if (v == IRQ_BASE + 15) {
+        g_spurious = g_spurious + 1;
+        outb(PIC2_CMD, PIC_EOI);
+        return (long)r;
+    }
 
-    if (v >= IRQ_BASE && v < IRQ_BASE + 16) { pic_eoi(v - IRQ_BASE); return; }
+    if (v >= IRQ_BASE && v < IRQ_BASE + 16) { pic_eoi(v - IRQ_BASE); return (long)r; }
+    return (long)r;
 }
 
 // ---------- bring-up ----------

@@ -41,6 +41,9 @@ make acpitest   # headless: tables read, PM timer runs, core idles
 
 make mm         # memory: frame allocator, 4 KiB paging, kernel heap
 make mmtest     # headless: frames, mapping, heap reuse, unmap really unmaps
+
+make threads    # preemptive threads, locking, thread-safe heap
+make threadstest # headless: preemption, joins, a real race, a mutex
 ```
 
 `make test` needs no display; it drives real keystrokes through QEMU's
@@ -352,3 +355,121 @@ It had been there all along and never showed, because the common case is
 `(char *)p - 16` on a `void *`, where the element size is 0 or 1 and scaling by
 it changes nothing. See `casts.c` in the parent directory — every value there
 is checked against gcc.
+
+---
+
+## Threads
+
+```
+$ make threadstest
+run order: 1 2 3 1 2 3 1 2 3 1 2 3 1 2 3 1 2 3 1 2 3 1 2 3
+interleave ok: threads share the CPU
+join returned 100 200 300
+join ok: return values came back
+unlocked: counter 100, expected 200
+race ok: the unlocked version lost updates
+locked:   counter 300, expected 300
+mutex ok: every update landed
+concurrent heap: 0 corruptions, 1 blocks in use (was 1)
+heap ok: no overlap and nothing leaked
+30 ticks with a non-yielding thread: 60 switches
+preemption ok: the timer took the CPU back
+```
+
+**The whole context switch is one instruction.** By the time the dispatcher
+runs, `isr_common` has already pushed every register onto the current thread's
+stack — so the entire machine state *is* that stack. The scheduler's only job
+is to decide which stack to return, and `mov %rax, %rsp` in `isr.s` does the
+rest.
+
+That is also why a brand-new thread is indistinguishable from a preempted one.
+`thread_create` builds a stack that looks exactly like a thread caught
+mid-interrupt: the fifteen registers `isr_common` pushes, then a vector and
+error code, then the five words the CPU pushes for `iretq`. Get that order
+wrong and a new thread starts with garbage in its registers and jumps
+somewhere arbitrary.
+
+A voluntary `thread_yield` is a software interrupt on a vector of its own, not
+a direct call into the scheduler — so a yield and a timer preemption arrive by
+exactly the same path with exactly the same stack layout. One code path to get
+right instead of two.
+
+### The test that would otherwise prove nothing
+
+The counter test runs the same increment twice, once without a lock and once
+with, and **requires the unlocked version to lose updates**. A concurrency test
+that only checks the locked case passes just as happily on a kernel where the
+threads never actually interleave. Each increment opens a deliberate window
+between the read and the write, so the race is forced rather than hoped for —
+200 increments produce 100.
+
+There is a matching test for preemption itself: a thread that never yields at
+all, which only the timer can take the CPU away from.
+
+### Locking, and what is honest about it
+
+**One CPU.** The MADT reports one processor and there is no local APIC bring-up
+here, so this is concurrency, not parallelism.
+
+That has a consequence worth stating rather than hiding: with preemption
+arriving only from the timer, **masking interrupts is mutual exclusion** —
+nothing else can be running to contend. It is both correct and cheaper than any
+spin loop. On more than one core it stops being true and each lock needs a real
+atomic test-and-set; those places are marked in `nano-thread.h`, and the `held`
+field is already there for it.
+
+Two kinds of lock, because they are not interchangeable:
+
+* `spin_lock` masks interrupts. Short critical sections only — nothing can run,
+  including the timer.
+* `mutex_lock` can be held across a yield, so interrupts stay on and the holder
+  can be preempted. When it is contended it **yields rather than spins**: on one
+  core, spinning burns the rest of a slice that the holder needs in order to
+  release the lock.
+
+The frame allocator, the page-table walker and the heap all take a lock now.
+Each had a window where it was half-updated — the bitmap between testing a bit
+and setting it, the tables between allocating a page table and installing it,
+the free list between unlinking a block and relinking it.
+
+### Two details that bite
+
+**A thread cannot free the stack it is standing on.** `thread_exit` leaves the
+stack alone and `thread_join` reclaims it, because the joiner is the first
+point at which the stack is provably idle. The consequence is that a thread
+which is never joined leaks its stack — the same bargain pthreads makes, and
+the reason `detach` exists.
+
+**The EOI has to happen before the context switch.** Acknowledge the timer
+after switching away and this interrupt is never acknowledged at all, so the
+timer never fires again and the machine freezes with the scheduler apparently
+working perfectly.
+
+Each stack carries a canary at its low end, checked on every switch, so a
+thread that runs off the bottom is named rather than corrupting whatever the
+heap put there and failing somewhere else entirely.
+
+### In the shell
+
+`spawn` starts a box bouncing around the drawing panel from its own thread, and
+the prompt stays usable while it runs — the two know nothing about each other.
+`ps` lists the threads with their slice counts, `stopall` ends them.
+
+```
+> ps
+id state   slices name
+0  running 367 shell
+1  ready   368 anim
+2  ready   230 anim
+3  ready    92 anim
+1076 context switches so far
+```
+
+### pthreads
+
+`pthread_create`, `pthread_join`, `pthread_self`, `pthread_exit`,
+`pthread_mutex_init/lock/trylock/unlock` are there with their usual meanings.
+That is the core of the API and **not** the whole of it — detach,
+cancellation, condition variables, barriers, thread-local storage and
+attributes are not implemented, and calling this "pthreads" without saying so
+would be a lie.

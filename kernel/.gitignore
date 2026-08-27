@@ -32,3 +32,8 @@ blob-mm.s
 mm64.elf
 mm64.bin
 mm.elf
+threads.s
+blob-threads.s
+threads64.elf
+threads64.bin
+threads.elf

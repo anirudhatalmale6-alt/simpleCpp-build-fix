@@ -57,6 +57,15 @@ isr_common:
     cld                         /* the ABI wants DF clear on entry to C */
     call isr_dispatch
 
+    /* isr_dispatch RETURNS the stack pointer to resume on. Normally that is
+     * the one it was handed and this changes nothing. When the scheduler
+     * decides to switch task, it returns the OTHER task's saved stack instead,
+     * and the pops below unwind that task rather than this one -- so a whole
+     * context switch is this single instruction. Every register, the
+     * instruction pointer and the flags all live on the stack at this point,
+     * so moving the stack moves all of them at once. */
+    mov %rax, %rsp
+
     pop %r15
     pop %r14
     pop %r13
@@ -171,6 +180,54 @@ cli_:
     cli
     ret
 
+/* long irq_save(void) — disable interrupts, return whether they were on.
+ * This is the uniprocessor lock: with preemption coming only from the timer,
+ * nothing else can be running to contend, so masking interrupts IS mutual
+ * exclusion. On more than one core it stops being true and needs a real
+ * atomic test-and-set; the shape here is the same either way. */
+.globl irq_save
+irq_save:
+    pushfq
+    pop %rax
+    and $0x200, %rax            /* the interrupt-enable flag */
+    cli
+    ret
+
+/* void irq_restore(long were_enabled) */
+.globl irq_restore
+irq_restore:
+    test %rdi, %rdi
+    jz 1f
+    sti
+1:  ret
+
+/* void switch_to_first(long rsp) — start the very first thread.
+ *
+ * There is no task to switch away from yet, so this drops onto the new stack
+ * and unwinds it exactly the way isr_common would. The stack was built by
+ * thread_create to look like a complete interrupt frame, which is what makes
+ * a brand-new thread and a preempted one indistinguishable from here. */
+.globl switch_to_first
+switch_to_first:
+    mov %rdi, %rsp
+    pop %r15
+    pop %r14
+    pop %r13
+    pop %r12
+    pop %r11
+    pop %r10
+    pop %r9
+    pop %r8
+    pop %rbp
+    pop %rdi
+    pop %rsi
+    pop %rdx
+    pop %rcx
+    pop %rbx
+    pop %rax
+    add $16, %rsp
+    iretq
+
 .globl sti_
 sti_:
     sti
@@ -219,4 +276,15 @@ io_wait:
     mov $0x80, %dx
     xor %eax, %eax
     out %al, %dx
+    ret
+
+/* void yield_now(void) — give up the rest of this time slice.
+ *
+ * A software interrupt on a vector of its own, rather than calling the
+ * scheduler directly. That way a voluntary yield and a timer preemption arrive
+ * at the scheduler through exactly the same path, with the same stack layout,
+ * so there is one code path to get right instead of two. */
+.globl yield_now
+yield_now:
+    int $0x81
     ret
