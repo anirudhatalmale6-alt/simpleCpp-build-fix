@@ -105,6 +105,30 @@ make switch      # switch / case / default: dispatch, fall-through, nesting
 make minimal     # --minimal: compile every demo with the reduced instruction set
 ```
 
+### `--nasm`: assemble without binutils
+
+`--minimal --nasm` produces the NASM subset a small bootstrap assembler reads —
+`section`/`global` rather than `.section`/`.globl`, `db` rather than `.string`
+and `.zero`, no `offset` and no `ptr` size keywords. Combined with `--minimal`
+the output can be assembled by
+[mini-asm](https://github.com/anirudhatalmale6-alt/SelfHostedAssembler-audit)
+directly:
+
+```sh
+./nano_cc --minimal --nasm printf.c prog.asm
+./mini_asm            # reads prog.asm, writes a.out
+./a.out
+```
+
+No gcc, no binutils. `make bootstrap` in the assembler repo runs all six demos
+that way and requires each one to behave exactly as the gcc-assembled build does.
+
+Two things that mode has to handle. String literals are pooled and written after
+the last function — the assembler produces one flat segment, so a literal emitted
+inline the way GNU-as mode does it would sit in the instruction stream and be
+executed. And `dil`, `sil` and `r8b`..`r15b` all need a REX prefix to name at
+all, so a `char` parameter goes through `rax` on its way to its stack slot.
+
 ### `--minimal`: a reduced instruction set
 
 `nano_cc --minimal` restricts the back end to the instruction set a small

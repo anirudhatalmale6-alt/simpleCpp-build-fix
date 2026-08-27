@@ -1007,6 +1007,54 @@ static void  gen_stmt(Node *n);
 // operation. char, strings and printf all depend on it.
 static int g_minimal = 0;
 
+// --nasm emits the NASM subset the bootstrap assembler reads instead of GNU-as
+// Intel: `section`/`global` rather than `.section`/`.globl`, `db` rather than
+// `.string`/`.zero`, no `ptr` size keywords and no `offset`.
+//
+// The assembler produces one flat PT_LOAD, so there is nowhere to put a .rodata
+// section. String literals therefore cannot be emitted inline the way they are
+// in GNU-as mode - they would sit in the instruction stream and be executed.
+// They are pooled here and written out after the last function instead.
+static int g_nasm = 0;
+
+typedef struct StrLit { int id; char *bytes; int len; struct StrLit *next; } StrLit;
+static StrLit *strlits = NULL, *strlit_tail = NULL;
+
+static void strlit_add(int id, const char *bytes, int len) {
+    StrLit *sl = calloc(1, sizeof(StrLit));
+    sl->id = id; sl->len = len;
+    sl->bytes = malloc(len ? len : 1);
+    memcpy(sl->bytes, bytes, len);
+    if (strlit_tail) strlit_tail->next = sl; else strlits = sl;
+    strlit_tail = sl;
+}
+
+// Emit a byte run as `db`, keeping printable runs readable as quoted strings.
+// The assembler's db has no escape handling, so a quote or any non-printable
+// byte is emitted numerically.
+static void emit_db_bytes(const char *label, const unsigned char *b, int len, int nul) {
+    int i = 0, col = 0, inq = 0, first = 1;
+    if (label) fprintf(fout, "%s:", label);
+    fprintf(fout, " db ");
+    for (i = 0; i < len; i++) {
+        int printable = b[i] >= 32 && b[i] <= 126 && b[i] != '"';
+        if (printable) {
+            if (!inq) { if (!first) fputs(", ", fout); fputc('"', fout); inq = 1; }
+            fputc(b[i], fout);
+        } else {
+            if (inq) { fputc('"', fout); inq = 0; }
+            if (!first) fputs(", ", fout);
+            fprintf(fout, "%d", b[i]);
+        }
+        first = 0;
+        if (++col >= 60) { if (inq) { fputc('"', fout); inq = 0; } fputs("\n db ", fout); col = 0; first = 1; }
+    }
+    if (inq) fputc('"', fout);
+    if (nul) { if (!first) fputs(", ", fout); fputs("0", fout); }
+    else if (first) fputs("0", fout);          // empty run still needs an operand
+    fputc('\n', fout);
+}
+
 static void e_push(const char *r) {
     if (!g_minimal) { emit("    push %s", r); return; }
     emit("    sub rsp, 8");
@@ -1044,7 +1092,8 @@ static void e_lea_rip(const char *sym) {
     if (!g_minimal) { emit("    lea rax, [rip + %s]", sym); return; }
     // GAS Intel syntax reads a bare symbol as memory CONTENTS, so the address
     // has to be asked for explicitly. In NASM syntax this is plain `mov rax, sym`.
-    emit("    mov rax, offset %s", sym);
+    if (g_nasm) emit("    mov rax, %s", sym);
+    else        emit("    mov rax, offset %s", sym);
 }
 static void e_lea_local(int off) {          // rax = rbp - off
     if (!g_minimal) { emit("    lea rax, [rbp - %d]", off); return; }
@@ -1244,6 +1293,12 @@ static Type *static_typeof(Node *n) {
 
 static void gen_string(Node *n) {
     int id = label_id++;
+    if (g_nasm) {
+        strlit_add(id, n->str, n->slen);
+        char b[64]; snprintf(b, sizeof b, ".LC%d", id);
+        e_lea_rip(b);
+        return;
+    }
     emit("    .section .rodata");
     fprintf(fout, ".LC%d: .string \"", id);
     for (int i = 0; i < n->slen; i++) {
@@ -1623,8 +1678,18 @@ static void gen_func(Func *fn) {
     for (int i = 0; i < fn->nparams && i < 6; i++) {
         Sym *s = sym_find(locals, fn->params[i]->name);
         int sz = ty_size(s->type);
-        if (sz == 1) emit("    mov [rbp - %d], %s", s->offset,
-                          i==0?"dil":i==1?"sil":i==2?"dl":i==3?"cl":i==4?"r8b":"r9b");
+        if (sz == 1) {
+            // dil, sil and r8b..r15b all need a REX prefix to name at all. The
+            // minimal target only has the four REX-free byte registers, so the
+            // argument goes through rax first.
+            if (g_minimal) {
+                emit("    mov rax, %s", ARGREG[i]);
+                emit("    mov [rbp - %d], al", s->offset);
+            } else {
+                emit("    mov [rbp - %d], %s", s->offset,
+                     i==0?"dil":i==1?"sil":i==2?"dl":i==3?"cl":i==4?"r8b":"r9b");
+            }
+        }
         else emit("    mov [rbp - %d], %s", s->offset, ARGREG[i]);
     }
     if (fn->is_variadic) {
@@ -1648,11 +1713,12 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--kernel") || !strcmp(argv[i], "-k")) kernel_mode = 1;
         else if (!strcmp(argv[i], "--minimal")) g_minimal = 1;
+        else if (!strcmp(argv[i], "--nasm")) g_nasm = 1;
         else if (!inpath)  inpath  = argv[i];
         else if (!outpath) outpath = argv[i];
     }
     if (!inpath || !outpath) {
-        fprintf(stderr, "Usage: %s [--kernel] [--minimal] <input.c> <output.s>\n", argv[0]);
+        fprintf(stderr, "Usage: %s [--kernel] [--minimal] [--nasm] <input.c> <output.s>\n", argv[0]);
         return 1;
     }
 
@@ -1665,13 +1731,18 @@ int main(int argc, char **argv) {
     fout = fopen(outpath, "w");
     if (!fout) { perror("fopen"); return 1; }
 
-    emit(".intel_syntax noprefix");
-    emit("    .section .text");
-    emit("    .globl main");
+    if (g_nasm) {
+        emit("section .text");
+        emit("global main");
+    } else {
+        emit(".intel_syntax noprefix");
+        emit("    .section .text");
+        emit("    .globl main");
+    }
 
     if (!kernel_mode) {
         // hosted freestanding entry point: run main, then exit(rax)
-        emit("    .globl _start");
+        emit(g_nasm ? "global _start" : "    .globl _start");
         emit("_start:");
         emit("    call main");
         emit("    mov rdi, rax");
@@ -1686,11 +1757,29 @@ int main(int argc, char **argv) {
     // mode uses .data so the zero bytes are emitted into the object and survive
     // an objcopy to a flat binary — the bare-metal image needs no separate
     // .bss zero-fill step.
-    emit(kernel_mode ? "    .section .data" : "    .section .bss");
-    emit("    .align 8");
-    for (Sym *g = globals; g; g = g->next) {
-        int sz = ty_size(g->type); if (sz < 1) sz = 8;
-        emit("%s: .zero %d", g->name, sz);
+    if (g_nasm) {
+        // One flat image: the pooled string literals and the globals both go
+        // here, after the last function, where nothing can execute into them.
+        for (StrLit *sl = strlits; sl; sl = sl->next) {
+            char lbl[64]; snprintf(lbl, sizeof lbl, ".LC%d", sl->id);
+            emit_db_bytes(lbl, (const unsigned char *)sl->bytes, sl->len, 1);
+        }
+        for (Sym *g = globals; g; g = g->next) {
+            int sz = ty_size(g->type); if (sz < 1) sz = 8;
+            fprintf(fout, "%s: db 0", g->name);
+            for (int i = 1; i < sz; i++) {
+                fputs(", 0", fout);
+                if (i % 32 == 0) fputs("\n db 0", fout), i++;
+            }
+            fputc('\n', fout);
+        }
+    } else {
+        emit(kernel_mode ? "    .section .data" : "    .section .bss");
+        emit("    .align 8");
+        for (Sym *g = globals; g; g = g->next) {
+            int sz = ty_size(g->type); if (sz < 1) sz = 8;
+            emit("%s: .zero %d", g->name, sz);
+        }
     }
 
     fclose(fout);
