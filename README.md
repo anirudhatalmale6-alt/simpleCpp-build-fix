@@ -6,10 +6,11 @@ stock GCC — no third-party libraries.
 
 It now compiles the bundled **`test.c`** all the way through to a running program.
 
-It also now compiles **its own source**: `make selfhost` runs `nano_cc` over
-`simpleC++.c` and GNU `as` accepts the 30k lines of assembly that come out.
-What is still missing is a freestanding C library to link it against — see
-[Self-hosting: where it stands](#self-hosting-where-it-stands).
+**It is self-hosting.** `make selfhost` builds `nano_cc` with `nano_cc`, then
+builds it again with the result, and requires the two compilers to come out
+**byte-identical**. No glibc anywhere — the C library it links against is
+`nano-libc.h`, written in this same C subset on raw Linux syscalls. See
+[Self-hosting](#self-hosting).
 
 It can even boot **bare metal**: `kernel/` builds a tiny interactive shell —
 compiled by `nano_cc` itself — that runs in 64-bit long mode under QEMU and
@@ -113,12 +114,14 @@ make typedefs    # typedef + enum
 make gotos       # goto and labels
 make functions   # array parameters and function return types
 make reserved    # C names that are assembler keywords (sp, ax, flat, ...)
-make checkall    # all five of the above in one go
-make selfhost    # how far is nano_cc from compiling itself?
+make libcheck    # nano-libc.h, checked against glibc
+make checkall    # all six of the above in one go
+make selfhost    # the three-stage bootstrap
 ```
 
-The five checked suites do not print a demo — they compile the
-same source with gcc (swapping `<stdio.h>` in for `nano-nolibc.h`) and require
+The six checked suites do not print a demo — they compile the
+same source with gcc (swapping the system headers in for `nano-nolibc.h` or
+`nano-libc.h`) and require
 `nano_cc`'s output to match it line for line, in normal mode and in `--minimal`.
 Add `MINIASM=../sha-audit/build/fixed` to include a third leg that assembles
 with no binutils at all:
@@ -194,12 +197,12 @@ status, and checks the minimal assembly contains nothing outside the set. The
 cost is roughly 50% more instructions:
 
 ```
-PASS test: same output, only the minimal set, 1128 -> 1703 lines
-PASS features: same output, only the minimal set, 1392 -> 2069 lines
-PASS structs: same output, only the minimal set, 1333 -> 2003 lines
-PASS bitwise: same output, only the minimal set, 1366 -> 2027 lines
-PASS printf: same output, only the minimal set, 1141 -> 1723 lines
-PASS switch: same output, only the minimal set, 1489 -> 2178 lines
+PASS test: same output, only the minimal set, 2167 -> 3203 lines
+PASS features: same output, only the minimal set, 2431 -> 3569 lines
+PASS structs: same output, only the minimal set, 2372 -> 3503 lines
+PASS bitwise: same output, only the minimal set, 2405 -> 3527 lines
+PASS printf: same output, only the minimal set, 2180 -> 3223 lines
+PASS switch: same output, only the minimal set, 2528 -> 3678 lines
 ```
 
 You can also compile your own small programs, e.g. the included `sample.c`:
@@ -212,42 +215,60 @@ gcc -nostdlib -no-pie sample.s -o sample_prog
 
 ---
 
-## Self-hosting: where it stands
-
-`make selfhost` answers the question by measuring rather than guessing:
+## Self-hosting
 
 ```
-PASS compile: nano_cc compiled all 2402 lines of its own source
-              -> 30176 lines of assembly
-PASS assemble: GNU as accepted it (125816 bytes of object)
+$ make selfhost
+stage 1: the gcc-built compiler compiles its own source
+         2545 lines of C -> 37874 lines of asm -> 130056 bytes, no libc
+stage 2: stage1 compiles the same source
+stage 3: stage2 compiles the same source
 
-REMAINING: 24 C library functions have no freestanding implementation.
-These are the whole gap between here and a real stage-1 bootstrap:
-  calloc exit fclose fgetc fopen fprintf fputc fputs free isalnum
-  isalpha isdigit isspace isxdigit malloc memcpy memmove perror
-  printf snprintf strcmp strlen tolower vfprintf
+PASS stage1 output == stage2 output
+PASS stage2 output == stage3 output
+PASS stage1 binary == stage2 binary, byte for byte (130056 bytes)
+
+and stage1 has to agree with the gcc-built compiler on every demo:
+  PASS test.c: identical assembly
+  ... 13 programs, all identical
 ```
 
-So the **compiler** side is done: every construct in `simpleC++.c` now parses
-and generates code, and GNU `as` accepts the result. What is left is a
-**library** question — `simpleC++.c` is written against a hosted C library,
-and a freestanding one does not exist yet. `nano-nolibc.h` already covers
-`write`/`open`/`close`/`exit`/`printf`/`strlen`/`strcmp`/`memcpy` on raw
-syscalls; the 24 above are the rest.
+**Why the byte comparison is the test.** "It compiled itself and the result
+runs" proves very little: a compiler with a real bug can still build something
+that appears to work, because the bug is present on both sides and cancels
+out. If stage 1 and stage 2 disagree, stage 1 miscompiled the compiler. If
+they match, the compiler has reached a fixed point — compiling itself again
+changes nothing.
 
-To keep those two questions apart, `make selfhost` swaps the five system
-includes for [`selfhost-shim.h`](selfhost-shim.h), which contains
-**declarations only, no code**. A clean compile therefore means "the compiler
-handles all of its own source" and specifically **not** "it links and runs" —
-the undefined-symbol list is the honest remainder. Getting from here to a real
-bootstrap means writing that library, then requiring stage 1 and stage 2 to
-come out byte-identical.
+A fixed point alone is not sufficient either; a compiler that emitted nothing
+would also be stable. So the last step makes stage 1 compile all thirteen test
+programs and requires its output to be identical, instruction for instruction,
+to what the gcc-built compiler produces.
 
-Five constructs had to be added along the way, each of which the compiler used
-in its own source: `typedef`, `enum`, `goto`, array parameters, and declared
-function return types. The last one is why `cur()->text` used to fail — every
-call was typed `long`, so a member lookup on a call result had nothing to look
-in.
+Getting here needed a C library, since `simpleC++.c` is written against a
+hosted one. [`nano-libc.h`](nano-libc.h) is that library — `FILE`, `fopen`,
+`fgetc`, `fprintf`, `snprintf`, `malloc`, the ctype and string functions, and
+a printf formatter with flags, width, precision and `%.*s` — all on raw
+syscalls, and all in the subset this compiler accepts. `make libcheck` compares
+56 lines of its output against glibc doing the same thing.
+
+Two design decisions in there worth knowing about, both stated in the header:
+
+* **Output is unbuffered between calls.** Every `fputs`/`fputc`/`fprintf`
+  issues one `write()`. That is a syscall per call — about 90,000 for a full
+  compiler run, roughly a tenth of a second — and in exchange there is no
+  flush ordering to get wrong and no way to lose output on an abrupt exit.
+  Input *is* buffered, because reading a source file a byte at a time is a
+  syscall per byte and that does matter.
+* **`free()` does nothing** and the allocator only moves forward. A compiler
+  builds a parse tree and exits; reclaiming it buys nothing. Blocks do carry
+  their size, so `realloc` is real. This allocator is the wrong choice for a
+  long-running program, and the header says so.
+
+The `--minimal --nasm` path composes with all of this: `nano_cc` can produce
+its own source's assembly in the NASM subset that
+[mini-asm](https://github.com/anirudhatalmale6-alt/SelfHostedAssembler-audit)
+reads, so the whole toolchain can be run with no GCC and no binutils.
 
 ---
 
@@ -289,6 +310,12 @@ Enough of C to compile `nano-nolibc.h` + `test.c`:
 - **Variadic functions:** `type f(args, ...)` with `__builtin_va_start` /
   `__builtin_va_arg` / `__builtin_va_end` (wrapped as `va_start`/`va_arg`/
   `va_end`), enough to write a real `printf()` — see `printf.c`.
+- **Storage:** `static` at block scope is real static storage — one object for
+  the whole program, initialised once at load time. It used to be dropped with
+  the other qualifiers, which put the object on the **stack**, so the common
+  `static Type t = {...}; return &t;` idiom returned a pointer into a dead
+  frame. At file scope `static` still only means linkage, and there is one
+  translation unit, so it changes nothing there.
 - **Statements:** `if/else`, `while`, `for`, `do/while`, `switch` / `case` /
   `default` (with C fall-through, `break`, and nesting), `break`, `continue`,
   `return`, **`goto` and labels** (forward, backward, out of nested loops, and
@@ -320,6 +347,11 @@ now report an error rather than generating wrong code: a struct used as a
 value decays to its address here, so `f(s)` would have handed the callee a
 pointer and let it read that pointer as the first field.
 
+Locals are also one slot per **name per function**, not per block. Two `int i`
+loop counters are fine; the same name declared at two different types in one
+function is refused, because it would otherwise alias two different objects
+onto the same bytes without saying anything.
+
 Two deliberate size differences from a hosted gcc, worth knowing before you
 compare `sizeof`: `int` is 8 bytes here, not 4, and so is an `enum`.
 
@@ -346,7 +378,13 @@ well beyond what the original parser could handle. Summary:
    `mov rax, _n`) so the generated code assembles and the syscalls actually fire.
    That is the only change to the header; all the C in it is untouched.
 
-5. **Renamed C identifiers that are assembler keywords** on the way out. A
+5. **Made `static` at block scope mean static storage.** It was dropped with
+   the other qualifiers, which silently changed the object's storage duration
+   from static to automatic. `ty_int()` and its three siblings in this very
+   file are `static Type t = {...}; return &t;` — under a self-build they were
+   handing back pointers into dead stack frames, and the first symptom was a
+   segfault a long way from the cause.
+6. **Renamed C identifiers that are assembler keywords** on the way out. A
    global called `sp`, `ax`, `ch` or `gs`, or a function called `flat`, parses
    as a register or a keyword in Intel syntax, so the compiler used to emit a
    file that looked correct and would not assemble

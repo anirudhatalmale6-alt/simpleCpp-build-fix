@@ -22,7 +22,9 @@ FAIL=0
 [ -x ./nano_cc ] || { echo "build nano_cc first (make)"; exit 1; }
 
 # --- reference -------------------------------------------------------------
-sed 's|#include "nano-nolibc.h"|#include <stdio.h>|' "$SRC" > "$W/ref.c"
+sed -e 's|#include "nano-nolibc.h"|#include <stdio.h>|' \
+    -e 's|#include "nano-libc.h"|#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n#include <ctype.h>|' \
+    "$SRC" > "$W/ref.c"
 cc -w -o "$W/ref" "$W/ref.c" || { echo "FAIL: gcc could not build the reference"; exit 1; }
 "$W/ref" > "$W/ref.txt" 2>&1
 

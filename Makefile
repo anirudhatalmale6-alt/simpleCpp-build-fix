@@ -14,7 +14,8 @@ SRC       = simpleC++.c
 BIN       = nano_cc
 
 .PHONY: all run test demo structs bitwise printf switch minimal \
-        initializers typedefs gotos functions reserved checkall selfhost clean
+        initializers typedefs gotos functions reserved libcheck checkall \
+        selfhost clean
 
 all: $(BIN)
 
@@ -104,14 +105,18 @@ functions: $(BIN)
 reserved: $(BIN)
 	@sh gcc-check.sh reserved.c $(MINIASM)
 
+# nano-libc.h: the freestanding C library, checked against glibc.
+libcheck: $(BIN)
+	@sh gcc-check.sh libcheck.c $(MINIASM)
+
 # Every gcc-checked suite in one go.
 checkall: $(BIN)
-	@for f in initializers typedefs gotos functions reserved; do \
+	@for f in initializers typedefs gotos functions reserved libcheck; do \
 	    echo "== $$f.c"; sh gcc-check.sh $$f.c $(MINIASM) || exit 1; \
 	done
 
-# How far is nano_cc from compiling itself? Prints what it can already handle
-# and the exact list of what is still missing. See selfhost-shim.h.
+# The three-stage bootstrap: nano_cc builds itself, then that builds itself,
+# and the two have to come out byte-identical. Uses nano-libc.h, not glibc.
 selfhost: $(BIN)
 	@sh selfhost.sh
 
@@ -121,4 +126,5 @@ clean:
 	      bitwise.s bitwise_prog printf.s printf_prog \
 	      switch.s switch_prog initializers.s initializers_prog \
 	      typedefs.s typedefs_prog gotos.s gotos_prog \
-	      functions.s functions_prog reserved.s reserved_prog
+	      functions.s functions_prog reserved.s reserved_prog \
+	      libcheck.s libcheck_prog libcheck.tmp
