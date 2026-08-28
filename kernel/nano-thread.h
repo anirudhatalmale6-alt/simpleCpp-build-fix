@@ -50,6 +50,8 @@ struct Thread {
     long joiner;               // id of a thread waiting on this one, or -1
     long slices;               // how many times it has been scheduled
     long faulted;              // 1 if it died from a CPU exception
+    long root;                 // page-table root this thread runs in
+    long proc;                 // owning process id, or -1 for a kernel thread
     char name[32];
 };
 
@@ -58,6 +60,18 @@ long g_current;                // index of the running thread
 long g_nthreads;
 long g_switches;
 long g_sched_on;               // 0 until the scheduler is allowed to preempt
+
+// The address space every kernel thread runs in: whatever boot32.s built.
+long g_kernel_root;
+
+// Set by sched_switch, read by isr_common in the one instruction window where
+// changing CR3 is safe -- see the comment there. Zero means "no change".
+//
+// It is a global rather than a second return value because the switch happens
+// in assembly, and because there is exactly one CPU: nothing else can be
+// between setting it and consuming it.
+long g_switch_cr3;
+long g_space_switches;
 
 // The stack a new thread starts on has to look exactly like one that was
 // interrupted, because that is the only way back into a thread. From low to
@@ -147,6 +161,8 @@ long thread_create(long entry, long arg, char *nm) {
     g_threads[slot].joiner = -1;
     g_threads[slot].slices = 0;
     g_threads[slot].faulted = 0;
+    g_threads[slot].root = g_kernel_root;
+    g_threads[slot].proc = -1;
     g_threads[slot].id = slot;
     thread_name(slot, nm);
     // 16-byte align the top, and leave a word spare: the ABI wants rsp+8
@@ -183,6 +199,11 @@ long g_stack_smashed;
 long sched_switch(long cur_rsp) {
     long next;
 
+    // Every path out of here must leave this defined, including the ones that
+    // decide not to switch. A stale value would install the previous switch's
+    // page tables under a thread that never asked to move.
+    g_switch_cr3 = 0;
+
     if (!g_sched_on) return cur_rsp;
 
     // Check the outgoing thread's canary while we are already touching it.
@@ -205,6 +226,15 @@ long sched_switch(long cur_rsp) {
     if (next == g_current) {
         g_threads[g_current].state = T_RUNNING;
         return cur_rsp;
+    }
+
+    // If the incoming thread lives in a different address space, hand the root
+    // to isr_common rather than installing it here: this function is running on
+    // the OUTGOING thread's stack, and that stack is only mapped in the address
+    // space we are about to leave.
+    if (g_threads[next].root != g_threads[g_current].root) {
+        g_switch_cr3 = g_threads[next].root;
+        g_space_switches = g_space_switches + 1;
     }
 
     g_current = next;
@@ -290,6 +320,46 @@ void thread_init() {
     g_sched_on = 0;
     g_stack_smashed = 0;
     g_thread_faults = 0;
+    g_switch_cr3 = 0;
+    g_space_switches = 0;
+    // Whatever boot32.s built is the kernel's address space, and every thread
+    // starts in it. Reading it rather than naming a constant means this stays
+    // right if the boot path ever moves the tables.
+    g_kernel_root = read_cr3_();
+}
+
+// A thread that runs in a page-table root of its own. The stack is supplied by
+// the caller because it lives in that other address space, and this side of the
+// kernel cannot allocate there.
+//
+// The stack frame the thread starts on must already have been built in the
+// target space -- see proc_build_stack in nano-proc.h, which pokes it in
+// through the identity map.
+long thread_adopt(long rsp, long root, long proc, char *nm) {
+    long slot;
+    long flags;
+
+    flags = irq_save();
+    slot = thread_find_slot();
+    if (slot < 0) { irq_restore(flags); return -1; }
+
+    g_threads[slot].stack_base = 0;      // not ours to free, and not on the heap
+    g_threads[slot].entry = 0;
+    g_threads[slot].arg = 0;
+    g_threads[slot].retval = 0;
+    g_threads[slot].joiner = -1;
+    g_threads[slot].slices = 0;
+    g_threads[slot].faulted = 0;
+    g_threads[slot].root = root;
+    g_threads[slot].proc = proc;
+    g_threads[slot].id = slot;
+    thread_name(slot, nm);
+    g_threads[slot].rsp = rsp;
+    g_threads[slot].state = T_READY;
+    if (slot >= g_nthreads) g_nthreads = slot + 1;
+
+    irq_restore(flags);
+    return slot;
 }
 
 // Called from the exception handler when the running thread has faulted.

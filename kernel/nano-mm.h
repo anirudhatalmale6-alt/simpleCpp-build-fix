@@ -331,7 +331,18 @@ long pd_split(long pd, long index) {
     return pt;
 }
 
-long vmm_map(long virt, long phys, long flags) {
+// The three vmm_* calls below each take the page-table ROOT to work in, so a
+// caller can build a mapping in an address space that is not the running one --
+// which is exactly what loading a program into a fresh address space needs.
+// The unsuffixed versions operate on the current CR3 and are what the rest of
+// the kernel uses.
+//
+// The root is a physical address, and every level below it is reached by
+// treating that physical address as a pointer. That only works because the
+// first 4 GiB is identity-mapped, so physical and virtual agree there and all
+// page tables are allocated from it. On a kernel with a higher-half map this
+// would need a temporary window; here the identity map IS the window.
+long vmm_map_in(long root, long virt, long phys, long flags) {
     long cr3;
     long pdpt;
     long pd;
@@ -342,7 +353,7 @@ long vmm_map(long virt, long phys, long flags) {
     // A table allocated but not yet installed is invisible to anyone else; a
     // 2 MiB page half-way through being split is worse than either state.
     irqf = irq_save();
-    cr3 = read_cr3_() & PTE_ADDR;
+    cr3 = root & PTE_ADDR;
     pdpt = pt_next(cr3, pt_index(virt, 4), 1);
     if (!pdpt) { irq_restore(irqf); return 0; }
     pd = pt_next(pdpt, pt_index(virt, 3), 1);
@@ -369,14 +380,18 @@ long vmm_map(long virt, long phys, long flags) {
     return 1;
 }
 
-long vmm_unmap(long virt) {
+long vmm_map(long virt, long phys, long flags) {
+    return vmm_map_in(read_cr3_(), virt, phys, flags);
+}
+
+long vmm_unmap_in(long root, long virt) {
     long cr3;
     long pdpt;
     long pd;
     long pt;
     long *e;
 
-    cr3 = read_cr3_() & PTE_ADDR;
+    cr3 = root & PTE_ADDR;
     pdpt = pt_next(cr3, pt_index(virt, 4), 0);
     if (!pdpt) return 0;
     pd = pt_next(pdpt, pt_index(virt, 3), 0);
@@ -398,9 +413,11 @@ long vmm_unmap(long virt) {
     return 1;
 }
 
+long vmm_unmap(long virt) { return vmm_unmap_in(read_cr3_(), virt); }
+
 // What a virtual address currently resolves to, or 0. Used by the tests, and
 // the only honest way to check that a mapping did what it said.
-long vmm_resolve(long virt) {
+long vmm_resolve_in(long root, long virt) {
     long cr3;
     long pdpt;
     long pd;
@@ -408,7 +425,7 @@ long vmm_resolve(long virt) {
     long pt;
     long *e;
 
-    cr3 = read_cr3_() & PTE_ADDR;
+    cr3 = root & PTE_ADDR;
     pdpt = pt_next(cr3, pt_index(virt, 4), 0);
     if (!pdpt) return 0;
     pd = pt_next(pdpt, pt_index(virt, 3), 0);
@@ -420,6 +437,34 @@ long vmm_resolve(long virt) {
     e = (long *)(pt + pt_index(virt, 1) * 8);
     if (!(e[0] & PTE_PRESENT)) return 0;
     return (e[0] & PTE_ADDR) + (virt & 0xFFF);
+}
+
+long vmm_resolve(long virt) { return vmm_resolve_in(read_cr3_(), virt); }
+
+// The page-table flags on a mapping, or 0 if it is not mapped. resolve() alone
+// cannot tell "mapped read-only" from "mapped writable", so a test that only
+// checks the address would pass on a loader that ignored segment permissions
+// entirely.
+long vmm_flags_in(long root, long virt) {
+    long cr3;
+    long pdpt;
+    long pd;
+    long *pde;
+    long pt;
+    long *e;
+
+    cr3 = root & PTE_ADDR;
+    pdpt = pt_next(cr3, pt_index(virt, 4), 0);
+    if (!pdpt) return 0;
+    pd = pt_next(pdpt, pt_index(virt, 3), 0);
+    if (!pd) return 0;
+    pde = (long *)(pd + pt_index(virt, 2) * 8);
+    if (!(pde[0] & PTE_PRESENT)) return 0;
+    if (pde[0] & PTE_HUGE) return pde[0] & 0xFFF;
+    pt = pde[0] & PTE_ADDR;
+    e = (long *)(pt + pt_index(virt, 1) * 8);
+    if (!(e[0] & PTE_PRESENT)) return 0;
+    return e[0] & 0xFFF;
 }
 
 // ---------- 4. the kernel heap ----------

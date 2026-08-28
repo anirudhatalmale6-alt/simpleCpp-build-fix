@@ -22,6 +22,14 @@ a **kernel heap**, **preemptive threads** with locking and a pthreads-shaped
 API, **supervised services** that are restarted when they crash or hang, a
 **filesystem** with directories and the usual shell tools, and it reads the
 firmware's **ACPI** tables to decide how to idle the CPU.
+
+It also runs **programs**. `kernel/user/` holds C programs compiled by the same
+`nano_cc`, linked at 512 GiB and stored on the OS's own filesystem; an **ELF64
+loader** maps their segments into a **private address space** per process and a
+**syscall boundary** on vector 0x80 is the only way they reach the kernel. Two
+copies of one binary run at the same virtual address without seeing each
+other's memory, and a program that faults is killed on its own while everything
+else keeps running.
 See [`kernel/README.md`](kernel/README.md).
 
 ---

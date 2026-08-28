@@ -10,13 +10,22 @@
 
 NANO   := ../nano_cc
 QEMU   := qemu-system-x86_64
+
+# The user programs. Defined here rather than next to their own rules further
+# down: make expands a rule's prerequisites when it READS the rule, and this is
+# a simply-expanded variable, so a definition below the first use expands to
+# nothing. The symptom was gshell64.bin assembling progs.s before the binaries
+# it .incbin's had been built -- "file not found: user/hello.elf" on a clean
+# tree, and a perfectly good build on the second attempt.
+UPROGS := user/hello.elf user/twin.elf user/wild.elf
 QFLAGS := -kernel kernel.elf -no-reboot
 
 .PHONY: all run test shot gfx gfxrun gfxtest gfxshot \
         gshell gshellrun gshelltest gshellshot \
         intr intrrun intrtest acpi acpirun acpitest \
         mm mmrun mmtest threads threadsrun threadstest \
-        srv srvrun srvtest fs fsrun fstest clean
+        srv srvrun srvtest fs fsrun fstest \
+        progs elf elfrun elftest clean
 
 all: kernel.elf
 
@@ -129,14 +138,15 @@ gfxshot: gfx.elf
 # with commands that draw.
 # ---------------------------------------------------------------------------
 gfxshell.s: gfxshell.c nano-kernel.h nano-fb.h nano-font.h nano-int.h \
-            nano-acpi.h nano-mm.h nano-thread.h nano-srv.h nano-fs.h $(NANO)
+            nano-acpi.h nano-mm.h nano-thread.h nano-srv.h nano-fs.h nano-proc.h $(NANO)
 	$(NANO) --kernel gfxshell.c gfxshell.s
 
-gshell64.bin: boot64.s isr.s gfxshell.s kernel64.ld
+gshell64.bin: boot64.s isr.s gfxshell.s progs.s $(UPROGS) kernel64.ld
 	as --64 boot64.s   -o boot64.o
 	as --64 isr.s      -o isr.o
 	as --64 gfxshell.s -o gfxshell.o
-	ld -T kernel64.ld -o gshell64.elf boot64.o isr.o gfxshell.o
+	as --64 progs.s    -o progs.o
+	ld -T kernel64.ld -o gshell64.elf boot64.o isr.o gfxshell.o progs.o
 	objcopy -O binary gshell64.elf gshell64.bin
 
 blob-gshell.s:
@@ -177,10 +187,22 @@ gshelltest: gshell.elf
 	   sleep 0.5; for k in l s ret; do echo "sendkey $$k"; sleep 0.18; done; \
 	   sleep 0.4; for k in d f ret; do echo "sendkey $$k"; sleep 0.18; done; \
 	   sleep 0.5; for k in b a r s ret; do echo "sendkey $$k"; sleep 0.18; done; \
+	   sleep 0.4; for k in e x e c spc slash b i n slash h e l l o ret; \
+	     do echo "sendkey $$k"; sleep 0.15; done; \
+	   sleep 1.2; for k in r u n spc slash b i n slash t w i n spc 1 ret; \
+	     do echo "sendkey $$k"; sleep 0.15; done; \
+	   sleep 0.3; for k in r u n spc slash b i n slash t w i n spc 2 ret; \
+	     do echo "sendkey $$k"; sleep 0.15; done; \
+	   sleep 0.4; for k in p r o c s ret; do echo "sendkey $$k"; sleep 0.18; done; \
+	   sleep 2.5; for k in e x e c spc slash b i n slash w i l d spc 1 ret; \
+	     do echo "sendkey $$k"; sleep 0.15; done; \
+	   sleep 1.2; for k in p r o c s ret; do echo "sendkey $$k"; sleep 0.18; done; \
+	   sleep 0.4; for k in c a t spc slash h e l l o dot o u t ret; \
+	     do echo "sendkey $$k"; sleep 0.15; done; \
 	   sleep 0.4; for k in e c h o spc h i ret; do echo "sendkey $$k"; sleep 0.18; done; \
 	   sleep 0.4; for k in f a u l t ret; do echo "sendkey $$k"; sleep 0.18; done; \
 	   sleep 1.2; echo quit ) | \
-	 timeout 60 $(QEMU) -kernel gshell.elf -no-reboot -display none \
+	 timeout 90 $(QEMU) -kernel gshell.elf -no-reboot -display none \
 	   -serial file:gshell-serial.log -monitor stdio >/dev/null 2>&1; \
 	 echo "---- serial output ----"; cat gshell-serial.log; echo "-----------------------"; \
 	 tr -d '\r' < gshell-serial.log > gshell-serial.clean; \
@@ -193,7 +215,7 @@ gshelltest: gshell.elf
 	   && grep -q "same block reused" gshell-serial.clean \
 	   && grep -q "wrote through it" gshell-serial.clean \
 	   && grep -q "the shell stays usable" gshell-serial.clean \
-	   && grep -q "context switches so far" gshell-serial.clean \
+	   && grep -q "of them across address spaces" gshell-serial.clean \
 	   && grep -q "this shell never stopped" gshell-serial.clean \
 	   && grep -q "everything here was compiled by nano_cc" gshell-serial.clean \
 	   && grep -q "^copied 22[0-9] bytes" gshell-serial.clean \
@@ -201,7 +223,13 @@ gshelltest: gshell.elf
 	   && grep -q "blocks of 512 bytes" gshell-serial.clean \
 	   && grep -qx "hi" gshell-serial.clean \
 	   && grep -q "EXCEPTION 14: page fault" gshell-serial.clean \
-	   && echo "PASS: graphics, keyboard, PCI, ACPI, idle, memory and faults" \
+	   && grep -q "hello from a user program" gshell-serial.clean \
+	   && grep -q "exited with 7" gshell-serial.clean \
+	   && grep -q "written by a user process" gshell-serial.clean \
+	   && grep -q "twin 1: 0 of" gshell-serial.clean \
+	   && grep -q "twin 2: 0 of" gshell-serial.clean \
+	   && grep -q "killed by a fault" gshell-serial.clean \
+	   && echo "PASS: graphics, keyboard, PCI, ACPI, idle, memory, faults, and processes" \
 	   || { echo "FAIL"; exit 1; }
 
 # Boot it, type a few commands, and photograph the screen.
@@ -213,16 +241,17 @@ gshellshot: gshell.elf
 	   sleep 0.5; for k in m e m ret; do echo "sendkey $$k"; sleep 0.18; done; \
 	   sleep 0.5; for k in s p a w n ret; do echo "sendkey $$k"; sleep 0.18; done; \
 	   sleep 0.3; for k in s p a w n ret; do echo "sendkey $$k"; sleep 0.18; done; \
-	   sleep 0.3; for k in s p a w n ret; do echo "sendkey $$k"; sleep 0.18; done; \
-	   sleep 0.3; for k in l s ret; do echo "sendkey $$k"; sleep 0.18; done; \
-	   sleep 0.4; for k in c a t spc slash d o c slash r e a d m e ret; \
+	   sleep 0.3; for k in c l e a r ret; do echo "sendkey $$k"; sleep 0.18; done; \
+	   sleep 0.4; for k in l s spc slash b i n ret; do echo "sendkey $$k"; sleep 0.15; done; \
+	   sleep 0.4; for k in e x e c spc slash b i n slash h e l l o ret; \
 	     do echo "sendkey $$k"; sleep 0.15; done; \
-	   sleep 0.6; for k in c p spc slash d o c slash r e a d m e spc slash n o t e s ret; \
+	   sleep 1.0; for k in c a t spc slash h e l l o dot o u t ret; \
 	     do echo "sendkey $$k"; sleep 0.15; done; \
-	   sleep 0.6; for k in l s ret; do echo "sendkey $$k"; sleep 0.18; done; \
-	   sleep 0.4; for k in d f ret; do echo "sendkey $$k"; sleep 0.18; done; \
+	   sleep 0.5; for k in e x e c spc slash b i n slash t w i n spc 1 ret; \
+	     do echo "sendkey $$k"; sleep 0.15; done; \
+	   sleep 1.5; for k in p r o c s ret; do echo "sendkey $$k"; sleep 0.18; done; \
 	   sleep 1.2; echo "screendump gshell.ppm"; sleep 1; echo quit ) | \
-	 timeout 45 $(QEMU) -kernel gshell.elf -no-reboot -display none \
+	 timeout 60 $(QEMU) -kernel gshell.elf -no-reboot -display none \
 	   -serial file:gshell-serial.log -monitor stdio >/dev/null 2>&1
 	@convert gshell.ppm gshell.png && echo "wrote gshell.png"
 
@@ -494,7 +523,85 @@ fstest: fs.elf
 	   && echo "PASS: files, directories, indirect blocks, rename, concurrency" \
 	   || { echo "FAIL"; exit 1; }
 
+# ---------------------------------------------------------------------------
+# Programs: user-space binaries, compiled by nano_cc, linked at 512 GiB, and
+# embedded in the kernel image so the RAM disk has something to hold.
+#
+# -z max-page-size=0x1000 matters. Without it ld aligns each segment to 2 MiB,
+# and a 4 KiB program asks the loader for six megabytes of frames.
+# ---------------------------------------------------------------------------
+user/ustart.o: user/ustart.s
+	as --64 user/ustart.s -o user/ustart.o
+
+# One recipe from .c to .elf rather than a .s and a .o step.
+#
+# Splitting it looks tidier and does not work: make has a built-in rule for
+# %.o from %.c that runs GCC, and it wins over a pattern rule of ours whose
+# prerequisite is the .s. The first build compiled these with GCC instead of
+# nano_cc and failed inside nano-user.h, on __builtin_va_start -- which was a
+# confusing way to be told the wrong compiler had been chosen.
+#
+# The `cd user` is needed too: nano_cc resolves #include against the working
+# directory, not against the file doing the including, so nano-user.h is only
+# findable from inside that directory.
+user/%.elf: user/%.c user/nano-user.h user/ustart.o user/user.ld $(NANO)
+	cd user && ../$(NANO) --kernel $*.c $*.s
+	as --64 user/$*.s -o user/$*.o
+	ld -T user/user.ld -z max-page-size=0x1000 -o $@ user/ustart.o user/$*.o
+
+progs: $(UPROGS)
+
+# ---------------------------------------------------------------------------
+# ELF loader: per-process address spaces, a syscall vector, and processes.
+# ---------------------------------------------------------------------------
+elf.s: elf.c nano-kernel.h nano-mm.h nano-thread.h nano-fs.h nano-proc.h nano-int.h $(NANO)
+	$(NANO) --kernel elf.c elf.s
+
+elf64.bin: boot64.s isr.s elf.s progs.s $(UPROGS) kernel64.ld
+	as --64 boot64.s -o boot64.o
+	as --64 isr.s    -o isr.o
+	as --64 elf.s    -o elf.o
+	as --64 progs.s  -o progs.o
+	ld -T kernel64.ld -o elf64.elf boot64.o isr.o elf.o progs.o
+	objcopy -O binary elf64.elf elf64.bin
+
+blob-elf.s:
+	@printf '.section .blob, "a"\n.incbin "elf64.bin"\n' > $@
+
+elfk.elf: boot32.s blob-elf.s elf64.bin final.ld
+	as --32 boot32.s  -o boot32.o
+	as --32 blob-elf.s -o blob-elf.o
+	ld -m elf_i386 -T final.ld -o elfk.elf boot32.o blob-elf.o
+
+elf: elfk.elf
+
+elfrun: elfk.elf
+	$(QEMU) -kernel elfk.elf -no-reboot
+
+elftest: elfk.elf
+	@rm -f elf-serial.log
+	@( sleep 14; echo quit ) | \
+	 timeout 70 $(QEMU) -kernel elfk.elf -no-reboot -display none \
+	   -serial file:elf-serial.log -monitor stdio >/dev/null 2>&1; \
+	 echo "---- serial output ----"; cat elf-serial.log; echo "-----------------------"; \
+	 tr -d '\r' < elf-serial.log > elf-serial.clean; \
+	 grep -q "exit code crossed the boundary ok" elf-serial.clean \
+	   && grep -q "process wrote a file the kernel can read ok" elf-serial.clean \
+	   && grep -q "separate address spaces ok" elf-serial.clean \
+	   && grep -q "all three faults contained ok" elf-serial.clean \
+	   && grep -q "kernel survived every fault ok" elf-serial.clean \
+	   && grep -q "every address space was reclaimed ok" elf-serial.clean \
+	   && grep -q "refused /bad.elf" elf-serial.clean \
+	   && echo "PASS: ELF loading, syscalls, address-space isolation, fault containment" \
+	   || { echo "FAIL"; exit 1; }
+
 clean:
+	@# NOT user/*.s -- ustart.s is a source file, and the generated ones are
+	@# named after their .c. Deleting by wildcard here would remove the entry
+	@# point and leave a build that fails on a missing symbol.
+	rm -f user/hello.s user/twin.s user/wild.s user/*.o user/*.elf \
+	      progs.o elf.s blob-elf.s elf64.bin elf64.elf elfk.elf \
+	      elf-serial.log elf-serial.clean
 	rm -f *.o shell.s gfx.s gfxshell.s intr.s acpi.s mm.s threads.s srv.s fs.s \
 	      blob-gfx.s blob-gshell.s blob-intr.s blob-acpi.s blob-mm.s \
 	      blob-threads.s blob-srv.s blob-fs.s \

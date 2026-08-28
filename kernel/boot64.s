@@ -141,3 +141,36 @@ tlb_flush:
 read_cr3_:
     mov %cr3, %rax
     ret
+
+/* void write_cr3_(long root) — install a page-table root.
+ *
+ * This is the entire address-space switch. Writing CR3 also flushes every
+ * non-global TLB entry, which is why no invlpg is needed after it; and why
+ * doing it on every context switch, rather than only when the address space
+ * actually changes, would be a real cost rather than a tidy simplification.
+ *
+ * Everything the kernel touches -- its own code, the stacks, the heap -- lives
+ * in the bottom 512 GiB, and every address space shares that one PML4 entry.
+ * If that were not true, this instruction would unmap the stack it is running
+ * on halfway through returning. */
+.globl write_cr3_
+write_cr3_:
+    mov %rdi, %cr3
+    ret
+
+/* void enable_write_protect(void) — set CR0.WP (bit 16).
+ *
+ * Without this bit, ring 0 may write to a page whose entry says read-only. The
+ * CPU only enforces the write permission against ring 3. So a kernel that maps
+ * a program's .text without PTE_WRITE and never sets WP has not protected
+ * anything -- the store lands, and a test asserting "the text segment is
+ * read-only" passes for the wrong reason, or rather fails to fail.
+ *
+ * Nothing in this kernel writes through a read-only mapping: the identity map
+ * is writable throughout, and the heap is mapped writable. */
+.globl enable_write_protect
+enable_write_protect:
+    mov %cr0, %rax
+    or $0x10000, %rax
+    mov %rax, %cr0
+    ret

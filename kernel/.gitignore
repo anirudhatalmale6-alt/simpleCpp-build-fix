@@ -47,3 +47,15 @@ blob-fs.s
 fs64.elf
 fs64.bin
 fs.elf
+elf.s
+blob-elf.s
+elf64.elf
+elf64.bin
+elfk.elf
+
+# User programs: the .c and nano-user.h, ustart.s and user.ld are sources; the
+# assembly nano_cc emits from them and the linked binaries are not.
+user/hello.s
+user/twin.s
+user/wild.s
+user/*.elf

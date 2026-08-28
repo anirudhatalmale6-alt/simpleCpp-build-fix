@@ -11,10 +11,28 @@
 #include "nano-kernel.h"
 #include "nano-mm.h"
 #include "nano-thread.h"
+#include "nano-fs.h"
+#include "nano-proc.h"
 #include "nano-int.h"
 #include "nano-acpi.h"
 #include "nano-srv.h"
-#include "nano-fs.h"
+
+// The order above is not alphabetical and not arbitrary. nano-int.h holds the
+// one interrupt dispatcher, and it routes a vector to the scheduler, and now
+// also to the syscall table, by testing for their include guards -- there are
+// no function pointers to register a handler with. Anything the dispatcher
+// calls has to be defined before it. nano-fs.h moved up for the same reason:
+// nano-proc.h loads programs off the filesystem, so it has to come after it.
+
+// The user programs, embedded in this image by progs.s. Accessor functions
+// rather than `extern char blob[]`, because nano_cc has no way to declare an
+// array defined in another object and take its address.
+extern long prog_hello_addr();
+extern long prog_hello_size();
+extern long prog_twin_addr();
+extern long prog_twin_size();
+extern long prog_wild_addr();
+extern long prog_wild_size();
 
 #define COL_BG      0x0d1117
 #define COL_FG      0xc9d1d9
@@ -685,6 +703,21 @@ void fs_populate() {
         "    puts(\"hello from a file\\n\");\n"
         "    return 0;\n"
         "}\n");
+
+    // The programs. They are compiled by nano_cc, linked at 512 GiB and
+    // embedded in this kernel image by progs.s, because there is no disk yet
+    // to have put them on. Copying them onto the RAM disk at boot is what makes
+    // `exec /bin/hello` read a real file rather than jump to a symbol.
+    fs_mkdir("/bin");
+    {
+        long ino;
+        ino = fs_create("/bin/hello");
+        if (ino) fs_write(ino, 0, (char *)prog_hello_addr(), prog_hello_size());
+        ino = fs_create("/bin/twin");
+        if (ino) fs_write(ino, 0, (char *)prog_twin_addr(), prog_twin_size());
+        ino = fs_create("/bin/wild");
+        if (ino) fs_write(ino, 0, (char *)prog_wild_addr(), prog_wild_size());
+    }
     strcpy(g_cwd, "/");
 }
 
@@ -698,16 +731,97 @@ char *state_name(long st) {
 
 void cmd_ps() {
     long i;
-    printf("id state   slices name\n");
+    printf("id state   slices space   name\n");
     i = 0;
     while (i < MAX_THREADS) {
         if (g_threads[i].state != T_UNUSED) {
-            printf("%d  %s %d %s\n", i, state_name(g_threads[i].state),
-                   g_threads[i].slices, g_threads[i].name);
+            // "kernel" or "own": which address space the thread runs in. A
+            // thread list that does not say this cannot tell a kernel worker
+            // apart from a loaded program, which after this milestone is the
+            // most useful thing about it.
+            printf("%d  %s %d %s %s\n", i, state_name(g_threads[i].state),
+                   g_threads[i].slices,
+                   g_threads[i].root == g_kernel_root ? "kernel " : "own    ",
+                   g_threads[i].name);
         }
         i = i + 1;
     }
-    printf("%d context switches so far\n", g_switches);
+    printf("%d context switches, %d of them across address spaces\n",
+           g_switches, g_space_switches);
+}
+
+char *proc_state_name(long st) {
+    if (st == P_RUNNING) return "running";
+    if (st == P_EXITED) return "exited ";
+    if (st == P_KILLED) return "killed ";
+    return "free   ";
+}
+
+void cmd_procs() {
+    long i;
+    proc_poll();
+    printf("pid state   thread exit name\n");
+    i = 0;
+    while (i < MAX_PROCS) {
+        if (g_procs[i].state != P_FREE) {
+            printf("%d   %s %d      %d    %s\n",
+                   g_procs[i].pid, proc_state_name(g_procs[i].state),
+                   g_procs[i].tid, g_procs[i].exitcode, g_procs[i].name);
+        }
+        i = i + 1;
+    }
+    printf("%d running, %d killed by a fault, %d syscalls served\n",
+           proc_alive(), g_proc_faults, g_syscalls);
+}
+
+// A number at the end of a command line. Returns 0 for anything that is not
+// one, which is also a perfectly good argument, so nothing here needs to
+// distinguish "no argument" from "the argument zero".
+long shell_atol(char *s) {
+    long v;
+    long neg;
+    v = 0;
+    neg = 0;
+    if (*s == '-') { neg = 1; s = s + 1; }
+    while (*s >= '0' && *s <= '9') { v = v * 10 + (*s - '0'); s = s + 1; }
+    return neg ? -v : v;
+}
+
+// Run a program and wait for it. The shell blocks, but the rest of the system
+// does not: this yields while it waits, so the animators keep drawing and any
+// background process keeps running.
+void cmd_exec(char *path, long arg) {
+    long pid;
+    long code;
+    pid = proc_spawn(path, arg, path);
+    if (!pid) { puts("cannot run "); puts(path); puts(": "); puts(proc_reject); putc('\n'); return; }
+    printf("[pid %d]\n", pid);
+    code = proc_wait(pid);
+    if (code == -1) printf("[pid %d killed by a fault]\n", pid);
+    else printf("[pid %d exited with %d]\n", pid, code);
+}
+
+// Start a program and come straight back to the prompt.
+void cmd_run(char *path, long arg) {
+    long pid;
+    pid = proc_spawn(path, arg, path);
+    if (!pid) { puts("cannot run "); puts(path); puts(": "); puts(proc_reject); putc('\n'); return; }
+    printf("[pid %d started in the background]\n", pid);
+}
+
+// Reap finished processes and give their address spaces back.
+//
+// It has to be somebody else's thread: a process cannot free the page tables
+// it is standing on. A shell command could do the reaping, but then a
+// background program that exits while the shell sits waiting for a keystroke
+// would hold its frames until the next Enter.
+long g_reaped;
+
+void reaper(long unused) {
+    for (;;) {
+        g_reaped = g_reaped + proc_poll();
+        thread_sleep_ms(200);
+    }
 }
 
 void cmd_spawn() {
@@ -730,7 +844,9 @@ void cmd_help() {
     puts("  help clear ver fbinfo pci acpi\n");
     puts("  idle uptime fault\n");
     puts("  mem heaptest maptest\n");
-    puts("  ps spawn stopall\n");
+    puts("  ps procs spawn stopall\n");
+    puts("  exec <prog> [n]   run a program and wait\n");
+    puts("  run  <prog> [n]   run one in the background\n");
     puts("  srv crash\n");
     puts("  ls cat mkdir rm touch cp mv write append cd pwd df\n");
     puts("  demo bars grad lines circles font\n");
@@ -816,7 +932,7 @@ void shell_thread(long unused) {
         if (n == 0) { }
         else if (!strcmp(line, "help")) cmd_help();
         else if (!strcmp(line, "clear")) { chrome(); fb_cx = 0; fb_cy = 0; }
-        else if (!strcmp(line, "ver")) puts("nano-os 0.4, threaded\n");
+        else if (!strcmp(line, "ver")) puts("nano-os 0.5: threads, a filesystem, and processes in their own address spaces\n");
         else if (!strcmp(line, "fbinfo")) cmd_fbinfo();
         else if (!strcmp(line, "pci")) cmd_pci();
         else if (!strcmp(line, "acpi")) cmd_acpi();
@@ -827,6 +943,7 @@ void shell_thread(long unused) {
         else if (!strcmp(line, "heaptest")) cmd_heaptest();
         else if (!strcmp(line, "maptest")) cmd_maptest();
         else if (!strcmp(line, "ps")) cmd_ps();
+        else if (!strcmp(line, "procs")) cmd_procs();
         else if (!strcmp(line, "spawn")) cmd_spawn();
         else if (!strcmp(line, "stopall")) cmd_stopall();
         else if (!strcmp(line, "srv")) cmd_srv();
@@ -858,6 +975,10 @@ void shell_thread(long unused) {
             else if (!strcmp(av[0], "cd") && ac >= 2) cmd_cd(av[1]);
             else if (!strcmp(av[0], "cp") && ac >= 3) cmd_cp(av[1], av[2]);
             else if (!strcmp(av[0], "mv") && ac >= 3) cmd_mv(av[1], av[2]);
+            else if (!strcmp(av[0], "exec") && ac >= 2)
+                cmd_exec(av[1], ac >= 3 ? shell_atol(av[2]) : 0);
+            else if (!strcmp(av[0], "run") && ac >= 2)
+                cmd_run(av[1], ac >= 3 ? shell_atol(av[2]) : 0);
             else if (starts_with(line, "write ") && ac >= 3)
                 cmd_write(av[1], line + 6 + strlen(av[1]) + 1, 0);
             else if (starts_with(line, "append ") && ac >= 3)
@@ -896,7 +1017,11 @@ int main() {
     g_have_fb = 1;
 
     thread_init();
+    proc_init();                   // process table, and CR0.WP so a read-only
+                                   // page is read-only in ring 0 as well
+    g_reaped = 0;
     thread_create((long)shell_thread, 0, "shell");
+    thread_create((long)reaper, 0, "reaper");
     sched_start();                 // does not return
 
     puts("UNREACHABLE\n");

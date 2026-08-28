@@ -208,6 +208,7 @@ void dump_regs(struct Regs *r) {
 // are named here.
 #define IRQ_BASE 32
 #define VEC_YIELD 0x81          // software interrupt: give up the time slice
+#define VEC_SYSCALL 0x80        // software interrupt: a process calling in
 
 long g_spurious;
 
@@ -264,6 +265,28 @@ long isr_dispatch(struct Regs *r) {
         return (long)r;
 #endif
     }
+
+#ifdef NANO_PROC_H
+    if (v == VEC_SYSCALL) {                     // a process calling the kernel
+        // The number is in rax and the answer goes back in rax, so a syscall
+        // looks to the program exactly like a function call that happens to
+        // change privilege domains.
+        g_syscall_resched = 0;
+        if (r->rax == SYS_TICKS) {
+            // Answered here rather than in syscall_dispatch because g_ticks
+            // belongs to this file, and this file is included last so the
+            // dispatcher above can see the scheduler and the process table.
+            r->rax = g_ticks;
+        } else {
+            r->rax = syscall_dispatch(r->rax, r->rdi, r->rsi, r->rdx);
+        }
+        // exit() and yield() must not resume the caller: one has no caller
+        // left, the other asked to be moved off the CPU. Both go through the
+        // same scheduler path a timer tick would.
+        if (g_syscall_resched) return sched_switch((long)r);
+        return (long)r;
+    }
+#endif
 
     if (v == IRQ_BASE + 1) {                    // keyboard
         int sc;

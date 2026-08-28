@@ -64,6 +64,25 @@ isr_common:
      * context switch is this single instruction. Every register, the
      * instruction pointer and the flags all live on the stack at this point,
      * so moving the stack moves all of them at once. */
+
+    /* If the scheduler picked a task in a DIFFERENT address space, it left the
+     * new page-table root in g_switch_cr3 rather than installing it itself.
+     * It could not install it: sched_switch runs on the outgoing task's stack,
+     * and changing CR3 unmaps that stack out from under the function that is
+     * still running on it.
+     *
+     * Here is the one window where that is safe. Between the call returning and
+     * the mov below, nothing touches memory at all -- the new stack pointer is
+     * in %rax, the new root is in %rcx, and the instructions themselves are in
+     * the kernel image, which every address space maps identically.
+     *
+     * Zero means "no change", which is also what the field holds on any kernel
+     * that never creates a second address space. */
+    mov g_switch_cr3(%rip), %rcx
+    test %rcx, %rcx
+    jz .Lsame_space
+    mov %rcx, %cr3
+.Lsame_space:
     mov %rax, %rsp
 
     pop %r15
@@ -84,6 +103,29 @@ isr_common:
 
     add $16, %rsp               /* drop the vector and the error code */
     iretq
+
+/* A fallback definition of g_switch_cr3, for the kernels that have no scheduler.
+ *
+ * isr.s is one file shared by every image here, and three of them -- the
+ * interrupt, ACPI and memory-manager bring-ups -- do not include nano-thread.h
+ * and so never define this variable. The reference above would leave them
+ * failing to link over a feature they do not use.
+ *
+ * `.weak` is exactly the right tool: an image that defines the symbol in C gets
+ * its own, and the one here is discarded; an image that does not gets this
+ * eight bytes of zero, which reads as "never change CR3".
+ *
+ * .data, NOT .bss. These images are flattened with `objcopy -O binary` and
+ * loaded by a stub that zeroes nothing, so a .bss variable would come up
+ * holding whatever was in memory -- and this one is loaded straight into CR3.
+ */
+.section .data
+.align 8
+.weak g_switch_cr3
+g_switch_cr3:
+    .quad 0
+
+.section .text
 
 /* isr_noerr N: the CPU pushed no error code, so push a zero in its place. */
 .macro isr_noerr n

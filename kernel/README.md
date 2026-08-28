@@ -50,6 +50,10 @@ make srvtest    # headless: a crash and a hang, both recovered
 
 make fs         # a RAM disk with a Unix-shaped filesystem
 make fstest     # headless: indirect blocks, rename, delete, concurrency
+
+make progs      # the user programs, compiled by nano_cc and linked at 512 GiB
+make elf        # the ELF loader: processes in their own address spaces
+make elftest    # headless: loading, syscalls, isolation, fault containment
 ```
 
 `make test` needs no display; it drives real keystrokes through QEMU's
@@ -93,8 +97,10 @@ rather than `.bss`, the flat image needs no separate zero-fill step.
 
 `nano_cc --kernel in.c out.s` differs from the hosted mode in two ways only:
 it does **not** emit the Linux `_start`/`exit` stub (the boot stub provides the
-entry and calls `main`), and it emits globals in `.data`. Everything else — the
-full language subset — is identical.
+entry and calls `main`), it emits globals in `.data` rather than `.bss` (a flat
+image has nothing to zero-fill it), and it marks those globals `.globl` so the
+hand-written assembly can reach them. Everything else — the full language
+subset — is identical, and hosted output is untouched.
 
 ## Shell commands
 
@@ -655,3 +661,171 @@ by message passing. Its state and locking are arranged so it can become one,
 but a genuine server needs IPC, and IPC only buys anything once each server has
 its own address space. Registering it as a supervised heartbeat thread that
 does no actual serving would look like progress and would be theatre.
+
+## Processes: an ELF loader, address spaces and a syscall boundary
+
+`make elf && make elftest`, and in the graphics shell `exec`, `run`, `procs`.
+
+Until this point a "program" was a thread. It shared one set of page tables
+with everything else, which meant a stray pointer in one task could land in
+another and the symptom would appear somewhere unrelated, much later. The
+supervisor in `nano-srv.h` could restart a service that *crashed*; nothing
+could contain a service that *scribbled*.
+
+Now a program is a file. `proc_spawn` reads it off the filesystem, parses the
+ELF64 header, maps its PT_LOAD segments into a fresh address space, builds a
+stack, and hands it to the scheduler as an ordinary thread.
+
+```
+/> ls /bin
+hello  14408
+twin   18256
+wild   14128
+/> exec /bin/hello
+[pid 1]
+hello from a user program
+  pid 1, started with argument 0
+  /doc/readme is 221 bytes
+  read 221 bytes back through the syscall boundary
+  wrote /hello.out
+[pid 1 exited with 7]
+/> cat /hello.out
+written by a user process
+```
+
+### Where user memory lives
+
+PML4 entry 1: virtual addresses 512 GiB to 1 TiB. Entry 0 — everything below
+512 GiB, which is the identity map and the kernel heap — is shared by every
+address space. Entry 1 is the only thing `as_create` gives a process of its
+own.
+
+Putting user space in its own top-level slot rather than at the traditional
+0x400000 is what makes the private/shared split one word wide. At 0x400000 it
+would sit inside the identity map, and every process would have to carve a hole
+in the mapping the kernel is running out of.
+
+Every program is linked at exactly the same address, on purpose. That is what
+makes two running copies a test of isolation rather than a test of the linker.
+
+### The context switch had to grow one instruction, in the right place
+
+`sched_switch` cannot install the new CR3 itself. It runs on the *outgoing*
+thread's stack, and changing CR3 unmaps that stack out from under the function
+still standing on it.
+
+So it writes the new root into `g_switch_cr3` and `isr_common` installs it, in
+the one window where that is safe:
+
+```asm
+    call isr_dispatch           /* returns the new rsp in %rax */
+
+    mov g_switch_cr3(%rip), %rcx
+    test %rcx, %rcx
+    jz .Lsame_space
+    mov %rcx, %cr3
+.Lsame_space:
+    mov %rax, %rsp              /* the context switch itself */
+```
+
+Between the call returning and the `mov`, nothing touches memory at all: the
+new stack pointer is in a register, the new root is in a register, and the
+instructions themselves are in the kernel image, which every address space maps
+identically.
+
+`isr.s` is shared by images that have no scheduler at all, so it carries a
+`.weak` definition of `g_switch_cr3` for them — in `.data`, not `.bss`, because
+these images are flattened with `objcopy -O binary` and nothing zeroes `.bss`.
+A `.bss` variable would come up holding whatever was in memory, and this one is
+loaded straight into CR3.
+
+### The test that would otherwise prove nothing
+
+Two processes, the same binary, the same virtual address, different bytes:
+
+```
+twin 1: pid 2, buffer at 0x8000002000, filled with 'A'
+twin 2: pid 3, buffer at 0x8000002000, filled with 'B'
+twin 1: 0 of 122880 bytes wrong after 30 rounds
+twin 2: 0 of 122880 bytes wrong after 30 rounds
+```
+
+It reports how many bytes were wrong rather than "ok", because a test that can
+only say ok cannot tell "isolated" from "never ran".
+
+It was checked the other way round too. Forcing both processes to share one
+address space does not produce a slightly worse number — the second program's
+segments load straight over the first one's, and both die immediately:
+
+```
+twin results: -1 and -1 bytes wrong
+FRAMES LEAKED
+FAIL
+```
+
+### CR0.WP, or the permission bits would have been decoration
+
+`wild.c` fails three different ways on purpose: a null pointer, a store into
+its own read-only text, and a store far above anything mapped.
+
+The middle one is the one worth having. Before CR0.WP was set, that store
+**succeeded**. The CPU only enforces a read-only page against ring 3, and these
+programs run in ring 0 — so the mapping said read-only and the hardware ignored
+it. A test running only the other two cases would have passed while the segment
+permissions did nothing at all.
+
+### What this buys, and what it does not
+
+Programs still run in **ring 0**. The address space is private, so a process
+cannot *accidentally* reach another one. It can still deliberately reach
+anything it likes: at CPL 0 it may write CR3, execute `cli`, and address the
+whole kernel through the identity map.
+
+Isolation from accident: yes. Isolation from malice: no.
+
+Ring 3 needs a TSS, a kernel stack per process, a user GDT selector, and a
+range check on every pointer that crosses the syscall boundary. That is its own
+milestone, not a footnote to this one.
+
+### The syscall boundary
+
+Vector `0x80`. Number in `rax`, arguments in `rdi`/`rsi`/`rdx`, result back in
+`rax`: exit, write, read, open, close, seek, size, sbrk, getpid, yield, ticks,
+unlink. The numbers are written out in both `kernel/nano-proc.h` and
+`kernel/user/nano-user.h` rather than shared through a header, because if the
+two ever disagree the calls do the wrong thing silently rather than failing to
+compile — and that is worth having in front of you in both files.
+
+`exit` and `yield` must not return to their caller: one has no caller left, the
+other asked to be moved off the CPU. Both set a flag the dispatcher reads and
+go through the same scheduler path a timer tick would, rather than having a
+second context-switch path to keep correct.
+
+### Frames have to come back
+
+Six processes are created and destroyed in `elftest`, and the free-frame count
+is compared before and after. An address space that leaks looks perfect until
+the twentieth program. `as_destroy` walks the user PDPT tree, frees every frame
+it maps and then the tables themselves, and refuses outright to destroy the
+address space it is currently standing in.
+
+The reaping cannot happen where a process ends — `thread_exit` runs on the
+dying process's own stack, inside the address space it would be destroying. A
+`reaper` thread does it, which is the first point at which the space is
+provably not in use.
+
+### A compiler change this needed
+
+Kernel-mode `nano_cc` now emits `.globl` for its globals. A kernel is C plus
+hand-written assembly, and the assembly regularly needs a variable the C side
+owns; without this the symbol is local to the object and the link fails on
+something the source plainly defines. Hosted output is unchanged, so the
+three-stage bootstrap is still byte-identical.
+
+### What this is not, yet
+
+There is no `fork`, no `exec` that replaces the calling image, no argv beyond a
+single integer, and no way to compile a program from inside the OS — the
+programs are built on the host and embedded in the kernel image by `progs.s`,
+because there is no disk to have put them on. A real block device is the next
+piece.
