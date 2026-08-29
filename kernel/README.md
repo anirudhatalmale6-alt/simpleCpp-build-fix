@@ -72,6 +72,12 @@ make wmshot     # save wm.png
 make sse        # floating point, measured: is a soft-float library needed?
 make sserun     # boot it and watch
 make ssetest    # headless: provoke the fault, enable SSE, check the bit patterns
+
+make wmin       # the mouse: a pointer, drag, click-to-raise, a console window
+make wminrun    # boot it and use it -- this one is interactive
+make wmintest   # headless: inject mouse packets, count pixels, hash the screen
+make wminshot   # save wmin.png
+sh tools/sabotage-wmin.sh    # break it on purpose; check the tests notice
 ```
 
 `make test` needs no display; it drives real keystrokes through QEMU's
@@ -1426,3 +1432,232 @@ what comes after. When we get there, musl's `math/` is MIT and derives from
 FreeBSD's `msun` under BSD-2; `sqrt` needs nothing at all, being one
 instruction. The `tlibc` libm is GPL-3.0, so it is not the permissive option it
 looked like.
+
+---
+
+## K13 — the mouse, the pointer, and a console in a window
+
+K11 gave windows that repaint only what changed. K13 gives a way to touch them:
+a PS/2 mouse on IRQ12, a pointer composited on top of everything, hit testing
+that respects the z-order, draggable title bars, a close button, focus, and a
+terminal that lives inside a window instead of owning the screen.
+
+![nanoOS K13 desktop](wmin.png)
+
+```
+make wminrun     # boot it and use it
+make wmintest    # headless: inject packets, count pixels, hash the screen
+make wminlive    # drive QEMU's real emulated mouse and photograph the result
+sh tools/sabotage-wmin.sh   # break it on purpose and check the tests notice
+```
+
+### The decoder is deliberately not an interrupt handler
+
+`mouse_byte()` takes one byte and advances a state machine. It does no I/O,
+touches no hardware and acknowledges nothing. The handler in `nano-int.h` reads
+port 0x60, hands the byte over, and sends the EOI. That is the entire coupling.
+
+The reason is that the byte stream is where the bugs are, and a pure function of
+a byte stream can be fed byte streams by a test. Wire the decoder into the IRQ
+and the only way to exercise it is to move a real mouse and look at the screen,
+which is not a test.
+
+So `make wmintest` injects packets, and three of the checks are the classic PS/2
+mouse bugs:
+
+- **Sign extension.** `dx` arrives as a magnitude byte whose sign lives in a bit
+  of the *first* byte. Without extending it, `0xF6` is 246 and the pointer jumps
+  right when the mouse moves left.
+- **The axis flip.** The mouse's Y grows away from the user; the screen's grows
+  downward. Copy `dy` straight through and the pointer goes up when you push the
+  mouse forward — everybody notices and nobody can immediately say why.
+- **Resynchronisation.** Bit 3 of byte 0 is always set, and it is the only thing
+  in the protocol marking where a packet begins. Without checking it, one
+  dropped byte means every packet after it is decoded against the wrong offsets,
+  forever.
+
+The packet straddling a truncation is garbage and nothing can be done about
+that — the protocol carries no length, so the decoder cannot know that two of
+its three bytes came from a different packet. What matters is that it does not
+*stay* wrong, so the assertion is that ten packets of +1 afterwards move the
+pointer by exactly ten. A decoder permanently one byte out of step cannot do
+that, and neither can one that re-locks onto the wrong boundary.
+
+### IRQ12 is on the other PIC
+
+Unmasking IRQ12 alone gives a mouse that is enabled, streaming, and completely
+silent. It lives on the secondary PIC, which reaches the CPU only through IRQ2
+on the primary, so the cascade line has to come out of the mask as well.
+
+The mouse is also set up with interrupts still off. The controller ACKs every
+command with `0xFA`, and `0xFA` has bit 3 set — so an IRQ12 handler running
+while those ACKs are in flight feeds the packet decoder something that looks
+exactly like a valid first byte.
+
+And the mouse and the keyboard share port 0x60. Bit 5 of the status register is
+the only thing that says which one the waiting byte came from; without checking
+it, a keystroke that races a mouse packet is decoded as movement — the pointer
+jumps and the letter is lost, and neither symptom points at the cause.
+
+### The pointer belongs to no window
+
+That is the design decision, not a detail. Composite the cursor into a window's
+backing buffer and it is captured by that window's content, smeared across it
+during a drag, and left behind whenever the pointer crosses a boundary.
+
+So it is drawn straight to the framebuffer *after* the compositor has finished,
+and it is erased by telling the compositor that the rectangle it occupied is
+damaged. The compositor repaints what was underneath without ever knowing why.
+
+This is also why it is not save-and-restore. Saving the pixels under the cursor
+and putting them back works right up until the window under it moves, at which
+point the restore paints a stale copy of where that window used to be.
+
+```
+moving the pointer 8 pixels                346 pixels =   0.0% of a full repaint
+  of which the pointer glyph itself is      118
+the same move, damage tracking off      786,550 pixels = 100.0%   2,273x more
+200 pointer moves over two windows          346 pixels per frame
+  200 full repaints would have been  157,286,400
+```
+
+The pointer is the thing that moves most often on a desktop. At 346 pixels a
+frame it is free; at 786,432 it would undo every saving K11 made.
+
+After 200 moves across two windows and the desktop, the framebuffer is read back
+and hashed against a full repaint of the same scene, and they match — no trail.
+Then the pointer is parked inside a window, the window is dragged out from under
+it, and the hashes are compared again. A cursor baked into a backing buffer
+cannot pass that one.
+
+### Hit testing walks the z-order the other way
+
+Painting runs back to front; hit testing runs front to back. Conflating the two
+gives clicks that land on the window underneath the one you can see, so the test
+asserts exactly that: two overlapping windows, a point inside both, and the
+answer has to be the front one — then raise the other and the answer has to
+change.
+
+The close box is inside the title bar, so it is tested first. The other order
+gives a close button that starts a drag.
+
+Dragging stores the **grab offset**, not the last pointer position. A drag
+driven by accumulated deltas drifts away from the cursor whenever an event is
+missed or the pointer is clamped at a screen edge, and the drift only shows up
+after many events.
+
+The event queue coalesces motion but never a button change. Losing a motion
+event is invisible — the next one carries the current position anyway. Losing a
+press is not: a click that never arrives is a window that will not come to the
+front, and the user's conclusion is that the machine is broken.
+
+### Focus is not the same thing as being in front
+
+A window can be raised without taking focus. `wm_set_focus` repaints **both**
+title bars, the one losing focus as well as the one gaining it; repainting only
+the new one leaves two windows both looking active, which is worse than neither
+looking active because it is a confident lie about where the next keystroke
+goes.
+
+That bug is invisible to a framebuffer checksum. The incremental frame and the
+full repaint are built from the *same backing buffers*, so they agree perfectly
+on a wrong picture. So the test reads the title bar pixel out of the buffer
+itself and compares it against the window's own accent and dim colours.
+
+With the desktop focused, keys go nowhere — not "the last window keeps getting
+them", which is what happens if focus is only ever set and never cleared.
+
+### The console keeps two grids
+
+`cells` is what the terminal wants on screen; `shown` is what is actually there.
+Flushing compares them, redraws only the cells that differ, and issues one
+invalidate covering the bounding box.
+
+```
+typing one character:  2 cells redrawn, 160 screen pixels
+  the same keystroke with the pointer visible: 506 (118 of them the pointer)
+```
+
+Two cells, because the character lands in one and the block cursor moves to the
+next; 160 pixels is exactly 2 × 8 × 10.
+
+That measurement is taken with the pointer hidden. The pointer is redrawn on
+every frame — that is what a pointer is — and leaving it in folds a constant 346
+pixels into a measurement of something else. The first version of this test did
+exactly that and then asserted a bound loose enough to hide it: two mistakes
+covering for each other.
+
+A cell is 8x10 for an 8x8 font. Row 7 of every glyph is the descender line,
+where `g j p q y _` go, so packing rows at exactly the font height makes those
+characters touch the tops of the line below.
+
+The terminal paints all of its own background, including blank cells, and the
+window's background colour is deliberately left as the manager's default. Making
+them the same colour would let a flush that skipped blank cells look perfect, so
+there is a check that counts client-area pixels the terminal never painted, and
+it has to be zero.
+
+### Proving the tests can fail
+
+`sh tools/sabotage-wmin.sh` applies one deliberate bug at a time, rebuilds, runs
+the image headless, and records which checks noticed. A baseline run first
+requires the unmodified tree to come back clean.
+
+| broken on purpose | checks that caught it |
+|---|---|
+| `dx` is never sign-extended | 2 |
+| the Y axis is not flipped | 2 |
+| byte 0's always-set bit 3 is not checked | 5 |
+| the X/Y overflow bits are ignored | 4 |
+| coalescing swallows button changes as well as motion | 18 |
+| the pointer is never erased before the next frame | 6 |
+| focus repaints only the window gaining it | 2 |
+| the close box is not tested before the title bar | 5 |
+| a press anywhere in a window starts a drag | 2 |
+| the terminal's `shown` grid starts out equal to `cells` | 2 |
+| the cell the text cursor left is not marked for redraw | 3 |
+
+The first run of that script reported **eight of eleven deliberately broken
+builds as passing**, and the code was fine. `expect()` printed its `got/wanted`
+diagnostic before calling `fail()`, so the word FAIL landed in the middle of a
+line and the script grepped for it at the start of one. A harness that
+under-reports failures is worse than no harness, because it certifies the code.
+
+Fixing that left three genuinely uncaught, and all three were holes in the
+tests:
+
+- The client-area press test never pressed anything. The step before it left the
+  button held down, and a press that is not a press *edge* does nothing — so the
+  block passed while the code was sabotaged to drag from anywhere in a window.
+- Nothing checked that the terminal painted its blank cells, because the window
+  background had been set to the terminal background, making the omission
+  invisible.
+- Nothing caught a stale text cursor, because the only move that exposes it is
+  one where *neither* the vacated nor the entered cell changes contents — a bare
+  newline on a blank line. Every other move happens to redraw the vacated cell
+  anyway, since that cell is the one that just received a character.
+
+The third needed a way to ask the picture how many cells were drawn inverted.
+No byte in `nano-font.h` has bit 7 set, so column 7 of a cell is always that
+cell's *background* whatever character is in it — an exact probe.
+
+### End to end, through the actual hardware
+
+Everything above is injected, which deliberately skips the 8042, the PIC
+cascade, IRQ12 and the interrupt handler. `make wminlive` drives QEMU's emulated
+PS/2 mouse and keyboard from the monitor instead: it types `help` into the
+focused console, walks the pointer onto the "files" title bar, presses, drags,
+and releases.
+
+![driven through the real emulated hardware](wmin-live.png)
+
+`help` ran and listed the commands. "files" moved to where it was dragged, came
+to the front of the console, and took focus — its title bar lit and the
+console's went dim. That is the whole path, from an interrupt to a pixel.
+
+### What is not here
+
+Resizing, minimise and maximise, window borders as drag handles, and a scroll
+wheel. The wheel needs the Intellimouse sample-rate handshake (200, 100, 80) to
+switch the mouse into a four-byte packet, which is a self-contained piece of
+work for a later milestone.

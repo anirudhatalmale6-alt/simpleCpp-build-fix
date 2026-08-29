@@ -42,8 +42,19 @@ struct Win {
     char *title;
     long visible;
     long bg;
-    long accent;                        // title bar colour
+    long accent;                        // title bar colour when focused
+    long dim;                           // title bar colour when not focused
+    long kind;                          // what the input layer should do with it
+    long tag;                           // index into whatever `kind` implies
+    long fixed;                         // 1 = cannot be dragged or closed
 };
+
+// Window kinds. There are no function pointers in nano_cc, so a window cannot
+// carry its own key handler; it carries a number and the input layer switches
+// on it. Less flexible than a vtable and, at four kinds, considerably less
+// code.
+#define WM_KIND_PLAIN 0
+#define WM_KIND_TERM  1
 
 struct Win  g_win[WM_MAXWIN];
 long        g_order[WM_MAXWIN];         // window handles, back to front
@@ -208,6 +219,10 @@ long wm_create(long x, long y, long w, long h, char *title) {
     g_win[i].visible = 1;
     g_win[i].bg = rgb(240, 240, 240);
     g_win[i].accent = rgb(40, 80, 160);
+    g_win[i].dim = rgb(110, 118, 130);
+    g_win[i].kind = WM_KIND_PLAIN;
+    g_win[i].tag = 0;
+    g_win[i].fixed = 0;
 
     g_order[g_nwin] = i;
     g_nwin = g_nwin + 1;
@@ -273,17 +288,64 @@ void wm_win_text(long hnd, long px, long py, char *s, long fg) {
     while (*s) { wm_win_glyph(hnd, x, py, *s, fg); x = x + FONT_W; s = s + 1; }
 }
 
+// ---------- focus and the title bar ----------
+
+// The focused window is the one keystrokes go to. It is deliberately NOT the
+// same thing as the front window: a window can be raised without taking focus,
+// and keeping the two ideas separate now is cheaper than untangling them later.
+long g_focus;
+
+// The close button, a square at the right-hand end of the title bar.
+#define WM_CLOSE_SZ  (WM_TITLE_H - 6)
+#define WM_CLOSE_PAD 4
+
+long wm_close_x(long hnd) { return g_win[hnd].w - WM_CLOSE_SZ - WM_CLOSE_PAD; }
+long wm_close_y() { return (WM_TITLE_H - WM_CLOSE_SZ) / 2; }
+
+// Draw only the title bar. Separate from wm_decorate because focus changes on
+// every click, and redrawing a window's entire client area to recolour a
+// 16-pixel strip is exactly the kind of waste the rest of this file exists to
+// avoid.
+void wm_titlebar(long hnd) {
+    long bar;
+    long cx;
+    long cy;
+    long i;
+    long focused;
+
+    focused = (g_focus == hnd);
+    bar = focused ? g_win[hnd].accent : g_win[hnd].dim;
+    wm_win_fill(hnd, 0, 0, g_win[hnd].w, WM_TITLE_H, bar);
+    if (g_win[hnd].title)
+        wm_win_text(hnd, 4, 4, g_win[hnd].title,
+                    focused ? rgb(255, 255, 255) : rgb(225, 228, 232));
+
+    if (!g_win[hnd].fixed) {
+        cx = wm_close_x(hnd);
+        cy = wm_close_y();
+        wm_win_fill(hnd, cx, cy, WM_CLOSE_SZ, WM_CLOSE_SZ, rgb(200, 70, 70));
+        wm_win_frame(hnd, cx, cy, WM_CLOSE_SZ, WM_CLOSE_SZ, rgb(90, 20, 20));
+        i = 2;
+        while (i < WM_CLOSE_SZ - 2) {
+            wm_win_pixel(hnd, cx + i, cy + i, rgb(255, 235, 235));
+            wm_win_pixel(hnd, cx + WM_CLOSE_SZ - 1 - i, cy + i, rgb(255, 235, 235));
+            i = i + 1;
+        }
+    }
+    wm_win_fill(hnd, 0, WM_TITLE_H - 1, g_win[hnd].w, 1, rgb(20, 20, 20));
+}
+
 // Border, title bar, and a client area cleared to the window's background.
 void wm_decorate(long hnd) {
     wm_win_fill(hnd, 0, 0, g_win[hnd].w, g_win[hnd].h, g_win[hnd].bg);
-    wm_win_fill(hnd, 0, 0, g_win[hnd].w, WM_TITLE_H, g_win[hnd].accent);
-    if (g_win[hnd].title)
-        wm_win_text(hnd, 4, 4, g_win[hnd].title, rgb(255, 255, 255));
+    wm_titlebar(hnd);
     wm_win_frame(hnd, 0, 0, g_win[hnd].w, g_win[hnd].h, rgb(20, 20, 20));
 }
 
 long wm_client_x() { return WM_BORDER; }
 long wm_client_y() { return WM_TITLE_H; }
+long wm_client_w(long hnd) { return g_win[hnd].w - WM_BORDER * 2; }
+long wm_client_h(long hnd) { return g_win[hnd].h - WM_TITLE_H - WM_BORDER; }
 
 // ---------- the region still waiting to be painted ----------
 //
@@ -368,6 +430,114 @@ void region_subtract(long bx, long by, long bw, long bh) {
     g_nreg = n2;
 }
 
+// ---------- the pointer ----------
+//
+// The cursor is the one thing on screen that belongs to no window. That is not
+// a detail, it is the whole design decision: if the cursor were composited into
+// a window's backing buffer it would be captured by that window's content,
+// smeared across it during a drag, and left behind whenever the pointer crossed
+// a boundary. So it is drawn straight to the framebuffer AFTER the compositor
+// has finished, and it is removed by telling the compositor that the rectangle
+// it occupied is damaged. The compositor then repaints what was underneath
+// without ever knowing why.
+//
+// The cost of that is two small rectangles per frame -- the one being vacated
+// and the one being entered -- against 786,432 pixels for a full repaint. A
+// cursor is the thing that moves most often on a desktop, so getting this wrong
+// undoes every saving the compositor makes.
+
+#define CUR_W 12
+#define CUR_H 19
+
+// '.' transparent, 'X' outline, '#' fill. A mask rather than a colour array,
+// because a pointer that is a solid rectangle is unusable over text.
+char *g_cursor_bits =
+    "X..........."
+    "XX.........."
+    "X#X........."
+    "X##X........"
+    "X###X......."
+    "X####X......"
+    "X#####X....."
+    "X######X...."
+    "X#######X..."
+    "X########X.."
+    "X#########X."
+    "X##########X"
+    "X#####XXXXXX"
+    "X###X#X....."
+    "X##X.X#X...."
+    "XX...X#X...."
+    "X.....X#X..."
+    "......X#X..."
+    ".......XX...";
+
+long g_cur_on;          // is there a pointer at all
+long g_cur_x;           // where it should be
+long g_cur_y;
+long g_cur_px;          // where it actually is on screen right now
+long g_cur_py;
+long g_cur_painted;     // ...and whether it is on screen at all
+long g_cur_pixels;      // pixels the pointer itself has cost since a reset
+
+void wm_cursor_show(long on) {
+    if (g_cur_on == on) return;
+    g_cur_on = on;
+    if (!on && g_cur_painted) wm_damage(g_cur_px, g_cur_py, CUR_W, CUR_H);
+}
+
+// Ask for the pointer to be somewhere. Nothing reaches the screen until the
+// next present, so a burst of mouse packets between two frames costs one move,
+// not one per packet.
+void wm_cursor_move(long x, long y) {
+    if (x < 0) x = 0;
+    if (y < 0) y = 0;
+    if (x > fb_width - 1) x = fb_width - 1;
+    if (y > fb_height - 1) y = fb_height - 1;
+    g_cur_x = x;
+    g_cur_y = y;
+}
+
+void wm_cursor_draw() {
+    long y;
+    if (!g_cur_on) return;
+    y = 0;
+    while (y < CUR_H) {
+        long sy;
+        sy = g_cur_y + y;
+        if (sy >= 0 && sy < fb_height) {
+            long x;
+            long wrote;
+            wrote = 0;
+            x = 0;
+            while (x < CUR_W) {
+                long ch;
+                long sx;
+                ch = g_cursor_bits[y * CUR_W + x];
+                sx = g_cur_x + x;
+                if (ch != '.' && sx >= 0 && sx < fb_width) {
+                    long col;
+                    col = (ch == 'X') ? rgb(0, 0, 0) : rgb(255, 255, 255);
+                    mmio_write32(fb_base + sy * fb_pitch + sx * 4, col);
+                    wrote = wrote + 1;
+                }
+                x = x + 1;
+            }
+            // Counted through the same totals as everything else, so the cost
+            // of the pointer cannot hide from the measurements.
+            if (wrote) {
+                wm_pixels = wm_pixels + wrote;
+                g_cur_pixels = g_cur_pixels + wrote;
+                wm_blits = wm_blits + 1;
+            }
+        }
+        y = y + 1;
+    }
+    g_cur_px = g_cur_x;
+    g_cur_py = g_cur_y;
+    g_cur_painted = 1;
+}
+
 // ---------- the present step ----------
 
 // Copy the part of window `hnd` that lies inside r to the screen.
@@ -419,11 +589,25 @@ void wm_paint_rect(struct Rect *r) {
 
 void wm_present() {
     long i;
+
+    // Erase the pointer by damaging where it is. The compositor has no idea a
+    // pointer exists; it just repaints that rectangle from the windows and the
+    // desktop, which is exactly what "erase" means. Doing it this way rather
+    // than saving and restoring the pixels underneath also means the pointer
+    // cannot resurrect a stale copy of a window that has since moved.
+    if (g_cur_painted) {
+        wm_damage(g_cur_px, g_cur_py, CUR_W, CUR_H);
+        g_cur_painted = 0;
+    }
+
     if (wm_no_damage || g_dmg_overflow) wm_damage_all();
     i = 0;
     while (i < g_ndmg) { wm_paint_rect(&g_dmg[i]); i = i + 1; }
     g_ndmg = 0;
     g_dmg_overflow = 0;
+
+    // Last, on top of everything, and outside the damage system entirely.
+    wm_cursor_draw();
 }
 
 // ---------- window operations that generate damage ----------
@@ -463,9 +647,61 @@ void wm_invalidate(long hnd, long x, long y, long w, long h) {
     wm_damage(g_win[hnd].x + x, g_win[hnd].y + y, w, h);
 }
 
+// Move focus. Both title bars are redrawn and both are invalidated -- the one
+// losing focus as well as the one gaining it. Repainting only the new one is
+// the obvious bug here, and it leaves two windows both looking active, which
+// is worse than neither looking active because it is a confident lie about
+// where the next keystroke will land.
+void wm_set_focus(long hnd) {
+    long old;
+    if (g_focus == hnd) return;
+    old = g_focus;
+    g_focus = hnd;
+    if (old >= 0 && old < WM_MAXWIN && g_win[old].used) {
+        wm_titlebar(old);
+        wm_invalidate(old, 0, 0, g_win[old].w, WM_TITLE_H);
+    }
+    if (hnd >= 0 && hnd < WM_MAXWIN && g_win[hnd].used) {
+        wm_titlebar(hnd);
+        wm_invalidate(hnd, 0, 0, g_win[hnd].w, WM_TITLE_H);
+    }
+}
+
+void wm_destroy(long hnd) {
+    long i;
+    long at;
+    if (hnd < 0 || hnd >= WM_MAXWIN) return;
+    if (!g_win[hnd].used) return;
+
+    // Damage before the window stops existing, not after: the rectangle to
+    // repaint is read from fields that are about to be cleared.
+    wm_damage(g_win[hnd].x, g_win[hnd].y, g_win[hnd].w, g_win[hnd].h);
+
+    at = -1;
+    i = 0;
+    while (i < g_nwin) { if (g_order[i] == hnd) at = i; i = i + 1; }
+    if (at >= 0) {
+        i = at;
+        while (i < g_nwin - 1) { g_order[i] = g_order[i + 1]; i = i + 1; }
+        g_nwin = g_nwin - 1;
+    }
+
+    if (g_win[hnd].pix) kfree((void *)g_win[hnd].pix);
+    g_win[hnd].pix = 0;
+    g_win[hnd].used = 0;
+    g_win[hnd].visible = 0;
+
+    // Focus cannot stay on a window that is gone. Hand it to whatever is now
+    // in front, or to nothing.
+    if (g_focus == hnd) {
+        g_focus = -1;
+        if (g_nwin > 0) wm_set_focus(g_order[g_nwin - 1]);
+    }
+}
+
 // ---------- measurement ----------
 
-void wm_reset_counters() { wm_pixels = 0; wm_blits = 0; }
+void wm_reset_counters() { wm_pixels = 0; wm_blits = 0; g_cur_pixels = 0; }
 
 // A rolling hash of everything on screen, read back from video memory. This is
 // the check that matters: a compositor that skips work it should have done
@@ -501,6 +737,14 @@ void wm_init(long bg) {
     g_dmg_overflow = 0;
     wm_bg = bg;
     wm_no_damage = 0;
+    g_focus = -1;
+    g_cur_on = 0;
+    g_cur_painted = 0;
+    g_cur_x = fb_width / 2;
+    g_cur_y = fb_height / 2;
+    g_cur_px = g_cur_x;
+    g_cur_py = g_cur_y;
+    g_cur_pixels = 0;
     wm_reset_counters();
     wm_damage_all();
 }

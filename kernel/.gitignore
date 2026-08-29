@@ -108,3 +108,15 @@ sse64.bin
 sse.elf
 sse-serial.log
 sse-serial.clean
+
+# The mouse / window-manager-input image. nano-mouse.h, nano-wmin.h,
+# nano-term.h and wmin.c are sources; wmin.png is kept because the README
+# shows it. sabotage.log* is written by tools/sabotage-wmin.sh.
+wmin.s
+blob-wmin.s
+wmin64.elf
+wmin64.bin
+wmin.elf
+sabotage.log
+sabotage.log.clean
+*.h.orig

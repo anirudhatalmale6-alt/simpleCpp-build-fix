@@ -305,6 +305,21 @@ long isr_dispatch(struct Regs *r) {
         return (long)r;
     }
 
+#ifdef NANO_MOUSE_H
+    if (v == IRQ_BASE + 12) {                   // PS/2 mouse
+        long st;
+        // The mouse and the keyboard share port 0x60. Bit 5 of the status
+        // register is the only thing that says which one the waiting byte came
+        // from, and without checking it a keystroke that arrives in the middle
+        // of a mouse packet is decoded as a movement -- the cursor jumps and
+        // the letter is lost, and neither symptom points at the cause.
+        st = inb(PS2_CMD);
+        if ((st & PS2_OUTFULL) && (st & 32)) mouse_byte(inb(PS2_DATA));
+        pic_eoi(12);
+        return (long)r;
+    }
+#endif
+
     // IRQ7 and IRQ15 can fire with nothing behind them -- a spurious interrupt
     // from line noise or a race in the PIC. The primary's must NOT be
     // acknowledged, or a real interrupt gets its EOI consumed by this one.
@@ -366,6 +381,21 @@ void interrupts_init(long hz) {
     // anything.
     outb(PIC1_DATA, 0xFC);            // IRQ0 and IRQ1 enabled
     outb(PIC2_DATA, 0xFF);
+
+#ifdef NANO_MOUSE_H
+    // Set the mouse up here, with interrupts still off. The controller sends
+    // an ACK for every command, and an IRQ12 handler running while those are
+    // in flight feeds them to the packet decoder -- where 0xFA has bit 3 set
+    // and so looks exactly like a valid first byte.
+    if (mouse_hw_init()) {
+        // IRQ12 is on the SECONDARY PIC, which reaches the CPU only through
+        // IRQ2 on the primary. Unmask IRQ12 alone and the mouse is enabled,
+        // streaming, and completely silent -- the cascade line is still shut.
+        outb(PIC1_DATA, 0xF8);        // IRQ0, IRQ1, and IRQ2 (the cascade)
+        outb(PIC2_DATA, 0xEF);        // IRQ12
+    }
+#endif
+
     pit_init(hz);
     sti_();
 }
@@ -373,6 +403,17 @@ void interrupts_init(long hz) {
 // Block until a key arrives, sleeping in between rather than spinning. This is
 // the idle: `cpu_idle` is sti+hlt, so the core stops until the next interrupt.
 long g_idle_wakeups;
+
+// The non-blocking form. An event loop that also has a mouse to service cannot
+// sit inside keyboard_getchar_irq waiting for a key, or the pointer freezes
+// whenever nobody is typing -- which is most of the time.
+char kbd_getchar_nb() {
+    char c;
+    if (!kbd_available()) return 0;
+    c = g_kbd_ring[g_kbd_tail];
+    g_kbd_tail = (g_kbd_tail + 1) % KBD_RING;
+    return c;
+}
 
 char keyboard_getchar_irq() {
     for (;;) {

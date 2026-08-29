@@ -27,7 +27,8 @@ QFLAGS := -kernel kernel.elf -no-reboot
         srv srvrun srvtest fs fsrun fstest \
         progs elf elfrun elftest cc ccrun cctest check-miniasm \
         chain chainrun chaintest wm wmrun wmtest wmshot \
-        sse sserun ssetest check-addsd-len clean
+        sse sserun ssetest check-addsd-len \
+        wmin wminrun wmintest wminshot wminlive clean
 
 all: kernel.elf
 
@@ -193,6 +194,91 @@ wmshot: wm.elf
 	 timeout 90 $(QEMU) -kernel wm.elf -no-reboot -display none \
 	   -serial file:wm-serial.log -monitor stdio >/dev/null 2>&1
 	@convert wm.ppm wm.png && echo "wrote wm.png"
+
+# ---------------------------------------------------------------------------
+# K13: the mouse, the pointer, and a console in a window.
+#
+# The packet decoder is a pure function of a byte stream, so the tests feed it
+# byte streams -- negative movements, the overflow bits, a deliberately
+# desynchronised stream -- rather than requiring somebody to move a mouse.
+# Clicks and drags are then driven through the same queue the IRQ fills.
+# ---------------------------------------------------------------------------
+wmin.s: wmin.c nano-kernel.h nano-mouse.h nano-int.h nano-fb.h nano-font.h \
+        nano-mm.h nano-wm.h nano-wmin.h nano-term.h $(NANO)
+	$(NANO) --kernel wmin.c wmin.s
+
+wmin64.bin: boot64.s isr.s wmin.s kernel64.ld
+	as --64 boot64.s -o boot64.o
+	as --64 isr.s    -o isr.o
+	as --64 wmin.s   -o wmin.o
+	ld -T kernel64.ld -o wmin64.elf boot64.o isr.o wmin.o
+	objcopy -O binary wmin64.elf wmin64.bin
+
+blob-wmin.s:
+	@printf '.section .blob, "a"\n.incbin "wmin64.bin"\n' > $@
+
+wmin.elf: boot32.s blob-wmin.s wmin64.bin final.ld
+	as --32 boot32.s    -o boot32.o
+	as --32 blob-wmin.s -o blob-wmin.o
+	ld -m elf_i386 -T final.ld -o wmin.elf boot32.o blob-wmin.o
+
+wmin: wmin.elf
+
+# Interactive. QEMU's default PS/2 mouse needs the pointer grabbed (click into
+# the window); -usb -device usb-tablet would give absolute coordinates instead,
+# but this milestone is about the PS/2 protocol, so it is deliberately not used.
+wminrun: wmin.elf
+	$(QEMU) -kernel wmin.elf -no-reboot
+
+# Fifteen framebuffer read-backs at 786,432 MMIO reads each, so this is the
+# slowest image in the tree. The timeout is generous on purpose.
+wmintest: wmin.elf
+	@rm -f wmin-serial.log
+	@( sleep 100; echo quit ) | \
+	 timeout 150 $(QEMU) -kernel wmin.elf -no-reboot -display none \
+	   -serial file:wmin-serial.log -monitor stdio >/dev/null 2>&1; \
+	 echo "---- serial output ----"; cat wmin-serial.log; echo "-----------------------"; \
+	 tr -d '\r' < wmin-serial.log > wmin-serial.clean; \
+	 grep -q "WMINTEST DONE" wmin-serial.clean \
+	   && ! grep -q "FAIL" wmin-serial.clean \
+	   && grep -q "PASS: the pointer, the mouse, the clicks and the console" wmin-serial.clean \
+	   && echo "PASS: mouse decoded, pointer composited, clicks routed, console works" \
+	   || { echo "FAIL"; exit 1; }
+
+wminshot: wmin.elf
+	@rm -f wmin.ppm wmin.png
+	@( sleep 100; echo "screendump wmin.ppm"; sleep 2; echo quit ) | \
+	 timeout 150 $(QEMU) -kernel wmin.elf -no-reboot -display none \
+	   -serial file:wmin-serial.log -monitor stdio >/dev/null 2>&1
+	@convert wmin.ppm wmin.png && echo "wrote wmin.png"
+
+# End to end, through the actual hardware.
+#
+# Everything wmintest does is injected: bytes handed to the decoder, events
+# pushed onto the queue. That deliberately skips the 8042, IRQ12, the PIC
+# cascade and the interrupt handler -- all the parts a unit test cannot reach.
+# This target drives QEMU's emulated PS/2 mouse and keyboard from the monitor
+# instead, so the movement really does arrive as an interrupt, and then
+# photographs the result.
+#
+# It types `help` into the focused console, walks the pointer onto the "files"
+# title bar, presses, drags it, and releases. If the picture shows that window
+# moved and the console listing the commands, then the whole path works.
+wminlive: wmin.elf
+	@rm -f wmin-live.ppm wmin-live.png
+	@( sleep 100; \
+	   for k in h e l p ret; do echo "sendkey $$k"; sleep 1; done; \
+	   echo "mouse_move -60 -90";  sleep 1; \
+	   echo "mouse_move -52 -96";  sleep 1; \
+	   echo "mouse_button 1";      sleep 1; \
+	   echo "mouse_move 60 40";    sleep 1; \
+	   echo "mouse_move 60 40";    sleep 1; \
+	   echo "mouse_button 0";      sleep 1; \
+	   echo "mouse_move 30 30";    sleep 1; \
+	   echo "screendump wmin-live.ppm"; sleep 2; echo quit ) | \
+	 timeout 200 $(QEMU) -kernel wmin.elf -no-reboot -display none \
+	   -serial file:wmin-live.log -monitor stdio >/dev/null 2>&1
+	@convert wmin-live.ppm wmin-live.png && echo "wrote wmin-live.png"
 
 # ---------------------------------------------------------------------------
 # Floating point, measured. Answers "do we need a soft-float library" by
