@@ -39,6 +39,13 @@ p_cc:
     .incbin "user/cc.elf"
 p_cc_end:
 
+/* The assembler. Same file the Linux build uses, with its OS block swapped --
+ * see user/as/README.md. */
+.align 16
+p_as:
+    .incbin "user/as.elf"
+p_as_end:
+
 /* The C source the OS compiles, and the header it includes. These are real
  * files in the tree rather than string literals in the kernel, so the host
  * build and the OS compile the SAME BYTES -- which is the only thing that
@@ -52,6 +59,14 @@ p_demo_end:
 p_util:
     .incbin "src/util.h"
 p_util_end:
+
+/* And the program the machine compiles, assembles and then runs, all by
+ * itself. It is written for the --minimal --nasm path, which has no C library
+ * at all behind it -- see the note at the top of src/prog.c. */
+.align 16
+p_prog:
+    .incbin "src/prog.c"
+p_prog_end:
 
 .section .text
 
@@ -113,4 +128,24 @@ prog_util_addr:
 .globl prog_util_size
 prog_util_size:
     mov $(p_util_end - p_util), %rax
+    ret
+
+.globl prog_as_addr
+prog_as_addr:
+    lea p_as(%rip), %rax
+    ret
+
+.globl prog_as_size
+prog_as_size:
+    mov $(p_as_end - p_as), %rax
+    ret
+
+.globl prog_prog_addr
+prog_prog_addr:
+    lea p_prog(%rip), %rax
+    ret
+
+.globl prog_prog_size
+prog_prog_size:
+    mov $(p_prog_end - p_prog), %rax
     ret

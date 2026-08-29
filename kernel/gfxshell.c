@@ -39,6 +39,10 @@ extern long prog_demo_addr();
 extern long prog_demo_size();
 extern long prog_util_addr();
 extern long prog_util_size();
+extern long prog_as_addr();
+extern long prog_as_size();
+extern long prog_prog_addr();
+extern long prog_prog_size();
 
 #define COL_BG      0x0d1117
 #define COL_FG      0xc9d1d9
@@ -717,6 +721,8 @@ void fs_populate() {
         if (ino) fs_write(ino, 0, (char *)prog_demo_addr(), prog_demo_size());
         ino = fs_create("/src/util.h");
         if (ino) fs_write(ino, 0, (char *)prog_util_addr(), prog_util_size());
+        ino = fs_create("/src/prog.c");
+        if (ino) fs_write(ino, 0, (char *)prog_prog_addr(), prog_prog_size());
     }
 
     // The programs. They are compiled by nano_cc, linked at 512 GiB and
@@ -734,6 +740,8 @@ void fs_populate() {
         if (ino) fs_write(ino, 0, (char *)prog_wild_addr(), prog_wild_size());
         ino = fs_create("/bin/cc");
         if (ino) fs_write(ino, 0, (char *)prog_cc_addr(), prog_cc_size());
+        ino = fs_create("/bin/as");
+        if (ino) fs_write(ino, 0, (char *)prog_as_addr(), prog_as_size());
     }
     strcpy(g_cwd, "/");
 }
@@ -846,6 +854,36 @@ void cmd_cc(char **args, long n) {
     printf("[%d ms]\n", (g_ticks - t0) * 10);
 }
 
+// as — the assembler, as a program on this machine.
+//
+// Same shape as cc, and deliberately so: both are ELF files on the RAM disk
+// that the kernel knows nothing special about. Together they are the whole
+// toolchain, and with both of them here the machine can turn its own source
+// into a running program without anything on the outside.
+//
+// -b is passed explicitly rather than left to the default. The assembler's
+// default output base is already 512 GiB in this build, but a program that
+// lands at the wrong address does not fail at assembly time -- it fails when
+// the loader refuses it, or worse, does not. Saying it out loud costs nothing.
+void cmd_as(char **args, long n) {
+    char *av[8];
+    long i;
+    long t0;
+
+    // n + 3: the program name, n arguments, and the two -b words. Counting
+    // the slots actually written rather than the ones passed in.
+    if (n + 3 > 8) { puts("as: too many arguments\n"); return; }
+    av[0] = "/bin/as";
+    i = 0;
+    while (i < n) { av[i + 1] = args[i]; i = i + 1; }
+    av[n + 1] = "-b";
+    av[n + 2] = "0x8000000000";
+
+    t0 = g_ticks;
+    cmd_exec(av, n + 3);
+    printf("[%d ms]\n", (g_ticks - t0) * 10);
+}
+
 // Reap finished processes and give their address spaces back.
 //
 // It has to be somebody else's thread: a process cannot free the page tables
@@ -884,6 +922,7 @@ void cmd_help() {
     puts("  ps procs spawn stopall\n");
     puts("  exec <prog> [n]   run a program and wait\n");
     puts("  run  <prog> [n]   run one in the background\n");
+    puts("  cc in.c out.s   as in.asm out\n");
     puts("  srv crash\n");
     puts("  ls cat mkdir rm touch cp mv write append cd pwd df\n");
     puts("  demo bars grad lines circles font\n");
@@ -1020,6 +1059,7 @@ void shell_thread(long unused) {
             else if (!strcmp(av[0], "exec") && ac >= 2) cmd_exec(av + 1, ac - 1);
             else if (!strcmp(av[0], "run") && ac >= 2)  cmd_run(av + 1, ac - 1);
             else if (!strcmp(av[0], "cc") && ac >= 3)   cmd_cc(av + 1, ac - 1);
+            else if (!strcmp(av[0], "as") && ac >= 3)   cmd_as(av + 1, ac - 1);
             else if (starts_with(line, "write ") && ac >= 3)
                 cmd_write(av[1], line + 6 + strlen(av[1]) + 1, 0);
             else if (starts_with(line, "append ") && ac >= 3)

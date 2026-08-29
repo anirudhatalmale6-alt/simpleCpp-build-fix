@@ -71,3 +71,23 @@ cc64.bin
 cck.elf
 cc-host.s
 cc-os.s
+
+# The assembler as a user program, and the chain test image. miniasm.asm,
+# target-linux.inc and the tools are sources; everything built from them is not.
+user/as/miniasm.s
+user/as/miniasm.o
+user/as/hostas
+user/as/hostas.asm
+user/as/hostas.s
+user/as/hostas.o
+user/as/.regen.asm
+chain.s
+chaink.o
+blob-chain.s
+chain64.bin
+chain64.elf
+chaink.elf
+chain-host.asm
+chain-host.bin
+chain-host.hex
+chain-os.hex

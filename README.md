@@ -31,11 +31,22 @@ copies of one binary run at the same virtual address without seeing each
 other's memory, and a program that faults is killed on its own while everything
 else keeps running.
 
-**The compiler is one of those programs.** `/bin/cc` is `nano_cc` itself, built
-from the same source with the same C library, loaded off the OS's own
-filesystem into its own address space. `make -C kernel cctest` compiles a C
-file inside the OS and diffs the assembly byte for byte against the assembly
-the same compiler produces on Linux from the same input.
+**The compiler is one of those programs, and so is the assembler.** `/bin/cc` is
+`nano_cc` itself and `/bin/as` is the bootstrap assembler, both loaded off the
+OS's own filesystem into their own address spaces. A C file on the RAM disk
+becomes an ELF file on that disk and then a process, with nothing outside the
+machine involved:
+
+```
+/src> cc --minimal --nasm --bss --kernel prog.c prog.asm
+/src> as prog.asm /bin/prog
+/src> exec /bin/prog
+hello from a program this machine compiled and assembled itself
+[pid 3 exited with 33]
+```
+
+`make -C kernel chaintest` does that headlessly and compares the binary the OS
+assembled, byte for byte, against the one the same assembler produces on Linux.
 See [`kernel/README.md`](kernel/README.md).
 
 ---

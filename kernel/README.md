@@ -58,6 +58,11 @@ make elftest    # headless: loading, syscalls, isolation, fault containment
 make cc         # the C compiler, built as a program for this OS
 make ccrun      # boot it and watch the compiler run inside the OS
 make cctest     # headless: compile inside the OS, diff against the host
+
+make chain      # the assembler too: source -> cc -> as -> a running process
+make chainrun   # boot it and watch the whole chain
+make chaintest  # headless: and byte-compare the binary against the host's
+make check-miniasm MINIASM_SRC=...   # the vendored assembler has not drifted
 ```
 
 `make test` needs no display; it drives real keystrokes through QEMU's
@@ -976,3 +981,130 @@ There is no assembler in the OS. `cc` produces `.s` and stops; turning that into
 a runnable binary still needs `as` and `ld` on the host. The bootstrap assembler
 is the obvious candidate for the missing half, and `resb` is what stands between
 it and assembling this compiler.
+
+
+---
+
+## K9 — the assembler, and a machine that builds its own programs
+
+```
+/> ls /bin
+hello  9856
+twin  9696
+wild  9664
+cc  131552
+as  24952
+/> cd /src
+/src> cc --minimal --nasm --bss --kernel prog.c prog.asm
+[pid 1]
+Compiled prog.c -> prog.asm (kernel mode)
+[pid 1 exited with 0]
+[160 ms]
+/src> as prog.asm /bin/prog
+[pid 2]
+[pid 2 exited with 0]
+[20 ms]
+/src> exec /bin/prog
+[pid 3]
+hello from a program this machine compiled and assembled itself
+ok
+[pid 3 exited with 33]
+```
+
+`/bin/as` is the bootstrap assembler from
+[SelfHostedAssembler-audit](https://github.com/anirudhatalmale6-alt/SelfHostedAssembler-audit),
+running as a program on this OS. With it and `/bin/cc` on the RAM disk, a C file
+on that disk becomes an ELF file on that disk and then a process, and nothing
+outside the machine is involved at any step.
+
+### The test is a byte comparison, again
+
+`make chaintest` dumps the binary the OS assembled over the serial line as hex
+and compares it against the binary the **same assembler**, retargeted back to
+Linux and built from the same vendored source, produces from the same input:
+
+```
+host: 60 lines, in the OS: 60 lines
+the OS and the host assembled the same bytes
+PASS: the machine compiled, assembled and ran a program by itself
+```
+
+The exit code carries the other half. 33 is computed at run time — 1..10 summed,
+minus 22 — rather than sitting in the file as a constant, so a loader that
+transferred control to the wrong place cannot produce it by accident.
+
+### One assembler, two targets
+
+Everything the assembler needs from the OS it *runs on* lives between two marker
+lines in its source, and `tools/retarget.py` swaps that block. `user/as/` holds
+the nano-os-targeted source plus the Linux block; the body underneath is the
+same assembler either way. Retargeting the vendored source back to Linux
+reproduces the audit repository's file **exactly**, which is the tightest check
+available that the two have not drifted, and `make check-miniasm` runs it.
+
+Two copies of a 2,300-line assembler would drift, and a divergence between them
+shows up as a miscompilation on one platform and not the other.
+
+### Two axes, deliberately independent
+
+Which OS the assembler *runs on* has nothing to do with which base address it
+*emits for*. The second is a `-b` flag, and separating them is what makes
+building a nano-os assembler on Linux possible at all: the Linux build, told
+`-b 0x8000000000`, produces the nano-os binary.
+
+### The bug that only appears above 2 GiB
+
+`_start` called `main` and landed **fifteen bytes short of it**, in the middle of
+an instruction — `EXCEPTION 6: invalid opcode`.
+
+`mov reg, imm` is seven bytes when the value fits in a signed 32-bit field and
+ten when it does not. A forward reference is unknown during the sizing pass, so
+the assembler used **zero** as a placeholder and sized the short form; the emit
+pass then knew the real address and emitted the long one. Every label after that
+point was off by three bytes per occurrence.
+
+It had never happened at `0x400000`, because there the placeholder and the real
+address are both in the same size class. At 512 GiB neither is. The placeholder
+is now `out_base` — the lowest address any symbol in the output can have, and so
+in the same size class as all of them.
+
+**And the assembler now checks that the two passes agree**, which is the fix
+that matters more than the fix:
+
+```
+Error: the two passes disagree about the size of the output
+```
+
+That divergence did not produce a broken-looking binary. It produced a plausible
+one, of the right size, that ran until it jumped into the middle of an
+instruction. Nothing was watching for it.
+
+### Five smaller things it needed
+
+* **`int N`.** The assembler could emit `syscall` and not `int 0x80`, so it
+  could build programs for exactly one of the two operating systems it now runs
+  on. Encoded `CD ib`, byte-identical to GNU as, and an operand outside 0..255
+  is refused rather than truncated.
+* **argv, and `-b`.** `mini_asm [input [output]] [-b BASE]`. With no arguments it
+  behaves exactly as it always did — `selfHosted.asm` in, `a.out` out, linked at
+  `0x400000` — which is how every existing test still passes unchanged.
+* **RIP-relative addressing throughout.** `mov rsi, in_buf` encodes the symbol
+  as a 32-bit absolute; ld refuses that at 512 GiB. Thirty-four of those became
+  `lea rsi, [rip + in_buf]`, and six `[symbol + register]` forms became a
+  RIP-relative `lea` plus an `add`.
+* **A store of an immediate to memory carries 32 bits.**
+  `mov qword [out_base], def_base` is right at `0x400000` and quietly a
+  different number at `0x8000000000`. GNU as refuses it — but only because it
+  was asked.
+* **A no-C-library program.** `src/prog.c` is written for the `--minimal --nasm`
+  path, which has no library behind it at all. `_start` must be the first
+  function in the file, because the assembler makes the first byte it emits the
+  entry point.
+
+### What this is not, yet
+
+There is no linker, so a program is one translation unit. `cc` and `as` are two
+commands rather than one driver. And the OS still cannot rebuild *itself*: the
+compiler's own assembly is 872 KB and the RAM disk is 2 MiB, so it would fit,
+but `/bin/cc` is 131 KB of that and the arithmetic gets tight — a real block
+device is the honest answer to that rather than a bigger RAM disk.

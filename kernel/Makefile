@@ -17,7 +17,7 @@ QEMU   := qemu-system-x86_64
 # nothing. The symptom was gshell64.bin assembling progs.s before the binaries
 # it .incbin's had been built -- "file not found: user/hello.elf" on a clean
 # tree, and a perfectly good build on the second attempt.
-UPROGS := user/hello.elf user/twin.elf user/wild.elf user/cc.elf
+UPROGS := user/hello.elf user/twin.elf user/wild.elf user/cc.elf user/as.elf
 QFLAGS := -kernel kernel.elf -no-reboot
 
 .PHONY: all run test shot gfx gfxrun gfxtest gfxshot \
@@ -25,7 +25,8 @@ QFLAGS := -kernel kernel.elf -no-reboot
         intr intrrun intrtest acpi acpirun acpitest \
         mm mmrun mmtest threads threadsrun threadstest \
         srv srvrun srvtest fs fsrun fstest \
-        progs elf elfrun elftest cc ccrun cctest clean
+        progs elf elfrun elftest cc ccrun cctest check-miniasm \
+        chain chainrun chaintest clean
 
 all: kernel.elf
 
@@ -141,7 +142,7 @@ gfxshell.s: gfxshell.c nano-kernel.h nano-fb.h nano-font.h nano-int.h \
             nano-acpi.h nano-mm.h nano-thread.h nano-srv.h nano-fs.h nano-proc.h $(NANO)
 	$(NANO) --kernel gfxshell.c gfxshell.s
 
-gshell64.bin: boot64.s isr.s gfxshell.s progs.s $(UPROGS) src/demo.c src/util.h kernel64.ld
+gshell64.bin: boot64.s isr.s gfxshell.s progs.s $(UPROGS) src/demo.c src/util.h src/prog.c kernel64.ld
 	as --64 boot64.s   -o boot64.o
 	as --64 isr.s      -o isr.o
 	as --64 gfxshell.s -o gfxshell.o
@@ -234,21 +235,23 @@ gshelltest: gshell.elf
 
 # Boot it, type a few commands, and photograph the screen.
 #
-# The sequence is a compiler session: find cc on the disk, change into the
-# source directory, compile a C file that includes a header next to it, and
-# list what came out. Everything on that screen is happening inside the OS.
+# The sequence is the whole toolchain: compile a C file, assemble the result,
+# and run what comes out. Every one of those three steps is a program on the
+# RAM disk, in its own address space.
 gshellshot: gshell.elf
 	@rm -f gshell.ppm gshell.png
 	@( sleep 3; for k in c l e a r ret; do echo "sendkey $$k"; sleep 0.15; done; \
 	   sleep 0.4; for k in l s spc slash b i n ret; do echo "sendkey $$k"; sleep 0.15; done; \
 	   sleep 0.5; for k in c d spc slash s r c ret; do echo "sendkey $$k"; sleep 0.15; done; \
-	   sleep 0.4; for k in l s ret; do echo "sendkey $$k"; sleep 0.15; done; \
-	   sleep 0.5; for k in c c spc d e m o dot c spc d e m o dot s ret; \
-	     do echo "sendkey $$k"; sleep 0.15; done; \
-	   sleep 12; for k in l s ret; do echo "sendkey $$k"; sleep 0.15; done; \
-	   sleep 0.5; for k in p r o c s ret; do echo "sendkey $$k"; sleep 0.15; done; \
-	   sleep 1.2; echo "screendump gshell.ppm"; sleep 1.5; echo quit ) | \
-	 timeout 90 $(QEMU) -kernel gshell.elf -no-reboot -display none \
+	   sleep 0.5; for k in c c spc minus minus m i n i m a l spc minus minus n a s m spc \
+	     minus minus b s s spc minus minus k e r n e l spc p r o g dot c spc \
+	     p r o g dot a s m ret; do echo "sendkey $$k"; sleep 0.14; done; \
+	   sleep 8; for k in a s spc p r o g dot a s m spc slash b i n slash p r o g ret; \
+	     do echo "sendkey $$k"; sleep 0.14; done; \
+	   sleep 5; for k in e x e c spc slash b i n slash p r o g ret; \
+	     do echo "sendkey $$k"; sleep 0.14; done; \
+	   sleep 3; echo "screendump gshell.ppm"; sleep 1.5; echo quit ) | \
+	 timeout 120 $(QEMU) -kernel gshell.elf -no-reboot -display none \
 	   -serial file:gshell-serial.log -monitor stdio >/dev/null 2>&1
 	@convert gshell.ppm gshell.png && echo "wrote gshell.png"
 
@@ -569,6 +572,40 @@ user/cc.elf: ../simpleC++.c ../nano-libc.h user/os-base.h user/ustart.o user/use
 	ld -T user/user.ld -z max-page-size=0x1000 -o $@ user/ustart.o user/ccbuild/cc.o
 	@echo "   $$(stat -c%s $@) bytes on disk, $$(readelf -lW $@ | awk '/RW /{print strtonum($$6)}') bytes of memory"
 
+# The assembler, as a program for this OS.
+#
+# An EXPLICIT rule, not the user/%.elf pattern above: the pattern would go
+# looking for user/as.c, and an explicit rule wins over a pattern rule.
+#
+# user/as/miniasm.asm is generated -- see user/as/README.md. It is the same
+# assembler the Linux build uses with one block swapped, and `make check-miniasm`
+# proves the vendored copy has not drifted.
+#
+# user.ld is the right linker script unchanged: it puts .text at 512 GiB, which
+# is where nano-os user memory starts, and names _start as the entry point.
+user/as.elf: user/as/miniasm.asm tools/nasm2gas.py user/user.ld
+	python3 tools/nasm2gas.py user/as/miniasm.asm > user/as/miniasm.s
+	as --64 -o user/as/miniasm.o user/as/miniasm.s
+	ld -T user/user.ld -z max-page-size=0x1000 -o $@ user/as/miniasm.o
+	@echo "   $$(stat -c%s $@) bytes on disk, $$(readelf -lW $@ | awk '/RW /{print strtonum($$6)}') bytes of memory"
+
+# Regenerate the vendored assembler and require it to match, so the copy in
+# this tree cannot quietly fall behind the one it came from.
+check-miniasm:
+	@[ -n "$(MINIASM_SRC)" ] || { \
+	   echo "pass MINIASM_SRC=/path/to/SelfHostedAssembler-audit"; exit 1; }
+	@python3 $(MINIASM_SRC)/tools/retarget.py \
+	   $(MINIASM_SRC)/fixed/selfContained.asm \
+	   $(MINIASM_SRC)/fixed/target-nanoos.inc > user/as/.regen.asm
+	@if cmp -s user/as/.regen.asm user/as/miniasm.asm; then \
+	   rm -f user/as/.regen.asm; \
+	   echo "PASS the vendored assembler matches $(MINIASM_SRC)"; \
+	 else \
+	   echo "FAIL user/as/miniasm.asm has drifted:"; \
+	   diff user/as/miniasm.asm user/as/.regen.asm | head -30; \
+	   rm -f user/as/.regen.asm; exit 1; \
+	 fi
+
 progs: $(UPROGS)
 
 # ---------------------------------------------------------------------------
@@ -577,7 +614,7 @@ progs: $(UPROGS)
 elf.s: elf.c nano-kernel.h nano-mm.h nano-thread.h nano-fs.h nano-proc.h nano-int.h $(NANO)
 	$(NANO) --kernel elf.c elf.s
 
-elf64.bin: boot64.s isr.s elf.s progs.s $(UPROGS) src/demo.c src/util.h kernel64.ld
+elf64.bin: boot64.s isr.s elf.s progs.s $(UPROGS) src/demo.c src/util.h src/prog.c kernel64.ld
 	as --64 boot64.s -o boot64.o
 	as --64 isr.s    -o isr.o
 	as --64 elf.s    -o elf.o
@@ -621,7 +658,7 @@ elftest: elfk.elf
 cc.s: cc.c nano-kernel.h nano-mm.h nano-thread.h nano-fs.h nano-proc.h nano-int.h $(NANO)
 	$(NANO) --kernel cc.c cc.s
 
-cc64.bin: boot64.s isr.s cc.s progs.s $(UPROGS) src/demo.c src/util.h kernel64.ld
+cc64.bin: boot64.s isr.s cc.s progs.s $(UPROGS) src/demo.c src/util.h src/prog.c kernel64.ld
 	as --64 boot64.s -o boot64.o
 	as --64 isr.s    -o isr.o
 	as --64 cc.s     -o cck.o
@@ -674,6 +711,83 @@ cctest: cck.elf $(NANO)
 	   && echo "PASS: the compiler ran inside the OS and produced byte-identical assembly" \
 	   || { echo "FAIL"; diff cc-host.s cc-os.s | head -20; exit 1; }
 
+# ---------------------------------------------------------------------------
+# The whole chain, inside the machine: C source -> cc -> as -> a process.
+# chain.c is the headless test.
+# ---------------------------------------------------------------------------
+chain.s: chain.c nano-kernel.h nano-mm.h nano-thread.h nano-fs.h nano-proc.h nano-int.h $(NANO)
+	$(NANO) --kernel chain.c chain.s
+
+chain64.bin: boot64.s isr.s chain.s progs.s $(UPROGS) src/prog.c kernel64.ld
+	as --64 boot64.s -o boot64.o
+	as --64 isr.s    -o isr.o
+	as --64 chain.s  -o chaink.o
+	as --64 progs.s  -o progs.o
+	ld -T kernel64.ld -o chain64.elf boot64.o isr.o chaink.o progs.o
+	objcopy -O binary chain64.elf chain64.bin
+
+blob-chain.s:
+	@printf '.section .blob, "a"\n.incbin "chain64.bin"\n' > $@
+
+chaink.elf: boot32.s blob-chain.s chain64.bin final.ld
+	as --32 boot32.s -o boot32.o
+	as --32 blob-chain.s -o blob-chain.o
+	ld -m elf_i386 -T final.ld -o chaink.elf boot32.o blob-chain.o
+
+chain: chaink.elf
+
+chainrun: chaink.elf
+	$(QEMU) -m 512 -kernel chaink.elf -no-reboot
+
+# The binary the OS assembles is compared byte for byte against the one the
+# same assembler produces on Linux from the same input. Two machines agreeing
+# on 1,907 bytes of x86-64 is a much narrower claim than a program that runs.
+# The SAME assembler, retargeted back to Linux and built to run here.
+#
+# It exists so the byte comparison below has something to compare against
+# without needing a second checkout, and it is worth having for its own sake:
+# retargeting the vendored nano-os source back to Linux reproduces the audit
+# repository's file exactly, which is the tightest possible check that the two
+# have not drifted.
+user/as/hostas: user/as/miniasm.asm user/as/target-linux.inc tools/retarget.py tools/nasm2gas.py
+	python3 tools/retarget.py user/as/miniasm.asm user/as/target-linux.inc > user/as/hostas.asm
+	python3 tools/nasm2gas.py user/as/hostas.asm > user/as/hostas.s
+	as --64 -o user/as/hostas.o user/as/hostas.s
+	ld -o $@ user/as/hostas.o
+
+chaintest: chaink.elf $(NANO) user/as.elf user/as/hostas
+	@rm -f chain-serial.log chain-host.bin chain-host.hex chain-os.hex
+	@cd src && ../$(NANO) --minimal --nasm --bss --kernel prog.c ../chain-host.asm >/dev/null
+	@# the same input, assembled by the same assembler, running on Linux
+	@d=$$(mktemp -d); cp user/as/hostas $$d/mini_asm; cp chain-host.asm $$d/in.asm; \
+	 ( cd $$d && ./mini_asm in.asm out.bin -b 0x8000000000 ); \
+	 cp $$d/out.bin chain-host.bin; rm -rf $$d
+	@python3 -c "d=open('chain-host.bin','rb').read();\
+	print('\n'.join(d[i:i+32].hex() for i in range(0,len(d),32)))" > chain-host.hex
+	@( sleep 30; echo quit ) | \
+	 timeout 90 $(QEMU) -m 512 -kernel chaink.elf -no-reboot -display none \
+	   -serial file:chain-serial.log -monitor stdio >/dev/null 2>&1; \
+	 tr -d '\r' < chain-serial.log > chain-serial.clean; \
+	 sed -n '/^---8<--- prog begins$$/,/^---8<--- prog ends$$/p' chain-serial.clean \
+	   | sed '1d;$$d' > chain-os.hex; \
+	 echo "---- serial output (the binary elided) ----"; \
+	 sed '/^---8<--- prog begins$$/,/^---8<--- prog ends$$/{//!d}' chain-serial.clean; \
+	 echo "-------------------------------------------"; \
+	 echo "host: $$(wc -l < chain-host.hex) lines, in the OS: $$(wc -l < chain-os.hex) lines"; \
+	 cmp chain-host.hex chain-os.hex || { echo "FAIL: the two binaries differ"; exit 1; }; \
+	 grep -q "^cc exited with 0$$" chain-serial.clean \
+	   && grep -q "^as exited with 0$$" chain-serial.clean \
+	   && grep -q "it is an ELF file" chain-serial.clean \
+	   && grep -q "hello from a program this machine compiled and assembled itself" chain-serial.clean \
+	   && grep -q "^prog exited with 33$$" chain-serial.clean \
+	   && grep -q "^unknown mnemonic: exit 1$$" chain-serial.clean \
+	   && grep -q "^missing input: exit 1$$" chain-serial.clean \
+	   && grep -q "^resb with no count: exit 1$$" chain-serial.clean \
+	   && grep -q "CHAINTEST DONE" chain-serial.clean \
+	   && [ -s chain-os.hex ] \
+	   && echo "PASS: the machine compiled, assembled and ran a program by itself" \
+	   || { echo "FAIL"; exit 1; }
+
 clean:
 	@# NOT user/*.s -- ustart.s is a source file, and the generated ones are
 	@# named after their .c. Deleting by wildcard here would remove the entry
@@ -682,11 +796,16 @@ clean:
 	      progs.o elf.s blob-elf.s elf64.bin elf64.elf elfk.elf \
 	      elf-serial.log elf-serial.clean
 	rm -rf user/ccbuild
+	rm -f user/as/miniasm.s user/as/miniasm.o user/as/.regen.asm \
+	      user/as/hostas user/as/hostas.asm user/as/hostas.s user/as/hostas.o
+	rm -f chain.s chaink.o blob-chain.s chain64.bin chain64.elf chaink.elf \
+	      chain-serial.log chain-serial.clean
 	@# cck.o, not cc.o: cc.o is what make's built-in rule would call the
 	@# object it builds from cc.c with GCC, and naming ours the same invites
 	@# exactly that mix-up back.
 	rm -f cc.s cck.o blob-cc.s cc64.bin cc64.elf cck.elf \
-	      cc-serial.log cc-serial.clean cc-host.s cc-os.s
+	      cc-serial.log cc-serial.clean cc-host.s cc-os.s \
+	      chain-host.asm chain-host.bin chain-host.hex chain-os.hex
 	rm -f *.o shell.s gfx.s gfxshell.s intr.s acpi.s mm.s threads.s srv.s fs.s \
 	      blob-gfx.s blob-gshell.s blob-intr.s blob-acpi.s blob-mm.s \
 	      blob-threads.s blob-srv.s blob-fs.s \
