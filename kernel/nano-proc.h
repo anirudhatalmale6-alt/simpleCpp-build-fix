@@ -36,6 +36,18 @@
 
 extern void write_cr3_(long root);
 extern void enable_write_protect();
+extern long enable_nx();
+
+// Whether the NX bit means anything on this machine. Set once, in proc_init,
+// from the CPU's own answer -- not assumed, because a page marked no-execute
+// on a CPU without NXE is not a hardened page, it is a page that faults on
+// every access including reads.
+long g_nx_on;
+
+// The no-execute bit, or nothing at all. Every caller goes through this rather
+// than naming PTE_NX directly, so there is one place that knows the difference
+// between "the CPU supports this" and "we would like it to".
+long nx_bit() { if (g_nx_on) return PTE_NX; return 0; }
 
 // ---------- where user memory lives ----------
 // PML4 entry 1: virtual addresses 512 GiB .. 1 TiB. Entry 0 (everything below
@@ -162,18 +174,31 @@ void as_mark_user_path(long root, long virt) {
 long as_touch(long root, long virt, long flags) {
     long phys;
     long have;
+    long fresh;
+    long want;
 
     have = vmm_flags_in(root, virt);
     phys = vmm_resolve_in(root, virt) & ~(PAGE_SIZE - 1);
+    fresh = 0;
     if (!phys) {
         phys = frame_alloc_zeroed();
         if (!phys) return 0;
         have = 0;
+        fresh = 1;
     }
     // The union of what the page already had and what this segment needs. A
     // page shared by a read-only and a writable segment has to be writable;
     // pretending otherwise gives a fault on the first store to a global.
-    if (!vmm_map_in(root, virt, phys, flags | (have & (PTE_WRITE | PTE_USER)))) return 0;
+    want = flags | (have & (PTE_WRITE | PTE_USER));
+
+    // NX goes the OTHER WAY, and getting that backwards would be silent: a
+    // page is executable if ANY segment sharing it is executable, so the
+    // no-execute bit only survives when both sides asked for it. Taking the
+    // union here instead would mark a shared code/data page non-executable and
+    // the program would fault on its own instructions.
+    if (!fresh && !(have & PTE_NX)) want = want & ~PTE_NX;
+
+    if (!vmm_map_in(root, virt, phys, want)) return 0;
     as_mark_user_path(root, virt);
     return phys;
 }
@@ -286,8 +311,33 @@ long elf_map_segment(long root, char *img, long imglen, char *ph) {
     if (filesz > memsz)                                { elf_reject = "filesz exceeds memsz"; return 0; }
     if (off + filesz > imglen)                         { elf_reject = "segment runs past the end of the file"; return 0; }
 
+    // ---- what the segment is allowed to BE, as opposed to where it goes ----
+    //
+    // These are properties of the file, checkable before a byte of it is
+    // mapped, and they cannot be worked around by choosing different contents.
+    // That is the whole reason to prefer them to inspecting the bytes: a
+    // scanner looks for a shape somebody chose, and a shape can be changed.
+
+    // Writable and executable at once. Every technique that ends in "and then
+    // jump to the bytes we just wrote" needs one page that is both, and no
+    // honest segment here is.
+    if ((eflags & PF_W) && (eflags & PF_X)) { elf_reject = "segment is both writable and executable"; return 0; }
+
+    // Zero-filled executable pages. memsz beyond filesz is memory the loader
+    // supplies rather than the file, so an executable segment asking for it is
+    // asking for a run of zero bytes it can execute -- which no compiler emits
+    // and which is a comfortable place to land.
+    if ((eflags & PF_X) && memsz > filesz) { elf_reject = "executable segment wants zero-filled pages"; return 0; }
+
+    // Executable and not readable is not a thing x86-64 paging can express, so
+    // a file asking for it is describing something the loader would silently
+    // widen. Say no rather than quietly granting more than was asked.
+    if ((eflags & PF_X) && !(eflags & PF_R)) { elf_reject = "executable segment is not readable"; return 0; }
+
     flags = PTE_USER;
     if (eflags & PF_W) flags = flags | PTE_WRITE;
+    // Whatever the file did not ask to be executable, is not.
+    if (!(eflags & PF_X)) flags = flags | nx_bit();
 
     start = vaddr & ~(PAGE_SIZE - 1);
     end = (vaddr + memsz + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
@@ -320,6 +370,8 @@ long elf_map_segment(long root, char *img, long imglen, char *ph) {
 // elf_reject set. *top_out gets the highest virtual address used, which is
 // where the process heap starts.
 long elf_load(long root, char *img, long len, long *top_out) {
+    long entry;
+    long entry_ok;
     long phoff;
     long phnum;
     long phent;
@@ -336,6 +388,8 @@ long elf_load(long root, char *img, long len, long *top_out) {
 
     top = USER_BASE;
     loaded = 0;
+    entry_ok = 0;
+    entry = rd_le(img, 24, 8);
     i = 0;
     while (i < phnum) {
         char *ph;
@@ -343,18 +397,26 @@ long elf_load(long root, char *img, long len, long *top_out) {
         if (rd_le(ph, 0, 4) == PT_LOAD) {
             long vaddr;
             long memsz;
+            long eflags;
             vaddr = rd_le(ph, 16, 8);
             memsz = rd_le(ph, 40, 8);
+            eflags = rd_le(ph, 4, 4);
             if (!elf_map_segment(root, img, len, ph)) return 0;
             if (vaddr + memsz > top) top = vaddr + memsz;
+            // The entry point has to land in something the file itself marked
+            // executable. Without this the header could point anywhere the
+            // program has memory -- its own data, its own stack -- and the
+            // loader would jump there and let the fault explain it afterwards.
+            if ((eflags & PF_X) && entry >= vaddr && entry < vaddr + memsz) entry_ok = 1;
             loaded = loaded + 1;
         }
         i = i + 1;
     }
     if (!loaded) { elf_reject = "no loadable segments"; return 0; }
+    if (!entry_ok) { elf_reject = "entry point is not in an executable segment"; return 0; }
 
     top_out[0] = (top + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
-    return rd_le(img, 24, 8);
+    return entry;
 }
 
 // ---------- processes ----------
@@ -407,6 +469,7 @@ void proc_init() {
     g_next_pid = 1;
     g_proc_faults = 0;
     enable_write_protect();
+    g_nx_on = enable_nx();
 }
 
 long proc_slot() {
@@ -544,9 +607,12 @@ long proc_spawn(char *path, long argc, char **argv, char *name, char *cwd) {
     // The stack: mapped writable, and NOT next to the program's own data --
     // there is a wide unmapped gap between them, so a runaway stack faults
     // rather than eating the globals.
+    // A stack is never code, and neither is a heap. Saying so costs nothing
+    // and removes the two places a program is most likely to be persuaded to
+    // execute something it was handed rather than something it was built from.
     va = USER_STACK_TOP - USER_STACK_SIZE;
     while (va < USER_STACK_TOP) {
-        if (!as_touch(root, va, PTE_USER | PTE_WRITE)) {
+        if (!as_touch(root, va, PTE_USER | PTE_WRITE | nx_bit())) {
             as_destroy(root);
             proc_reject = "out of frames for the stack";
             return 0;
@@ -759,7 +825,7 @@ long sys_sbrk(long slot, long delta) {
     va = old & ~(PAGE_SIZE - 1);
     while (va < want) {
         if (!vmm_resolve_in(g_procs[slot].root, va)) {
-            if (!as_touch(g_procs[slot].root, va, PTE_USER | PTE_WRITE)) return 0;
+            if (!as_touch(g_procs[slot].root, va, PTE_USER | PTE_WRITE | nx_bit())) return 0;
         }
         va = va + PAGE_SIZE;
     }

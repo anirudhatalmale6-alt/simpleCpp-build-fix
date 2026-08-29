@@ -174,3 +174,40 @@ enable_write_protect:
     or $0x10000, %rax
     mov %rax, %cr0
     ret
+
+/* long enable_nx(void) — turn on EFER.NXE, so bit 63 of a page-table entry
+ * means "no execute" instead of "reserved, fault the moment you use it".
+ * Returns 1 if the CPU has it, 0 if not.
+ *
+ * Until this runs, setting that bit does not harden anything -- it makes every
+ * access to the page a reserved-bit page fault. So nothing may set it before
+ * the return value has been checked.
+ *
+ * The CPUID check is not ceremony. Writing a reserved EFER bit on a CPU
+ * without NX is a #GP, and a triple fault this early looks like a bad page
+ * table rather than a bad MSR write, which is a long way to go for a wrong
+ * answer. The extended leaf has to be checked for existence first, for the
+ * same reason: CPUID with an unsupported leaf returns the highest one instead
+ * of failing, and its EDX would be read as if it meant something. */
+.globl enable_nx
+enable_nx:
+    push %rbx                   /* cpuid clobbers it, and it is callee-saved */
+    mov $0x80000000, %eax
+    cpuid
+    cmp $0x80000001, %eax
+    jb .Lno_nx                  /* the leaf that reports NX does not exist */
+    mov $0x80000001, %eax
+    cpuid
+    test $(1 << 20), %edx       /* EDX.NX */
+    jz .Lno_nx
+    mov $0xC0000080, %ecx       /* IA32_EFER */
+    rdmsr
+    or $(1 << 11), %eax         /* NXE */
+    wrmsr
+    mov $1, %rax
+    pop %rbx
+    ret
+.Lno_nx:
+    xor %eax, %eax
+    pop %rbx
+    ret

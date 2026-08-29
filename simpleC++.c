@@ -2582,8 +2582,19 @@ int main(int argc, char **argv) {
     // output that will be loaded as an ELF rather than flattened.
     int use_bss = !kernel_mode || g_bss;
     if (g_nasm) {
-        // One flat image: the pooled string literals and the globals both go
-        // here, after the last function, where nothing can execute into them.
+        // One image, but not one segment. Everything above this line is code
+        // and everything below it is data, so saying so lets the assembler emit
+        // a read+execute segment and a read+write one instead of a single
+        // read+write+execute segment -- which is the one property every
+        // "write some bytes and then jump to them" technique needs.
+        //
+        // The assembler pads to a page boundary here, because a loader maps a
+        // segment at p_vaddr from p_offset and the two have to be congruent
+        // modulo the page size.
+        emit("section .data");
+
+        // The pooled string literals and the globals both go here, after the
+        // last function, where nothing can execute into them.
         for (StrLit *sl = strlits; sl; sl = sl->next) {
             char lbl[64]; snprintf(lbl, sizeof lbl, ".LC%d", sl->id);
             emit_db_bytes(lbl, (const unsigned char *)sl->bytes, sl->len, 1);

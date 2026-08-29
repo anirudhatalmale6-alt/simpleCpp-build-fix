@@ -73,6 +73,8 @@ void main_thread(long unused) {
     if (!fs_format(4096, 128)) { puts("format failed\n"); cpu_halt_forever(); }
     populate();
     printf("%d frames free before any process\n", mm_free_frames);
+    if (g_nx_on) puts("NX is on: a page marked no-execute really is\n");
+    else puts("NX IS NOT AVAILABLE -- non-executable pages are decoration\n");
     frames_at_start = mm_free_frames;
 
     // --- 1. load and run one program ---
@@ -146,7 +148,7 @@ void main_thread(long unused) {
         long faults_before;
         faults_before = g_proc_faults;
         mode = 0;
-        while (mode < 3) {
+        while (mode < 4) {
             long pid;
             long code;
             {
@@ -164,7 +166,7 @@ void main_thread(long unused) {
             mode = mode + 1;
         }
         printf("%d processes killed by a fault\n", g_proc_faults - faults_before);
-        if (g_proc_faults - faults_before == 3) puts("all three faults contained ok\n");
+        if (g_proc_faults - faults_before == 4) puts("all four faults contained ok\n");
         else puts("A FAULTING PROCESS WAS NOT CONTAINED\n");
     }
 
@@ -175,7 +177,7 @@ void main_thread(long unused) {
         ino = fs_lookup("/doc/readme");
         n = fs_read(ino, 0, g_readback, 200);
         g_readback[n] = 0;
-        printf("after three faults, the filesystem still reads: %s", g_readback);
+        printf("after four faults, the filesystem still reads: %s", g_readback);
         if (n > 10) puts("kernel survived every fault ok\n");
         else puts("KERNEL STATE DAMAGED\n");
     }
@@ -231,6 +233,68 @@ void main_thread(long unused) {
             pid = proc_spawn("/bad.elf", 0, 0, "bad", "/");
             if (pid) puts("LOADED A SEGMENT OUTSIDE USER SPACE\n");
             else printf("refused /bad.elf: %s\n", proc_reject);
+        }
+
+        // The header rules, one at a time. Each of these is a VALID ELF file
+        // in every other respect -- right magic, right class, right machine,
+        // a segment in the right place -- so nothing but the rule under test
+        // can be what refuses it.
+        //
+        // Built by hand rather than by the toolchain on purpose: the toolchain
+        // cannot produce them, which is exactly why a test that only used the
+        // toolchain's output would never exercise these paths at all.
+        {
+            long ino;
+            long i;
+            char hdr[128];
+            long k;
+
+            k = 0;
+            while (k < 3) {
+                i = 0;
+                while (i < 128) { hdr[i] = 0; i = i + 1; }
+                hdr[0] = 0x7F; hdr[1] = 'E'; hdr[2] = 'L'; hdr[3] = 'F';
+                hdr[4] = 2; hdr[5] = 1; hdr[6] = 1;
+                hdr[16] = 2;                       // e_type = ET_EXEC
+                hdr[18] = 62;                      // e_machine = x86-64
+                hdr[32] = 64;                      // e_phoff
+                hdr[54] = 56;                      // e_phentsize
+                hdr[56] = 1;                       // e_phnum
+                hdr[64] = 1;                       // p_type = PT_LOAD
+                // p_vaddr = USER_BASE = 0x8000000000, little-endian: the
+                // 0x80 is the FIFTH byte of the field, not the second. p_vaddr
+                // is at phdr offset 16 and the phdr starts at 64, so that is
+                // hdr[84]; e_entry is at 24, so hdr[28].
+                hdr[84] = 0x80;
+                hdr[28] = 0x80;
+                hdr[96] = 16;                      // p_filesz
+                hdr[104] = 16;                     // p_memsz
+                hdr[68] = 5;                       // p_flags = R | X
+
+                if (k == 0) {
+                    hdr[68] = 7;                   // ... and writable too
+                    ino = fs_create("/wx.elf");
+                    fs_write(ino, 0, hdr, 128);
+                    pid = proc_spawn("/wx.elf", 0, 0, "wx", "/");
+                    if (pid) puts("LOADED A WRITABLE EXECUTABLE SEGMENT\n");
+                    else printf("refused /wx.elf: %s\n", proc_reject);
+                } else if (k == 1) {
+                    hdr[104] = 64;                 // memsz > filesz, and PF_X
+                    ino = fs_create("/zx.elf");
+                    fs_write(ino, 0, hdr, 128);
+                    pid = proc_spawn("/zx.elf", 0, 0, "zx", "/");
+                    if (pid) puts("LOADED ZERO-FILLED EXECUTABLE PAGES\n");
+                    else printf("refused /zx.elf: %s\n", proc_reject);
+                } else {
+                    hdr[68] = 6;                   // p_flags = R | W, no X
+                    ino = fs_create("/ne.elf");
+                    fs_write(ino, 0, hdr, 128);
+                    pid = proc_spawn("/ne.elf", 0, 0, "ne", "/");
+                    if (pid) puts("ENTERED A NON-EXECUTABLE SEGMENT\n");
+                    else printf("refused /ne.elf: %s\n", proc_reject);
+                }
+                k = k + 1;
+            }
         }
     }
 

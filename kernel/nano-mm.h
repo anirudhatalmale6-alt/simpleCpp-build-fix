@@ -42,6 +42,13 @@ extern long read_cr3_();
 #define PTE_HUGE    128        // in a PD entry: this maps 2 MiB directly
 #define PTE_ADDR    0x000FFFFFFFFFF000
 
+// Bit 63: no execute. It is a RESERVED bit until EFER.NXE is set, and a
+// reserved bit that is set faults on every access to the page -- so this is
+// only ever ORed in through nx_bit(), which returns zero when the CPU or the
+// kernel has not turned NXE on. A hardening flag that bricks the mapping when
+// it is unavailable is worse than not having it.
+#define PTE_NX      0x8000000000000000
+
 // ---------- 1. the physical memory map ----------
 long mm_ram_top;               // one past the highest usable physical byte
 long mm_ram_total;             // usable bytes, which is not top minus zero

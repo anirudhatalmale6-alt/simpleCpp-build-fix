@@ -1108,3 +1108,84 @@ commands rather than one driver. And the OS still cannot rebuild *itself*: the
 compiler's own assembly is 872 KB and the RAM disk is 2 MiB, so it would fit,
 but `/bin/cc` is 131 KB of that and the arithmetic gets tight — a real block
 device is the honest answer to that rather than a bigger RAM disk.
+
+
+---
+
+## K10 — W^X, NX, and three rules about the file
+
+The loader now refuses binaries rather than running them and hoping:
+
+```
+refused /wx.elf: segment is both writable and executable
+refused /zx.elf: executable segment wants zero-filled pages
+refused /ne.elf: entry point is not in an executable segment
+```
+
+These are properties of the **file**, checkable before a byte of it is mapped,
+and they cannot be worked around by choosing different contents. That is why
+they are worth more than inspecting the bytes: a scanner looks for a shape
+somebody chose, and a shape can be changed.
+
+The three test files are valid ELF in every other respect — right magic, right
+class, right machine, a segment in the right place — so nothing but the rule
+under test can be what refuses them. They are built by hand because the
+toolchain cannot produce them, which is exactly why a test using only the
+toolchain's output would never reach these paths.
+
+### NX, and a test that passed for the wrong reason
+
+`EFER.NXE` is on, so bit 63 of a page-table entry means *no execute* rather than
+*reserved*. Every segment the file did not mark executable is mapped with it,
+and so are the stack and the heap — neither is ever code, and saying so removes
+the two places a program is most likely to be talked into executing something it
+was handed rather than something it was built from.
+
+Bit 63 is a **reserved** bit until NXE is set, and a reserved bit that is set
+faults on *every* access to the page, reads included. So it only ever goes in
+through `nx_bit()`, which returns zero when the CPU says it does not have NX.
+The CPUID check before writing the MSR is not ceremony either: writing a
+reserved `EFER` bit is a `#GP`, and a triple fault during bring-up looks like a
+bad page table rather than a bad MSR write.
+
+`wild.c` gained a fourth deliberate fault: write a `ret` into a global and jump
+to it. **The first version of that test passed with NX turned off**, which is
+the only reason the bug in it was noticed — a `ret` reached by a `jmp` pops
+whatever happens to be on the stack and faults on that, whether the page was
+executable or not. It uses `call` now, and with `nx_bit()` forced to zero the
+test reports `STILL RUNNING -- the data page was executable` and fails. The gate
+was checked in both directions, which is the same lesson CR0.WP taught in K7.
+
+### The toolchain had to change to satisfy the rule
+
+The bootstrap assembler emitted **one** segment, and one segment holding both
+code and data has to be RWX. W^X refused every binary the OS's own assembler
+produced — which is the right outcome for the rule and the wrong outcome for the
+machine.
+
+So the assembler emits two. A `section .data` in the source splits the image:
+everything before it is read+execute, everything after is read+write, and
+nothing is both. `nano_cc --nasm` emits that marker between the last function
+and the string pool, which is exactly where code stops and data starts.
+
+The split is padded to a page boundary, because a loader maps a segment at
+`p_vaddr` from `p_offset` and the two must be congruent modulo the page size.
+Splitting mid-page would put one page in two segments with different
+permissions, and whichever was mapped second would win — silently.
+
+A source with no `section .data` still gets one RWX segment, because its code and
+data are interleaved and there is nowhere to cut. `e_phnum` is patched to 1 in
+that case rather than leaving a header describing a segment that does not exist.
+Such a binary will not load here, and that is the rule working.
+
+### What this is and is not
+
+W^X is enforced **at load time**, and that part is absolute: a segment marked
+both cannot be mapped. NX makes the file's declared permissions real **at run
+time** as well, so a page that is not code cannot be executed even by the
+program itself.
+
+Neither is a defence against a program that means harm, because programs still
+run in **ring 0** and can rewrite CR3 or clear CR0.WP whenever they like. These
+are defences against a program that is *wrong*, and against a file that is not
+what it claims. Ring 3 is still its own milestone.

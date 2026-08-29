@@ -645,10 +645,14 @@ elftest: elfk.elf
 	 grep -q "exit code crossed the boundary ok" elf-serial.clean \
 	   && grep -q "process wrote a file the kernel can read ok" elf-serial.clean \
 	   && grep -q "separate address spaces ok" elf-serial.clean \
-	   && grep -q "all three faults contained ok" elf-serial.clean \
+	   && grep -q "all four faults contained ok" elf-serial.clean \
+	   && grep -q "NX is on: a page marked no-execute really is" elf-serial.clean \
 	   && grep -q "kernel survived every fault ok" elf-serial.clean \
 	   && grep -q "every address space was reclaimed ok" elf-serial.clean \
 	   && grep -q "refused /bad.elf" elf-serial.clean \
+	   && grep -q "refused /wx.elf: segment is both writable and executable" elf-serial.clean \
+	   && grep -q "refused /zx.elf: executable segment wants zero-filled pages" elf-serial.clean \
+	   && grep -q "refused /ne.elf: entry point is not in an executable segment" elf-serial.clean \
 	   && echo "PASS: ELF loading, syscalls, address-space isolation, fault containment" \
 	   || { echo "FAIL"; exit 1; }
 

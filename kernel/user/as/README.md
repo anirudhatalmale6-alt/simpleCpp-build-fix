@@ -21,4 +21,4 @@ The copy cannot drift quietly:
 
     make check-miniasm MINIASM_SRC=/path/to/SelfHostedAssembler-audit
 
-regenerates it and diffs. Generated at `f30567e`.
+regenerates it and diffs. Generated at `ad82ee6`.
