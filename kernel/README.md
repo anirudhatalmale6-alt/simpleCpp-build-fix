@@ -68,6 +68,10 @@ make wm         # the compositor: windows, damage rectangles, clipped blits
 make wmrun      # boot it and watch
 make wmtest     # headless: count the pixels, and hash them against a full repaint
 make wmshot     # save wm.png
+
+make sse        # floating point, measured: is a soft-float library needed?
+make sserun     # boot it and watch
+make ssetest    # headless: provoke the fault, enable SSE, check the bit patterns
 ```
 
 `make test` needs no display; it drives real keystrokes through QEMU's
@@ -1279,3 +1283,146 @@ nowhere in its API to say which part changed.
 It is also entirely integer work. A compositor is coordinates, widths and
 copies, so none of it waits on floating point, which nano_cc still does not
 have.
+
+---
+
+## K12 — floating point: what is actually missing
+
+The recurring question when a graphics or maths library comes up is whether we
+need a software floating-point library, of which Berkeley SoftFloat is the
+canonical one. `make ssetest` answers it by measurement rather than by opinion.
+
+### The answer
+
+A soft-float library exists for CPUs that cannot add two reals. x86-64 is not
+one of them: SSE2 is part of the architecture definition, not an optional
+extension, so `addsd` and `mulsd` are present on every CPU that can run this
+kernel at all.
+
+What is missing is not a library. It is two control-register bits and the
+front half of a compiler.
+
+### The two bits
+
+The CPU boots with SSE switched off. `make ssetest` reads the actual registers
+this kernel boots with:
+
+```
+  at boot: CR0 = 80000011  CR4 = 20
+    CR0.MP(1)=0  CR0.EM(2)=0  CR0.TS(3)=0
+    CR4.OSFXSR(9)=0  CR4.OSXMMEXCPT(10)=0
+    CR4.OSFXSR is clear: SSE opcodes trap for a second, separate reason.
+```
+
+`CR4.OSFXSR` clear means "this OS has not agreed to save the SSE registers on a
+context switch", and the CPU refuses to run SSE instructions until it does. So
+the image executes `addsd xmm0, xmm1` and reports what happens:
+
+```
+  faulted: #UD, invalid opcode. The hardware is there; permission is not.
+```
+
+Then it sets `CR0.MP`, clears `CR0.EM`, sets `CR4.OSFXSR` and `CR4.OSXMMEXCPT`
+— six instructions — and runs the same instruction again:
+
+```
+  after: CR0 = 80000013  CR4 = 620
+  addsd executes. Same instruction, same silicon, different two bits.
+```
+
+Provoking the fault deliberately needs a handler that survives it, because
+`nano-int.h` halts the machine on any CPU exception. Vectors 6 and 7 are
+pointed at handlers of our own for the length of the experiment, which step the
+saved instruction pointer over the faulting instruction. That is only safe
+because `addsd xmm0, xmm1` is exactly four bytes, so `make check-addsd-len`
+asserts that against `objdump` rather than against this paragraph — a comment
+drifting from an encoding would turn the handler into a jump into the middle of
+an instruction. The default halt-and-report handlers are reinstalled the moment
+the experiment ends; a recovery handler left in place past its purpose turns
+every later bug into a wrong answer instead of a crash.
+
+### Arithmetic, or something that resembles arithmetic
+
+"The number printed looks about right" is how you ship an FPU that rounds
+wrongly in the last place, so the checks are bit-exact:
+
+| expression | pattern | why this one |
+|---|---|---|
+| `0.1 + 0.2` | `3fd3333333333334` | one ulp **above** the double nearest 0.3 |
+| `0.3` | `3fd3333333333333` | and it must differ from the line above |
+| `0.1f` | `3dcccccd` | single precision really is a different format |
+| `0.1` | `3fb999999999999a` | round-to-nearest-even, not truncation |
+
+Plus `355/113 = 3.1415929` and `sqrt(2) = 1.4142135` to seven places, printed
+by scaling and integer division since there is nothing to print doubles with
+yet. `sqrtsd` is one instruction and correctly rounded by the hardware; in a
+soft-float world it is a few hundred lines and a table.
+
+Three sabotage runs, to check the checks bite:
+
+| sabotage | what happened | which check caught it |
+|---|---|---|
+| never call `enable_sse` | `addsd` still faulted, then the default handler dumped registers and halted | the CR4 assertion *and* the second `addsd` |
+| enable SSE before the fault test | no fault to observe | "expected a fault before enabling SSE and did not get one" |
+| expect `...3333` for `0.1 + 0.2` | got `...3334` | the bit-exact comparison |
+
+### Why SoftFloat would not help here anyway
+
+Berkeley SoftFloat 2c is 5,165 lines in `softfloat.c`, 713 in
+`softfloat-macros` and 457 in `softfloat-specialize` for the 64-bit build. Set
+aside that it duplicates silicon we already have — it cannot be compiled by
+`nano_cc` as it stands, and the reasons are worth writing down because two of
+them are the interesting kind.
+
+The loud ones stop the build:
+
+- 31 uses of `short`, which `nano_cc` has no such type for
+- `#define LIT64(a) a##LL`, and `nano_cc` has no `##` token pasting
+- 136 declarations passing or returning `float128` / `floatx80` by value, and
+  `nano_cc` has no struct-by-value parameters
+- 37 `extern inline` definitions
+
+The quiet one does not. `nano_cc` parses `unsigned` and ignores it, so every
+`bits32` and `bits64` in SoftFloat — which is every mantissa, exponent and
+sign field in the library — becomes signed. SoftFloat extracts fields by right
+shifting. Compiled with `nano_cc`:
+
+```c
+unsigned long a; long b;
+a = 0 - 1;        /* all 64 bits set */
+b = a >> 60;      /* C says 15 */
+```
+
+prints **-1**, because the shift is emitted as `sar`. The library would build
+and run and give wrong answers on negative-looking mantissas. That is a much
+worse failure than not compiling.
+
+### So what floats would actually take
+
+Not a library — compiler work, in this order:
+
+1. **Lexer**: recognise `3.14`, `1e-3`, `1.0f`. Today the number scanner stops
+   at the decimal point.
+2. **Types**: `float` and `double` as real types, 4 and 8 bytes, with the usual
+   arithmetic conversions.
+3. **Register classes**: values currently live in `rax` and an integer stack.
+   Floats live in `xmm0`, which means every expression node has to carry which
+   class it is in, and every spill has to know which register file to spill.
+4. **Calling convention**: SysV passes floats in `xmm0`–`xmm7` counted
+   separately from the integer registers, returns in `xmm0`, and for varargs
+   requires `al` to hold the number of vector registers used. That last one is
+   exactly what breaks `printf("%f")` if it is missed.
+5. **Boot**: the six instructions above, which is the only part already done.
+6. **`printf("%f")`**: a correct double-to-decimal is its own piece of work.
+   A fixed-precision path is fine for a kernel and much smaller.
+
+Real `unsigned` arithmetic is worth doing before any of it, since it is a
+prerequisite for handling `float` bit patterns at all — and, as above, it is
+currently wrong rather than absent.
+
+`libm` — `sin`, `cos`, `pow` — sits **above** all of this and assumes the
+compiler already has floats, so it is not an alternative to the work, it is
+what comes after. When we get there, musl's `math/` is MIT and derives from
+FreeBSD's `msun` under BSD-2; `sqrt` needs nothing at all, being one
+instruction. The `tlibc` libm is GPL-3.0, so it is not the permissive option it
+looked like.

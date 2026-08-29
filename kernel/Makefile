@@ -26,7 +26,8 @@ QFLAGS := -kernel kernel.elf -no-reboot
         mm mmrun mmtest threads threadsrun threadstest \
         srv srvrun srvtest fs fsrun fstest \
         progs elf elfrun elftest cc ccrun cctest check-miniasm \
-        chain chainrun chaintest wm wmrun wmtest wmshot clean
+        chain chainrun chaintest wm wmrun wmtest wmshot \
+        sse sserun ssetest check-addsd-len clean
 
 all: kernel.elf
 
@@ -192,6 +193,61 @@ wmshot: wm.elf
 	 timeout 90 $(QEMU) -kernel wm.elf -no-reboot -display none \
 	   -serial file:wm-serial.log -monitor stdio >/dev/null 2>&1
 	@convert wm.ppm wm.png && echo "wrote wm.png"
+
+# ---------------------------------------------------------------------------
+# Floating point, measured. Answers "do we need a soft-float library" by
+# showing the CR0/CR4 bits the kernel boots with, provoking the invalid-opcode
+# fault they cause, enabling SSE in six instructions, and then checking the
+# arithmetic bit-for-bit against what IEEE-754 requires.
+# ---------------------------------------------------------------------------
+sse.s: sse.c nano-kernel.h nano-int.h $(NANO)
+	$(NANO) --kernel sse.c sse.s
+
+sse64.bin: boot64.s isr.s sse.s kernel64.ld
+	as --64 boot64.s -o boot64.o
+	as --64 isr.s    -o isr.o
+	as --64 sse.s    -o sse.o
+	ld -T kernel64.ld -o sse64.elf boot64.o isr.o sse.o
+	objcopy -O binary sse64.elf sse64.bin
+
+# The #UD handler steps the saved RIP forward by a hard-coded 4 bytes, which is
+# only correct if `addsd xmm0, xmm1` really is four bytes long. Assert that
+# against the assembler's output rather than against memory: if the encoding
+# ever differs, the handler would resume in the middle of an instruction and
+# the failure would look like anything but a wrong constant.
+check-addsd-len: sse64.elf
+	@bytes=$$(objdump -d sse64.elf | awk \
+	   '/<try_addsd>:/ { f = 1; next } \
+	    f && /addsd/    { split($$0, a, "\t"); gsub(/ /, "", a[2]); \
+	                      print length(a[2]) / 2; exit }'); \
+	 if [ "$$bytes" = "4" ]; then echo "addsd xmm0,xmm1 is $$bytes bytes: matches ADDSD_LEN"; \
+	 else echo "addsd is $$bytes bytes, sse.c assumes 4"; exit 1; fi
+
+blob-sse.s:
+	@printf '.section .blob, "a"\n.incbin "sse64.bin"\n' > $@
+
+sse.elf: boot32.s blob-sse.s sse64.bin final.ld
+	as --32 boot32.s   -o boot32.o
+	as --32 blob-sse.s -o blob-sse.o
+	ld -m elf_i386 -T final.ld -o sse.elf boot32.o blob-sse.o
+
+sse: sse.elf
+
+sserun: sse.elf
+	$(QEMU) -kernel sse.elf -no-reboot
+
+ssetest: sse.elf check-addsd-len
+	@rm -f sse-serial.log
+	@( sleep 8; echo quit ) | \
+	 timeout 40 $(QEMU) -kernel sse.elf -no-reboot -display none \
+	   -serial file:sse-serial.log -monitor stdio >/dev/null 2>&1; \
+	 echo "---- serial output ----"; cat sse-serial.log; echo "-----------------------"; \
+	 tr -d '\r' < sse-serial.log > sse-serial.clean; \
+	 grep -q "SSETEST DONE" sse-serial.clean \
+	   && ! grep -q "FAIL" sse-serial.clean \
+	   && grep -q "PASS: hardware IEEE-754 doubles" sse-serial.clean \
+	   && echo "PASS: SSE off at boot, on in six instructions, bit-exact afterwards" \
+	   || { echo "FAIL"; exit 1; }
 
 # ---------------------------------------------------------------------------
 # The graphics shell: same keyboard-driven shell, drawn into the framebuffer,

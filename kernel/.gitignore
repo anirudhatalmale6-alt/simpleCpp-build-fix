@@ -99,3 +99,12 @@ blob-wm.s
 wm64.elf
 wm64.bin
 wm.elf
+
+# The floating-point measurement image. sse.c is the source.
+sse.s
+blob-sse.s
+sse64.elf
+sse64.bin
+sse.elf
+sse-serial.log
+sse-serial.clean
