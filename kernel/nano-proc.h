@@ -196,6 +196,30 @@ long as_poke(long root, long virt, long val) {
     return 1;
 }
 
+// Copy bytes into another address space, one page-chunk at a time.
+//
+// as_poke writes one aligned word and gets away with never crossing a page.
+// A string does cross, and a copy that resolved the page once and then ran off
+// the end of it would write into whatever frame happened to be next -- which
+// in a fresh address space is usually the program's own text.
+long as_copy_in(long root, long virt, char *src, long n) {
+    long done;
+    done = 0;
+    while (done < n) {
+        long dst;
+        long pageoff;
+        long chunk;
+        dst = vmm_resolve_in(root, virt + done);
+        if (!dst) return 0;
+        pageoff = (virt + done) & (PAGE_SIZE - 1);
+        chunk = PAGE_SIZE - pageoff;
+        if (chunk > n - done) chunk = n - done;
+        memcpy((char *)dst, src + done, chunk);
+        done = done + chunk;
+    }
+    return 1;
+}
+
 // ---------- reading an ELF64 file ----------
 // Every multi-byte field is read a byte at a time. Not for portability: nano_cc
 // has no 16- or 32-bit integer type, so there is no `short` to load a 2-byte
@@ -336,7 +360,16 @@ long elf_load(long root, char *img, long len, long *top_out) {
 // ---------- processes ----------
 
 #define MAX_PROCS 16
-#define MAX_FDS   8
+
+// 16, not 8. The compiler holds its source file, its output file and every
+// header it is nested inside open at the same time, and 8 was enough right up
+// until a program included a header that included another one.
+#define MAX_FDS   16
+
+// argv. Eight arguments of 128 bytes is not a POSIX limit, it is a limit that
+// fits on the initial stack page without needing a second one.
+#define MAX_ARGS  8
+#define ARG_MAX   128
 
 #define P_FREE    0
 #define P_RUNNING 1
@@ -355,6 +388,12 @@ struct Proc {
     long fd_ino[MAX_FDS];      // 0 = closed; entries 0..2 are the console
     long fd_pos[MAX_FDS];
     char name[32];
+    char cwd[64];              // what a relative path is relative to
+    // Where a resolved relative path is assembled. Per-process rather than one
+    // shared buffer: the timer can preempt a syscall anywhere, and two
+    // processes opening relative paths would otherwise take turns overwriting
+    // each other's filename between building it and using it.
+    char pathbuf[128];
 };
 
 struct Proc g_procs[MAX_PROCS];
@@ -391,7 +430,7 @@ long proc_by_tid(long tid) {
 // word at a time. It has to look exactly like a thread caught mid-interrupt,
 // for the same reason thread_build_stack does: that is the only shape
 // isr_common knows how to resume.
-long proc_build_stack(long root, long stack_top, long entry, long arg) {
+long proc_build_stack(long root, long stack_top, long entry, long argc, long argv) {
     long s;
     long i;
 
@@ -410,8 +449,11 @@ long proc_build_stack(long root, long stack_top, long entry, long arg) {
     s = s - 8; as_poke(root, s, 0);            // rbx
     s = s - 8; as_poke(root, s, 0);            // rcx
     s = s - 8; as_poke(root, s, 0);            // rdx
-    s = s - 8; as_poke(root, s, 0);            // rsi
-    s = s - 8; as_poke(root, s, arg);          // rdi = the argument
+    // The C calling convention, arranged by iretq: _start does `call main`
+    // without touching either register, so whatever is here is what main's
+    // (argc, argv) are.
+    s = s - 8; as_poke(root, s, argv);         // rsi = argv
+    s = s - 8; as_poke(root, s, argc);         // rdi = argc
     s = s - 8; as_poke(root, s, 0);            // rbp
     i = 0;
     while (i < 8) { s = s - 8; as_poke(root, s, 0); i = i + 1; }   // r8..r15
@@ -421,9 +463,50 @@ long proc_build_stack(long root, long stack_top, long entry, long arg) {
 
 char *proc_reject;
 
+// Lay argc/argv out at the top of the new process's stack and return the
+// address the argv array ended up at, with *sp_out moved below everything
+// written. Zero means the arguments did not fit.
+//
+// The strings have to live in the process's own memory: the kernel's copies
+// are in the kernel heap, which the program can reach today only because
+// nothing runs in ring 3 yet, and which would be a dangling pointer the moment
+// anything freed them.
+long proc_push_args(long root, long argc, char **argv, long *sp_out) {
+    long s;
+    long addr[MAX_ARGS];
+    long i;
+
+    s = sp_out[0];
+    if (argc < 0 || argc > MAX_ARGS) return 0;
+
+    i = 0;
+    while (i < argc) {
+        long len;
+        len = 0;
+        while (argv[i][len] && len < ARG_MAX - 1) len = len + 1;
+        s = s - (len + 1);
+        s = s & ~7;
+        if (!as_copy_in(root, s, argv[i], len)) return 0;
+        if (!as_copy_in(root, s + len, "", 1)) return 0;   // the terminator
+        addr[i] = s;
+        i = i + 1;
+    }
+
+    // The array itself, with the NULL that tells a program where argv ends
+    // even if it ignores argc.
+    s = s - (argc + 1) * 8;
+    s = s & ~15;
+    i = 0;
+    while (i < argc) { if (!as_poke(root, s + i * 8, addr[i])) return 0; i = i + 1; }
+    if (!as_poke(root, s + argc * 8, 0)) return 0;
+
+    sp_out[0] = s;
+    return s;
+}
+
 // Load `path` off the filesystem into a new address space and start it.
 // Returns a pid, or 0 with proc_reject set.
-long proc_spawn(char *path, long arg, char *name) {
+long proc_spawn(char *path, long argc, char **argv, char *name, char *cwd) {
     long ino;
     long size;
     char *img;
@@ -487,9 +570,20 @@ long proc_spawn(char *path, long arg, char *name) {
         i = 0;
         while (i < 31 && name[i]) { g_procs[slot].name[i] = name[i]; i = i + 1; }
         g_procs[slot].name[i] = 0;
+        i = 0;
+        if (cwd) while (i < 63 && cwd[i]) { g_procs[slot].cwd[i] = cwd[i]; i = i + 1; }
+        if (!i) { g_procs[slot].cwd[0] = '/'; i = 1; }
+        g_procs[slot].cwd[i] = 0;
     }
 
-    rsp = proc_build_stack(root, USER_STACK_TOP - 16, entry, arg);
+    {
+        long sp;
+        long uargv;
+        sp = USER_STACK_TOP - 16;
+        uargv = proc_push_args(root, argc, argv, &sp);
+        if (!uargv && argc > 0) { as_destroy(root); proc_reject = "arguments too long"; return 0; }
+        rsp = proc_build_stack(root, sp, entry, argc, uargv);
+    }
     tid = thread_adopt(rsp, root, g_procs[slot].pid, name);
     if (tid < 0) { as_destroy(root); proc_reject = "no free thread slot"; return 0; }
 
@@ -575,6 +669,7 @@ long proc_wait(long pid) {
 #define SYS_YIELD  9
 #define SYS_TICKS  10
 #define SYS_UNLINK 11
+#define SYS_BRK    12
 
 // Set by a syscall that must not simply return to its caller. The dispatcher
 // in nano-int.h checks it and reschedules instead.
@@ -586,13 +681,58 @@ long g_syscalls;
 // source of truth: if the scheduler switched, this answer changed with it.
 long proc_current() { return proc_by_tid(g_current); }
 
-long sys_open(long slot, char *path, long mode) {
+// The flag values are Linux's, because the C library that sits on top of this
+// (nano-libc.h, shared with the hosted build) already speaks them and giving
+// them different numbers here would mean a translation layer whose only job is
+// to be wrong once.
+//
+// Only two bits do anything. There is no permission model, so a mode argument
+// would be a number the kernel records and never checks -- worse than not
+// having one, because it looks like a control.
+#define O_CREAT 64
+#define O_TRUNC 512
+
+// Turn whatever the program passed into an absolute path.
+//
+// This exists because of one line in the compiler: `#include "util.h"` opens
+// the name verbatim, so without a working directory a program can only ever
+// include a header by its full path -- and then the same source file cannot be
+// compiled here and on Linux, which kills the only comparison worth making.
+//
+// Deliberately does NOT understand "." or "..". The shell normalises those when
+// it sets its own cwd, and a second, subtly different implementation of path
+// cleanup in the kernel is how two parts of a system come to disagree about
+// which file a name means.
+char *proc_path(long slot, char *path) {
+    long n;
+    long i;
+    if (slot < 0 || path[0] == '/') return path;
+
+    n = 0;
+    while (g_procs[slot].cwd[n] && n < 63) { g_procs[slot].pathbuf[n] = g_procs[slot].cwd[n]; n = n + 1; }
+    if (n && g_procs[slot].pathbuf[n - 1] != '/') { g_procs[slot].pathbuf[n] = '/'; n = n + 1; }
+    i = 0;
+    while (path[i] && n < 127) { g_procs[slot].pathbuf[n] = path[i]; n = n + 1; i = i + 1; }
+    g_procs[slot].pathbuf[n] = 0;
+    // A name that did not fit would resolve to a DIFFERENT, shorter path that
+    // might well exist. Refusing is the only safe answer.
+    if (path[i]) return "";
+    return g_procs[slot].pathbuf;
+}
+
+long sys_open(long slot, char *path, long flags) {
     long ino;
     long fd;
     if (slot < 0) return -1;
+    path = proc_path(slot, path);
     ino = fs_lookup(path);
-    if (!ino && mode == 1) ino = fs_create(path);
+    if (!ino && (flags & O_CREAT)) ino = fs_create(path);
     if (!ino) return -1;
+    // Truncate an EXISTING file that is being opened for writing. Without this
+    // a second, shorter write leaves the tail of the first one in place and
+    // the file is a valid-looking splice of two different outputs -- which is
+    // exactly what a compiler run over an earlier, longer output would produce.
+    if ((flags & O_TRUNC) && fs_type(ino) == T_FILE) fs_truncate(ino);
     fd = 3;
     while (fd < MAX_FDS) {
         if (!g_procs[slot].fd_ino[fd]) {
@@ -697,10 +837,19 @@ long syscall_dispatch(long nr, long a, long b, long c) {
         return 0;
     }
 
+    // lseek(fd, off, whence). The whence argument is c; 0 is SEEK_SET, which
+    // is what every caller before this passed implicitly by leaving c zero, so
+    // adding it changed nothing that already worked.
     if (nr == SYS_SEEK) {
+        long base;
         if (slot < 0 || a < 3 || a >= MAX_FDS || !g_procs[slot].fd_ino[a]) return -1;
-        g_procs[slot].fd_pos[a] = b;
-        return b;
+        if (c == 1)      base = g_procs[slot].fd_pos[a];
+        else if (c == 2) base = fs_size(g_procs[slot].fd_ino[a]);
+        else if (c == 0) base = 0;
+        else             return -1;
+        if (base + b < 0) return -1;
+        g_procs[slot].fd_pos[a] = base + b;
+        return base + b;
     }
 
     if (nr == SYS_SIZE) {
@@ -709,11 +858,30 @@ long syscall_dispatch(long nr, long a, long b, long c) {
     }
 
     if (nr == SYS_SBRK)   return sys_sbrk(slot, a);
+
+    // brk(addr): move the break to an absolute address and return where it
+    // ended up; brk(0) just reports it. That is the Linux shape, and it is
+    // here because nano-libc.h's allocator was written against it -- the same
+    // library file serves the hosted build and this one, so the cheapest place
+    // to absorb the difference is the kernel that has a choice.
+    //
+    // On failure it returns the OLD break unchanged, which is also Linux's
+    // behaviour and is what the allocator's `got < want` check is looking for.
+    // Returning -1 here would be read as an enormous successful break.
+    if (nr == SYS_BRK) {
+        long cur;
+        if (slot < 0) return 0;
+        cur = g_procs[slot].brk;
+        if (a <= cur) return cur;
+        if (!sys_sbrk(slot, a - cur)) return cur;
+        return g_procs[slot].brk;
+    }
+
     if (nr == SYS_GETPID) { if (slot < 0) return 0; return g_procs[slot].pid; }
     if (nr == SYS_YIELD)  { g_syscall_resched = 1; return 0; }
     // SYS_TICKS is answered by the dispatcher in nano-int.h, which is the file
     // that owns g_ticks and is included after this one.
-    if (nr == SYS_UNLINK) return fs_unlink((char *)a);
+    if (nr == SYS_UNLINK) return fs_unlink(proc_path(slot, (char *)a));
 
     return -1;
 }

@@ -33,11 +33,20 @@ extern long syscall4(long nr, long a, long b, long c);
 #define SYS_YIELD  9
 #define SYS_TICKS  10
 #define SYS_UNLINK 11
+#define SYS_BRK    12
+
+// open() flags. Linux's values, because the fuller C library in nano-libc.h
+// speaks them and one set of numbers is better than two.
+#define O_RDONLY 0
+#define O_WRONLY 1
+#define O_RDWR   2
+#define O_CREAT  64
+#define O_TRUNC  512
 
 void exit_(long code)                       { syscall4(SYS_EXIT, code, 0, 0); }
 long write(long fd, char *buf, long n)      { return syscall4(SYS_WRITE, fd, (long)buf, n); }
 long read(long fd, char *buf, long n)       { return syscall4(SYS_READ, fd, (long)buf, n); }
-long open(char *path, long create)          { return syscall4(SYS_OPEN, (long)path, create, 0); }
+long open(char *path, long flags)           { return syscall4(SYS_OPEN, (long)path, flags, 0); }
 long close(long fd)                         { return syscall4(SYS_CLOSE, fd, 0, 0); }
 long seek(long fd, long pos)                { return syscall4(SYS_SEEK, fd, pos, 0); }
 long fsize(long fd)                         { return syscall4(SYS_SIZE, fd, 0, 0); }
@@ -56,6 +65,19 @@ void *umemset(void *d, int c, long n) {
     p = (char *)d; i = 0;
     while (i < n) { p[i] = c; i = i + 1; }
     return d;
+}
+
+// argv arrives as text. Deliberately returns 0 for anything that is not a
+// number rather than reporting an error: every caller here is a test program
+// choosing a mode, and none of them has anywhere to report to.
+long uatol(char *s) {
+    long v;
+    long sign;
+    v = 0;
+    sign = 1;
+    if (*s == '-') { sign = -1; s = s + 1; }
+    while (*s >= '0' && *s <= '9') { v = v * 10 + (*s - '0'); s = s + 1; }
+    return sign * v;
 }
 
 int ustrcmp(char *a, char *b) {

@@ -18,16 +18,23 @@
 //   3 .. 3+N     inode table    (8 inodes per block)
 //   ...          data blocks
 //
-// An inode is 128 bytes: type, size, link count, eight direct block pointers
-// and one single-indirect block, with room left over. Every field is 8 bytes
-// wide because nano_cc has no 16- or 32-bit integer type and an on-disk struct
-// with mixed field widths cannot be declared correctly here -- wasteful, and
-// honest about why.
+// An inode is 128 bytes: type, size, link count, eight direct block pointers,
+// one single-indirect block and one double-indirect block, with room left over.
+// Every field is 8 bytes wide because nano_cc has no 16- or 32-bit integer type
+// and an on-disk struct with mixed field widths cannot be declared correctly
+// here -- wasteful, and honest about why.
 //
-// Eight direct blocks reach 4 KiB; the indirect block holds 64 more pointers,
-// so the largest file is 36 KiB. Small on purpose: enough for source files and
-// the compiler's output, and growing it is one more indirection level rather
-// than a redesign.
+// Eight direct blocks reach 4 KiB and the indirect block holds 64 more
+// pointers, which was the whole file system until the compiler moved in: that
+// is a 36 KiB ceiling, and cc.elf is 131 KB. The double-indirect block is 64
+// pointers to 64 pointers, so the ceiling is now (8 + 64 + 4096) * 512 bytes,
+// a little over 2 MiB.
+//
+// The block size stayed at 512 rather than growing, because a bigger block is
+// the cheaper-looking fix that quietly wastes half a block on every small file
+// and does not change the SHAPE of the limit -- one more indirection level
+// does. This is the level xv6 stops at too, and for the same reason: the next
+// one is another 128 MiB nobody here needs.
 
 #ifndef NANO_FS_H
 #define NANO_FS_H
@@ -37,7 +44,8 @@
 #define INODES_PER_BLK (BLK_SIZE / INODE_SZ)      // 4
 #define NDIRECT      8
 #define NINDIRECT    (BLK_SIZE / 8)          // 64 pointers in an indirect block
-#define MAXFILE      ((NDIRECT + NINDIRECT) * BLK_SIZE)
+#define NDINDIRECT   (NINDIRECT * NINDIRECT)      // 4096 through two levels
+#define MAXFILE      ((NDIRECT + NINDIRECT + NDINDIRECT) * BLK_SIZE)
 
 #define FS_MAGIC     0x4E414E4F46531000      // "NANOFS" and a version
 
@@ -179,6 +187,7 @@ long blocks_free() {
 #define INO_NLINK   2
 #define INO_DIRECT  3                         // words 3..10
 #define INO_INDIRECT 11
+#define INO_DINDIRECT 12
 #define INO_WORDS   (INODE_SZ / 8)            // 16
 
 long ino_addr(long ino) {
@@ -242,8 +251,7 @@ long ino_block(long ino, long off, long alloc) {
         return b;
     }
     n = n - NDIRECT;
-    if (n >= NINDIRECT) return 0;
-    {
+    if (n < NINDIRECT) {
         long ib;
         long *tab;
         long b;
@@ -257,6 +265,43 @@ long ino_block(long ino, long off, long alloc) {
         tab = (long *)blk_addr(ib);
         b = tab[n];
         if (!b && alloc) { b = balloc(); if (b) tab[n] = b; }
+        return b;
+    }
+
+    // Two levels: the inode points at a block of 64 pointers, each of which
+    // points at a block of 64 pointers to data.
+    n = n - NINDIRECT;
+    if (n >= NDINDIRECT) return 0;
+    {
+        long db;
+        long *top;
+        long *tab;
+        long mid;
+        long b;
+
+        db = ino_get(ino, INO_DINDIRECT);
+        if (!db) {
+            if (!alloc) return 0;
+            db = balloc();
+            if (!db) return 0;
+            ino_set(ino, INO_DINDIRECT, db);
+        }
+        top = (long *)blk_addr(db);
+        mid = top[n / NINDIRECT];
+        if (!mid) {
+            if (!alloc) return 0;
+            mid = balloc();
+            if (!mid) return 0;
+            // Written only after balloc succeeded. Storing the pointer first
+            // and allocating after would leave a zero in the table on failure,
+            // which reads back as "hole" and is indistinguishable from a block
+            // that was never written -- so a full disk would look like a file
+            // with a silent gap in the middle instead of a failed write.
+            top[n / NINDIRECT] = mid;
+        }
+        tab = (long *)blk_addr(mid);
+        b = tab[n % NINDIRECT];
+        if (!b && alloc) { b = balloc(); if (b) tab[n % NINDIRECT] = b; }
         return b;
     }
 }
@@ -281,6 +326,34 @@ void ino_truncate(long ino) {
             while (i < NINDIRECT) { if (tab[i]) bfree(tab[i]); i = i + 1; }
             bfree(ib);
             ino_set(ino, INO_INDIRECT, 0);
+        }
+    }
+    // The double-indirect tree, bottom up: every leaf, then the block that
+    // held the leaves, then the top block. Freeing the top first would leave
+    // the rest allocated with nothing pointing at them -- the classic way a
+    // truncate turns into a slow disk leak that no single test notices.
+    {
+        long db;
+        db = ino_get(ino, INO_DINDIRECT);
+        if (db) {
+            long *top;
+            long i;
+            top = (long *)blk_addr(db);
+            i = 0;
+            while (i < NINDIRECT) {
+                if (top[i]) {
+                    long *tab;
+                    long k;
+                    tab = (long *)blk_addr(top[i]);
+                    k = 0;
+                    while (k < NINDIRECT) { if (tab[k]) bfree(tab[k]); k = k + 1; }
+                    bfree(top[i]);
+                    top[i] = 0;
+                }
+                i = i + 1;
+            }
+            bfree(db);
+            ino_set(ino, INO_DINDIRECT, 0);
         }
     }
     ino_set(ino, INO_SIZE, 0);
@@ -629,6 +702,13 @@ long fs_readdir(long dir, long index, char *name_out) {
 // ---------- bring-up ----------
 long fs_format(long nblocks, long ninodes) {
     long itable_blocks;
+
+    // The block bitmap is ONE block: 512 bytes, 4096 bits, 4096 blocks. Ask
+    // for more and balloc would hand out block 4097 while bitmap_set quietly
+    // wrote its bit past the end of the bitmap into the inode table -- a
+    // formatted, mountable filesystem that corrupts an inode on the first big
+    // file. Refusing to format is the only honest failure here.
+    if (nblocks > BLK_SIZE * 8) return 0;
 
     if (!fs_dev_init(nblocks)) return 0;
 

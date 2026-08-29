@@ -79,7 +79,11 @@ void main_thread(long unused) {
     {
         long pid;
         long code;
-        pid = proc_spawn("/bin/hello", 42, "hello");
+        {
+            char *av_hello[1];
+            av_hello[0] = "/bin/hello";
+            pid = proc_spawn("/bin/hello", 1, av_hello, "hello", "/");
+        }
         if (!pid) { printf("SPAWN FAILED: %s\n", proc_reject); }
         else {
             printf("spawned pid %d\n", pid);
@@ -116,8 +120,14 @@ void main_thread(long unused) {
         long b;
         long ra;
         long rb;
-        a = proc_spawn("/bin/twin", 1, "twin1");
-        b = proc_spawn("/bin/twin", 2, "twin2");
+        {
+            char *av1[2];
+            char *av2[2];
+            av1[0] = "/bin/twin"; av1[1] = "1";
+            av2[0] = "/bin/twin"; av2[1] = "2";
+            a = proc_spawn("/bin/twin", 2, av1, "twin1", "/");
+            b = proc_spawn("/bin/twin", 2, av2, "twin2", "/");
+        }
         if (!a || !b) printf("TWIN SPAWN FAILED: %s\n", proc_reject);
         else {
             printf("two processes running the same binary: pids %d and %d\n", a, b);
@@ -139,7 +149,14 @@ void main_thread(long unused) {
         while (mode < 3) {
             long pid;
             long code;
-            pid = proc_spawn("/bin/wild", mode, "wild");
+            {
+                char *av_wild[2];
+                char digit[2];
+                digit[0] = (char)(48 + mode);
+                digit[1] = 0;
+                av_wild[0] = "/bin/wild"; av_wild[1] = digit;
+                pid = proc_spawn("/bin/wild", 2, av_wild, "wild", "/");
+            }
             if (!pid) { printf("WILD SPAWN FAILED: %s\n", proc_reject); break; }
             code = proc_wait(pid);
             printf("wild(%d) finished with %d\n", mode, code);
@@ -180,11 +197,11 @@ void main_thread(long unused) {
     // --- 7. a file that is not a program ---
     {
         long pid;
-        pid = proc_spawn("/doc/readme", 0, "notelf");
+        pid = proc_spawn("/doc/readme", 0, 0, "notelf", "/");
         if (pid) puts("RAN SOMETHING THAT IS NOT AN ELF FILE\n");
         else printf("refused /doc/readme: %s\n", proc_reject);
 
-        pid = proc_spawn("/bin/nothing", 0, "missing");
+        pid = proc_spawn("/bin/nothing", 0, 0, "missing", "/");
         if (pid) puts("RAN A FILE THAT DOES NOT EXIST\n");
         else printf("refused /bin/nothing: %s\n", proc_reject);
 
@@ -211,7 +228,7 @@ void main_thread(long unused) {
             hdr[104] = 16;                     // p_memsz
             ino = fs_create("/bad.elf");
             fs_write(ino, 0, hdr, 128);
-            pid = proc_spawn("/bad.elf", 0, "bad");
+            pid = proc_spawn("/bad.elf", 0, 0, "bad", "/");
             if (pid) puts("LOADED A SEGMENT OUTSIDE USER SPACE\n");
             else printf("refused /bad.elf: %s\n", proc_reject);
         }

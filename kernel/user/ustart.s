@@ -5,9 +5,10 @@
  * it must never return, because there is nowhere to return to.
  *
  * The kernel starts a process by building a stack that looks exactly like a
- * thread caught mid-interrupt (see proc_build_stack), with the process argument
- * in rdi. `iretq` drops into _start with that register already set, which is
- * why nothing here loads it -- `call main` passes it straight through.
+ * thread caught mid-interrupt (see proc_build_stack), with argc in rdi and argv
+ * in rsi. `iretq` drops into _start with both registers already set, which is
+ * why nothing here loads them -- `call main` passes them straight through, and
+ * a main() declared (int, char **) is already looking in the right place.
  */
 .code64
 .section .text

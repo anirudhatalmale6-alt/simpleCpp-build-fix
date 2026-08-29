@@ -18,11 +18,14 @@
 
 char g_pattern[N];
 
-int main(long id) {
+int main(int argc, char **argv) {
+    long id;
     long i;
     long round;
     long bad;
     char mine;
+
+    id = argc > 1 ? uatol(argv[1]) : 1;
 
     // 'A' for the first twin, 'B' for the second: visible in a memory dump,
     // and different enough that a partial overwrite still shows up.

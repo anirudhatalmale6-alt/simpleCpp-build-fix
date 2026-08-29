@@ -30,6 +30,12 @@ loader** maps their segments into a **private address space** per process and a
 copies of one binary run at the same virtual address without seeing each
 other's memory, and a program that faults is killed on its own while everything
 else keeps running.
+
+**The compiler is one of those programs.** `/bin/cc` is `nano_cc` itself, built
+from the same source with the same C library, loaded off the OS's own
+filesystem into its own address space. `make -C kernel cctest` compiles a C
+file inside the OS and diffs the assembly byte for byte against the assembly
+the same compiler produces on Linux from the same input.
 See [`kernel/README.md`](kernel/README.md).
 
 ---
@@ -166,6 +172,23 @@ directly:
 
 No gcc, no binutils. `make bootstrap` in the assembler repo runs all six demos
 that way and requires each one to behave exactly as the gcc-assembled build does.
+
+#### `--bss`: `resb` instead of 19 MB of `db 0`
+
+Uninitialised globals used to be written out as explicit zero bytes in both
+`--nasm` and kernel mode, so `nano_cc --minimal --nasm` on its own source
+produced a **61,180,857 byte** `.asm` file — 19 MB of globals spelled out one
+decimal digit and a comma at a time — which the bootstrap assembler quite
+correctly refused.
+
+`--bss` reserves them instead: `resb N` for NASM, `.bss` and `.zero` for GNU-as.
+The same file comes out at **871,603 bytes**.
+
+It is off by default and orthogonal to `--kernel`, because the default is right
+for a flat image: `objcopy -O binary` drops `.bss` and nothing zeroes it
+afterwards, so a global left there comes up holding whatever was in memory. Use
+it when something else does the zeroing — an ELF loader, or an assembler that
+emits `p_memsz > p_filesz`.
 
 Two things that mode has to handle. String literals are pooled and written after
 the last function — the assembler produces one flat segment, so a literal emitted

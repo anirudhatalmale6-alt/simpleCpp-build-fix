@@ -54,6 +54,10 @@ make fstest     # headless: indirect blocks, rename, delete, concurrency
 make progs      # the user programs, compiled by nano_cc and linked at 512 GiB
 make elf        # the ELF loader: processes in their own address spaces
 make elftest    # headless: loading, syscalls, isolation, fault containment
+
+make cc         # the C compiler, built as a program for this OS
+make ccrun      # boot it and watch the compiler run inside the OS
+make cctest     # headless: compile inside the OS, diff against the host
 ```
 
 `make test` needs no display; it drives real keystrokes through QEMU's
@@ -824,8 +828,151 @@ three-stage bootstrap is still byte-identical.
 
 ### What this is not, yet
 
-There is no `fork`, no `exec` that replaces the calling image, no argv beyond a
-single integer, and no way to compile a program from inside the OS — the
-programs are built on the host and embedded in the kernel image by `progs.s`,
+There is no `fork` and no `exec` that replaces the calling image. The programs
+are still built on the host and embedded in the kernel image by `progs.s`,
 because there is no disk to have put them on. A real block device is the next
 piece.
+
+---
+
+## K8 — the compiler, running inside the OS
+
+```
+/> ls /bin
+hello  9856
+twin  9696
+wild  9664
+cc  131552
+/> cd /src
+/src> ls
+hello.c  62
+demo.c  1710
+util.h  700
+/src> cc demo.c demo.s
+[pid 1]
+Compiled demo.c -> demo.s
+[pid 1 exited with 0]
+[150 ms]
+/src> ls
+demo.s  7393
+```
+
+`/bin/cc` is nano_cc. Same source as the compiler that built this kernel, same
+C library, loaded off the RAM disk into its own address space like any other
+program, reaching its files through `open`/`read`/`write`/`close`.
+
+### The test is a comparison, not a smoke test
+
+"It printed something and exited 0" would also be true of a compiler that
+emitted an empty file. `make cctest` dumps the assembly produced **inside the
+OS** over the serial line and diffs it byte for byte against the assembly the
+same compiler produces **on Linux** from the same input file:
+
+```
+host: 468 lines, in the OS: 468 lines
+PASS: the compiler ran inside the OS and produced byte-identical assembly
+```
+
+The input is a real file in the tree (`src/demo.c`) embedded in the image, so
+both sides are definitely compiling the same bytes. It includes a header by a
+**relative** name, which only resolves because a process now has a working
+directory — the second file the compiler has to open through the syscall
+boundary, and the one that would fail quietly if path resolution were wrong.
+
+Both of those were checked by breaking them on purpose. With `proc_path`
+returning the path unresolved, the test fails with `cannot open demo.c`. With
+the `O_TRUNC` handling removed, it fails with `THE OUTPUT FILE WAS NOT
+TRUNCATED` — a 339-byte program producing a 7393-byte output file, because the
+tail of the previous run survived underneath it.
+
+### 19.6 MB → 131 KB: uninitialised globals
+
+The compiler has about 19 MB of uninitialised globals — `toks` alone is 17 MB.
+Kernel-mode `nano_cc` wrote them into `.data` as explicit zero bytes, because a
+bare-metal image is flattened with `objcopy -O binary`, which drops `.bss`, and
+nothing zeroes it afterwards. That is right for a flat image and wrong for a
+program an ELF loader will load, where `p_memsz - p_filesz` is zeroed for free.
+
+The first link of the compiler as a user program came out at **19,625,384
+bytes**: bigger than the loader's limit, bigger than the filesystem's largest
+file, and bigger than the kernel image it has to be embedded in.
+
+`--bss` puts them where a loader can zero them. Same binary, **131,552 bytes**,
+19,497,480 bytes of it memory the file does not carry. It is off by default and
+orthogonal to `--kernel`, and old and new compilers were checked to produce
+identical output on 15 programs across 4 flag combinations.
+
+The same flag emits NASM's `resb` on the `--nasm` path, which is the other half
+of it: `nano_cc --minimal --nasm` on its own source produced a **61,180,857
+byte** `.asm` file, which the bootstrap assembler quite correctly refused. With
+`--bss` that is **871,603 bytes**. The assembler still has to honour `resb` —
+define the label, advance the location counter, and emit `p_memsz > p_filesz` —
+but the input is no longer absurd.
+
+### A 36 KiB filesystem and a 131 KB file
+
+`/bin/cc` did not fit. Eight direct blocks and one indirect block reach 36,864
+bytes, and that was the whole filesystem's maximum file size. A double-indirect
+block — 64 pointers to 64 pointers — takes the ceiling to a little over 2 MiB.
+
+The block size stayed at 512. Growing it is the cheaper-looking fix that wastes
+half a block on every small file and does not change the *shape* of the limit;
+one more indirection level does.
+
+`fs_format` now refuses `nblocks > 4096` rather than accepting it. The block
+bitmap is one 512-byte block: 4096 bits. Ask for more and `balloc` hands out
+block 4097 while `bitmap_set` writes its bit past the end of the bitmap and into
+the inode table — a formatted, mountable filesystem that corrupts an inode the
+first time a big file is written.
+
+### One C library, two kernels
+
+`nano-libc.h` is the C library the compiler is written against, and it reaches
+the outside world through exactly one file: `nano-base.h`. The OS build swaps
+that file for `user/os-base.h` and uses `nano-libc.h` and `simpleC++.c`
+completely unmodified.
+
+What differs is about sixty lines: the trap (`int $0x80` through `ustart.s`
+rather than `syscall`), the open flags, and `brk`. `brk` is deliberately the
+Linux shape — absolute address in, new break out, 0 meaning "just tell me" —
+because that is what the allocator up in `nano-libc.h` was written against, and
+the kernel is the side with a choice.
+
+### The frames, and honest accounting
+
+Six compiler runs, each mapping 19 MB. The free-frame count is taken **after**
+the first run, not before, and the difference is explained rather than tolerated:
+
+```
+130181 frames free before the first run, 130148 after all six
+the kernel heap grew from 529 pages to 562 to hold a 131552 byte ELF image
+every frame came back
+```
+
+33 frames = 33 pages of kernel heap growth to hold the 131 KB ELF image, once.
+A heap never gives its pages back, by design. That is not an address-space leak,
+and the way to tell them apart is that it does not happen again — so the test is
+"no frames move across runs 2 to 6", which still fails loudly if a single
+address space is not reclaimed.
+
+### What else this needed
+
+* **argv.** A process used to get a single integer. It now gets `argc` and a
+  real `argv`, built in its own address space at the top of its stack — the
+  kernel's copies live in the kernel heap and would be a dangling pointer the
+  moment anything freed them.
+* **A working directory per process,** so `#include "util.h"` means the same
+  thing here as on Linux. It deliberately does not understand `.` or `..`; the
+  shell normalises those, and a second implementation of path cleanup is how two
+  parts of a system come to disagree about which file a name means.
+* **`O_TRUNC`,** so a shorter second output does not leave the tail of the first
+  one in place.
+* **`lseek` with a whence,** and 16 file descriptors instead of 8 — a compiler
+  holds its source, its output and every header it is nested inside open at once.
+
+### What this is not, yet
+
+There is no assembler in the OS. `cc` produces `.s` and stops; turning that into
+a runnable binary still needs `as` and `ld` on the host. The bootstrap assembler
+is the obvious candidate for the missing half, and `resb` is what stands between
+it and assembling this compiler.

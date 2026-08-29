@@ -17,7 +17,7 @@ QEMU   := qemu-system-x86_64
 # nothing. The symptom was gshell64.bin assembling progs.s before the binaries
 # it .incbin's had been built -- "file not found: user/hello.elf" on a clean
 # tree, and a perfectly good build on the second attempt.
-UPROGS := user/hello.elf user/twin.elf user/wild.elf
+UPROGS := user/hello.elf user/twin.elf user/wild.elf user/cc.elf
 QFLAGS := -kernel kernel.elf -no-reboot
 
 .PHONY: all run test shot gfx gfxrun gfxtest gfxshot \
@@ -25,7 +25,7 @@ QFLAGS := -kernel kernel.elf -no-reboot
         intr intrrun intrtest acpi acpirun acpitest \
         mm mmrun mmtest threads threadsrun threadstest \
         srv srvrun srvtest fs fsrun fstest \
-        progs elf elfrun elftest clean
+        progs elf elfrun elftest cc ccrun cctest clean
 
 all: kernel.elf
 
@@ -141,7 +141,7 @@ gfxshell.s: gfxshell.c nano-kernel.h nano-fb.h nano-font.h nano-int.h \
             nano-acpi.h nano-mm.h nano-thread.h nano-srv.h nano-fs.h nano-proc.h $(NANO)
 	$(NANO) --kernel gfxshell.c gfxshell.s
 
-gshell64.bin: boot64.s isr.s gfxshell.s progs.s $(UPROGS) kernel64.ld
+gshell64.bin: boot64.s isr.s gfxshell.s progs.s $(UPROGS) src/demo.c src/util.h kernel64.ld
 	as --64 boot64.s   -o boot64.o
 	as --64 isr.s      -o isr.o
 	as --64 gfxshell.s -o gfxshell.o
@@ -233,25 +233,22 @@ gshelltest: gshell.elf
 	   || { echo "FAIL"; exit 1; }
 
 # Boot it, type a few commands, and photograph the screen.
+#
+# The sequence is a compiler session: find cc on the disk, change into the
+# source directory, compile a C file that includes a header next to it, and
+# list what came out. Everything on that screen is happening inside the OS.
 gshellshot: gshell.elf
 	@rm -f gshell.ppm gshell.png
-	@( sleep 3; for k in a c p i ret; do echo "sendkey $$k"; sleep 0.18; done; \
-	   sleep 0.5; for k in i d l e ret; do echo "sendkey $$k"; sleep 0.18; done; \
-	   sleep 2; for k in u p t i m e ret; do echo "sendkey $$k"; sleep 0.18; done; \
-	   sleep 0.5; for k in m e m ret; do echo "sendkey $$k"; sleep 0.18; done; \
-	   sleep 0.5; for k in s p a w n ret; do echo "sendkey $$k"; sleep 0.18; done; \
-	   sleep 0.3; for k in s p a w n ret; do echo "sendkey $$k"; sleep 0.18; done; \
-	   sleep 0.3; for k in c l e a r ret; do echo "sendkey $$k"; sleep 0.18; done; \
+	@( sleep 3; for k in c l e a r ret; do echo "sendkey $$k"; sleep 0.15; done; \
 	   sleep 0.4; for k in l s spc slash b i n ret; do echo "sendkey $$k"; sleep 0.15; done; \
-	   sleep 0.4; for k in e x e c spc slash b i n slash h e l l o ret; \
+	   sleep 0.5; for k in c d spc slash s r c ret; do echo "sendkey $$k"; sleep 0.15; done; \
+	   sleep 0.4; for k in l s ret; do echo "sendkey $$k"; sleep 0.15; done; \
+	   sleep 0.5; for k in c c spc d e m o dot c spc d e m o dot s ret; \
 	     do echo "sendkey $$k"; sleep 0.15; done; \
-	   sleep 1.0; for k in c a t spc slash h e l l o dot o u t ret; \
-	     do echo "sendkey $$k"; sleep 0.15; done; \
-	   sleep 0.5; for k in e x e c spc slash b i n slash t w i n spc 1 ret; \
-	     do echo "sendkey $$k"; sleep 0.15; done; \
-	   sleep 1.5; for k in p r o c s ret; do echo "sendkey $$k"; sleep 0.18; done; \
-	   sleep 1.2; echo "screendump gshell.ppm"; sleep 1; echo quit ) | \
-	 timeout 60 $(QEMU) -kernel gshell.elf -no-reboot -display none \
+	   sleep 12; for k in l s ret; do echo "sendkey $$k"; sleep 0.15; done; \
+	   sleep 0.5; for k in p r o c s ret; do echo "sendkey $$k"; sleep 0.15; done; \
+	   sleep 1.2; echo "screendump gshell.ppm"; sleep 1.5; echo quit ) | \
+	 timeout 90 $(QEMU) -kernel gshell.elf -no-reboot -display none \
 	   -serial file:gshell-serial.log -monitor stdio >/dev/null 2>&1
 	@convert gshell.ppm gshell.png && echo "wrote gshell.png"
 
@@ -545,9 +542,32 @@ user/ustart.o: user/ustart.s
 # directory, not against the file doing the including, so nano-user.h is only
 # findable from inside that directory.
 user/%.elf: user/%.c user/nano-user.h user/ustart.o user/user.ld $(NANO)
-	cd user && ../$(NANO) --kernel $*.c $*.s
+	cd user && ../$(NANO) --kernel --bss $*.c $*.s
 	as --64 user/$*.s -o user/$*.o
 	ld -T user/user.ld -z max-page-size=0x1000 -o $@ user/ustart.o user/$*.o
+
+# The compiler itself, as a program for this OS.
+#
+# Same source as ../nano_cc, same libc (../nano-libc.h), and the same awk
+# transform selfhost.sh uses to swap the five system includes for it. The ONLY
+# thing that differs is which file lands as nano-base.h: on Linux it is the one
+# with `syscall` in it, here it is user/os-base.h with `int $$0x80`.
+#
+# --bss is not optional here. Without it the uninitialised globals are written
+# out as zero bytes and the binary is 19.6 MB, which is larger than the loader
+# accepts, larger than the filesystem's biggest file, and larger than the
+# kernel image it has to be embedded in.
+user/cc.elf: ../simpleC++.c ../nano-libc.h user/os-base.h user/ustart.o user/user.ld $(NANO)
+	@mkdir -p user/ccbuild
+	@awk '/^#include <(stdio|stdlib|string|ctype|stdarg)\.h>$$/ { next } \
+	      /^static FILE \*fout;$$/ && !done { print "#include \"nano-libc.h\""; done=1 } \
+	      { print }' ../simpleC++.c > user/ccbuild/cc.c
+	@cp ../nano-libc.h user/ccbuild/
+	@cp user/os-base.h user/ccbuild/nano-base.h
+	cd user/ccbuild && ../../$(NANO) --kernel --bss cc.c cc.s
+	as --64 user/ccbuild/cc.s -o user/ccbuild/cc.o
+	ld -T user/user.ld -z max-page-size=0x1000 -o $@ user/ustart.o user/ccbuild/cc.o
+	@echo "   $$(stat -c%s $@) bytes on disk, $$(readelf -lW $@ | awk '/RW /{print strtonum($$6)}') bytes of memory"
 
 progs: $(UPROGS)
 
@@ -557,7 +577,7 @@ progs: $(UPROGS)
 elf.s: elf.c nano-kernel.h nano-mm.h nano-thread.h nano-fs.h nano-proc.h nano-int.h $(NANO)
 	$(NANO) --kernel elf.c elf.s
 
-elf64.bin: boot64.s isr.s elf.s progs.s $(UPROGS) kernel64.ld
+elf64.bin: boot64.s isr.s elf.s progs.s $(UPROGS) src/demo.c src/util.h kernel64.ld
 	as --64 boot64.s -o boot64.o
 	as --64 isr.s    -o isr.o
 	as --64 elf.s    -o elf.o
@@ -595,6 +615,65 @@ elftest: elfk.elf
 	   && echo "PASS: ELF loading, syscalls, address-space isolation, fault containment" \
 	   || { echo "FAIL"; exit 1; }
 
+# ---------------------------------------------------------------------------
+# The compiler, running inside the OS. cc.c is the headless test.
+# ---------------------------------------------------------------------------
+cc.s: cc.c nano-kernel.h nano-mm.h nano-thread.h nano-fs.h nano-proc.h nano-int.h $(NANO)
+	$(NANO) --kernel cc.c cc.s
+
+cc64.bin: boot64.s isr.s cc.s progs.s $(UPROGS) src/demo.c src/util.h kernel64.ld
+	as --64 boot64.s -o boot64.o
+	as --64 isr.s    -o isr.o
+	as --64 cc.s     -o cck.o
+	as --64 progs.s  -o progs.o
+	ld -T kernel64.ld -o cc64.elf boot64.o isr.o cck.o progs.o
+	objcopy -O binary cc64.elf cc64.bin
+
+blob-cc.s:
+	@printf '.section .blob, "a"\n.incbin "cc64.bin"\n' > $@
+
+cck.elf: boot32.s blob-cc.s cc64.bin final.ld
+	as --32 boot32.s -o boot32.o
+	as --32 blob-cc.s -o blob-cc.o
+	ld -m elf_i386 -T final.ld -o cck.elf boot32.o blob-cc.o
+
+cc: cck.elf
+
+ccrun: cck.elf
+	$(QEMU) -m 512 -kernel cck.elf -no-reboot
+
+# The test that means something: the assembly produced INSIDE the OS, compared
+# byte for byte with the assembly the same compiler produces on Linux from the
+# same source file.
+#
+# -m 512 because the compiler's globals are 19 MB, every page of them is mapped
+# up front, and six runs plus a 2 MiB RAM disk do not fit in QEMU's default 128.
+cctest: cck.elf $(NANO)
+	@rm -f cc-serial.log cc-host.s cc-os.s
+	@cd src && ../$(NANO) demo.c ../cc-host.s > /dev/null
+	@( sleep 40; echo quit ) | \
+	 timeout 120 $(QEMU) -m 512 -kernel cck.elf -no-reboot -display none \
+	   -serial file:cc-serial.log -monitor stdio >/dev/null 2>&1; \
+	 tr -d '\r' < cc-serial.log > cc-serial.clean; \
+	 sed -n '/^---8<--- demo.s begins$$/,/^---8<--- demo.s ends$$/p' cc-serial.clean \
+	   | sed '1d;$$d' > cc-os.s; \
+	 echo "---- serial output (assembly elided) ----"; \
+	 sed '/^---8<--- demo.s begins$$/,/^---8<--- demo.s ends$$/{//!d}' cc-serial.clean; \
+	 echo "-----------------------------------------"; \
+	 echo "host: $$(wc -l < cc-host.s) lines, in the OS: $$(wc -l < cc-os.s) lines"; \
+	 grep -q "the last byte of it reads back correctly" cc-serial.clean \
+	   && grep -q "^cc exited with 0$$" cc-serial.clean \
+	   && grep -q "the old output was truncated" cc-serial.clean \
+	   && grep -q "^missing input: exit 1$$" cc-serial.clean \
+	   && grep -q "^broken input: exit 1$$" cc-serial.clean \
+	   && grep -q "^relative include with the wrong cwd: exit 1$$" cc-serial.clean \
+	   && grep -q "every frame came back" cc-serial.clean \
+	   && grep -q "CCTEST DONE" cc-serial.clean \
+	   && [ -s cc-os.s ] \
+	   && cmp cc-host.s cc-os.s \
+	   && echo "PASS: the compiler ran inside the OS and produced byte-identical assembly" \
+	   || { echo "FAIL"; diff cc-host.s cc-os.s | head -20; exit 1; }
+
 clean:
 	@# NOT user/*.s -- ustart.s is a source file, and the generated ones are
 	@# named after their .c. Deleting by wildcard here would remove the entry
@@ -602,6 +681,12 @@ clean:
 	rm -f user/hello.s user/twin.s user/wild.s user/*.o user/*.elf \
 	      progs.o elf.s blob-elf.s elf64.bin elf64.elf elfk.elf \
 	      elf-serial.log elf-serial.clean
+	rm -rf user/ccbuild
+	@# cck.o, not cc.o: cc.o is what make's built-in rule would call the
+	@# object it builds from cc.c with GCC, and naming ours the same invites
+	@# exactly that mix-up back.
+	rm -f cc.s cck.o blob-cc.s cc64.bin cc64.elf cck.elf \
+	      cc-serial.log cc-serial.clean cc-host.s cc-os.s
 	rm -f *.o shell.s gfx.s gfxshell.s intr.s acpi.s mm.s threads.s srv.s fs.s \
 	      blob-gfx.s blob-gshell.s blob-intr.s blob-acpi.s blob-mm.s \
 	      blob-threads.s blob-srv.s blob-fs.s \

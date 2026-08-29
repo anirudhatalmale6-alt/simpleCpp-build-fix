@@ -10,16 +10,16 @@
 
 char buf[256];
 
-int main(long arg) {
+int main(int argc, char **argv) {
     long fd;
     long n;
     long total;
 
     puts("hello from a user program\n");
-    printf("  pid %d, started with argument %d\n", getpid(), arg);
+    printf("  pid %d, argc %d, argv[0] %s\n", getpid(), argc, argc ? argv[0] : "(none)");
 
     // --- read a file the kernel put there ---
-    fd = open("/doc/readme", 0);
+    fd = open("/doc/readme", O_RDONLY);
     if (fd < 0) {
         puts("  could not open /doc/readme\n");
         return 1;
@@ -35,7 +35,7 @@ int main(long arg) {
     printf("  read %d bytes back through the syscall boundary\n", total);
 
     // --- and write one of its own, for the shell to find afterwards ---
-    fd = open("/hello.out", 1);
+    fd = open("/hello.out", O_WRONLY | O_CREAT | O_TRUNC);
     if (fd < 0) {
         puts("  could not create /hello.out\n");
         return 2;

@@ -33,6 +33,12 @@ extern long prog_twin_addr();
 extern long prog_twin_size();
 extern long prog_wild_addr();
 extern long prog_wild_size();
+extern long prog_cc_addr();
+extern long prog_cc_size();
+extern long prog_demo_addr();
+extern long prog_demo_size();
+extern long prog_util_addr();
+extern long prog_util_size();
 
 #define COL_BG      0x0d1117
 #define COL_FG      0xc9d1d9
@@ -703,6 +709,15 @@ void fs_populate() {
         "    puts(\"hello from a file\\n\");\n"
         "    return 0;\n"
         "}\n");
+    // demo.c and its header come from real files in the source tree, copied in
+    // by progs.s. `cd /src` then `cc demo.c demo.s` compiles them in place.
+    {
+        long ino;
+        ino = fs_create("/src/demo.c");
+        if (ino) fs_write(ino, 0, (char *)prog_demo_addr(), prog_demo_size());
+        ino = fs_create("/src/util.h");
+        if (ino) fs_write(ino, 0, (char *)prog_util_addr(), prog_util_size());
+    }
 
     // The programs. They are compiled by nano_cc, linked at 512 GiB and
     // embedded in this kernel image by progs.s, because there is no disk yet
@@ -717,6 +732,8 @@ void fs_populate() {
         if (ino) fs_write(ino, 0, (char *)prog_twin_addr(), prog_twin_size());
         ino = fs_create("/bin/wild");
         if (ino) fs_write(ino, 0, (char *)prog_wild_addr(), prog_wild_size());
+        ino = fs_create("/bin/cc");
+        if (ino) fs_write(ino, 0, (char *)prog_cc_addr(), prog_cc_size());
     }
     strcpy(g_cwd, "/");
 }
@@ -774,26 +791,17 @@ void cmd_procs() {
            proc_alive(), g_proc_faults, g_syscalls);
 }
 
-// A number at the end of a command line. Returns 0 for anything that is not
-// one, which is also a perfectly good argument, so nothing here needs to
-// distinguish "no argument" from "the argument zero".
-long shell_atol(char *s) {
-    long v;
-    long neg;
-    v = 0;
-    neg = 0;
-    if (*s == '-') { neg = 1; s = s + 1; }
-    while (*s >= '0' && *s <= '9') { v = v * 10 + (*s - '0'); s = s + 1; }
-    return neg ? -v : v;
-}
-
 // Run a program and wait for it. The shell blocks, but the rest of the system
 // does not: this yields while it waits, so the animators keep drawing and any
 // background process keeps running.
-void cmd_exec(char *path, long arg) {
+void cmd_exec(char **argv, long argc) {
     long pid;
     long code;
-    pid = proc_spawn(path, arg, path);
+    char *path;
+    path = argv[0];
+    // The shell's own working directory becomes the program's, so a
+    // relative filename on the command line means the same thing to both.
+    pid = proc_spawn(path, argc, argv, path, g_cwd);
     if (!pid) { puts("cannot run "); puts(path); puts(": "); puts(proc_reject); putc('\n'); return; }
     printf("[pid %d]\n", pid);
     code = proc_wait(pid);
@@ -802,11 +810,40 @@ void cmd_exec(char *path, long arg) {
 }
 
 // Start a program and come straight back to the prompt.
-void cmd_run(char *path, long arg) {
+void cmd_run(char **argv, long argc) {
     long pid;
-    pid = proc_spawn(path, arg, path);
+    char *path;
+    path = argv[0];
+    pid = proc_spawn(path, argc, argv, path, g_cwd);
     if (!pid) { puts("cannot run "); puts(path); puts(": "); puts(proc_reject); putc('\n'); return; }
     printf("[pid %d started in the background]\n", pid);
+}
+
+// cc — the C compiler, as a program on this machine.
+//
+// There is nothing special about it from the kernel's side: it is /bin/cc, an
+// ELF file on the ramdisk, loaded into its own address space like any other.
+// The only reason it gets a command of its own rather than being typed as
+// `exec /bin/cc ...` is that it is the one program here anybody would want to
+// run by name.
+//
+// It is the same compiler that built this kernel, from the same source, and it
+// reaches its files through open/read/write/close on the filesystem you can
+// `ls`. Its 19 MB of globals are pages in its own address space; when it exits
+// the reaper hands every one of them back.
+void cmd_cc(char **args, long n) {
+    char *av[8];
+    long i;
+    long t0;
+
+    if (n + 1 > 8) { puts("cc: too many arguments\n"); return; }
+    av[0] = "/bin/cc";
+    i = 0;
+    while (i < n) { av[i + 1] = args[i]; i = i + 1; }
+
+    t0 = g_ticks;
+    cmd_exec(av, n + 1);
+    printf("[%d ms]\n", (g_ticks - t0) * 10);
 }
 
 // Reap finished processes and give their address spaces back.
@@ -897,7 +934,9 @@ void shell_thread(long unused) {
 
     // Services start once the scheduler is live, so the supervisor has
     // something to schedule.
-    if (!fs_format(2048, 128)) puts("filesystem format failed\n");
+    // 4096 blocks is the most a single-block bitmap can track, and the whole
+    // 2 MiB is needed now: /bin/cc alone is 257 of them.
+    if (!fs_format(4096, 192)) puts("filesystem format failed\n");
     else fs_populate();
 
     srv_init(100);
@@ -975,10 +1014,12 @@ void shell_thread(long unused) {
             else if (!strcmp(av[0], "cd") && ac >= 2) cmd_cd(av[1]);
             else if (!strcmp(av[0], "cp") && ac >= 3) cmd_cp(av[1], av[2]);
             else if (!strcmp(av[0], "mv") && ac >= 3) cmd_mv(av[1], av[2]);
-            else if (!strcmp(av[0], "exec") && ac >= 2)
-                cmd_exec(av[1], ac >= 3 ? shell_atol(av[2]) : 0);
-            else if (!strcmp(av[0], "run") && ac >= 2)
-                cmd_run(av[1], ac >= 3 ? shell_atol(av[2]) : 0);
+            // Everything from the program name onwards becomes its argv, which
+            // is why these pass av + 1 rather than av[1]: the program's own
+            // name has to be argv[0], the way every C program expects.
+            else if (!strcmp(av[0], "exec") && ac >= 2) cmd_exec(av + 1, ac - 1);
+            else if (!strcmp(av[0], "run") && ac >= 2)  cmd_run(av + 1, ac - 1);
+            else if (!strcmp(av[0], "cc") && ac >= 3)   cmd_cc(av + 1, ac - 1);
             else if (starts_with(line, "write ") && ac >= 3)
                 cmd_write(av[1], line + 6 + strlen(av[1]) + 1, 0);
             else if (starts_with(line, "append ") && ac >= 3)

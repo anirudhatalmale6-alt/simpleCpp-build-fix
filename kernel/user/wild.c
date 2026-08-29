@@ -19,8 +19,11 @@
 
 #include "nano-user.h"
 
-int main(long mode) {
+int main(int argc, char **argv) {
+    long mode;
     char *p;
+
+    mode = argc > 1 ? uatol(argv[1]) : 0;
 
     printf("wild: pid %d, about to do something it should not (mode %d)\n",
            getpid(), mode);

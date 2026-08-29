@@ -59,3 +59,15 @@ user/hello.s
 user/twin.s
 user/wild.s
 user/*.elf
+
+# The compiler as a user program, and its test image. cc.c and src/ are
+# sources; user/ccbuild is a staging directory the Makefile assembles.
+user/ccbuild/
+cc.s
+cck.o
+blob-cc.s
+cc64.elf
+cc64.bin
+cck.elf
+cc-host.s
+cc-os.s
