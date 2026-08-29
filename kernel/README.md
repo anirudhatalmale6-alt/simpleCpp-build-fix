@@ -63,6 +63,11 @@ make chain      # the assembler too: source -> cc -> as -> a running process
 make chainrun   # boot it and watch the whole chain
 make chaintest  # headless: and byte-compare the binary against the host's
 make check-miniasm MINIASM_SRC=...   # the vendored assembler has not drifted
+
+make wm         # the compositor: windows, damage rectangles, clipped blits
+make wmrun      # boot it and watch
+make wmtest     # headless: count the pixels, and hash them against a full repaint
+make wmshot     # save wm.png
 ```
 
 `make test` needs no display; it drives real keystrokes through QEMU's
@@ -1189,3 +1194,88 @@ Neither is a defence against a program that means harm, because programs still
 run in **ring 0** and can rewrite CR3 or clear CR0.WP whenever they like. These
 are defences against a program that is *wrong*, and against a file that is not
 what it claims. Ring 3 is still its own milestone.
+
+## K11 — the compositor: only repaint what changed
+
+Until now everything drew straight to the screen. `nano-fb.h` writes each pixel
+with an `mmio_write32` to video memory across the PCI bus, and at 1024x768 a
+full repaint is 786,432 of them. Doing that because one window moved four pixels
+is the difference between a machine that feels alive and one that does not.
+
+`nano-wm.h` puts a layer in between. Each window owns a backing buffer in
+ordinary RAM; programs draw into that as fast as memory allows and nothing
+reaches the screen. They then say which rectangle changed, and `wm_present`
+copies out only those rectangles.
+
+### Damage is not enough on its own
+
+Painting a damaged rectangle back to front — the painter's algorithm — is always
+correct, and it was the first thing this did. It also wrote 137% of the screen
+on a full repaint of four overlapping windows: the desktop background painted
+first and then covered entirely, lower windows painted and then painted over.
+Three hundred thousand pixels pushed across the bus purely to be hidden.
+
+So the paint runs **front to back**, carrying a region — a list of rectangles —
+of what is still unpainted. Each window draws only where the region says nothing
+has been drawn yet, then subtracts itself from it. Whatever survives to the end
+is desktop. Every pixel on screen is written exactly once, and a window behind a
+covering window is never read, never blitted, and never considered again.
+
+When a split would need more rectangles than the region holds, the original is
+kept whole. That over-paints, which is the safe direction: dropping the
+rectangle instead would leave a patch of screen that no later frame repairs.
+The damage list has the same rule — overflow falls back to a full repaint.
+
+### What `make wmtest` measures
+
+A compositor that repaints everything looks *identical* to one that repaints
+only what changed. The picture is the same. Only the number of bus writes
+differs, and that is invisible unless you count it. So every pixel that reaches
+video memory goes through one of two functions, both of which increment a
+counter.
+
+Counting alone would not be enough either, because skipping work you should have
+done is the cheapest way to make a counter look good, and the result is usually
+still plausible — one stale rectangle in a corner. So after every incremental
+frame the framebuffer is read back and hashed, the same scene is repainted in
+full, and the two hashes must be equal.
+
+```
+first full paint      786,432 pixels = 100.0%   no pixel written twice
+move a 320x240 window   79,056 pixels =  10.0%   by four pixels
+  the same move, damage tracking off             786,432 = 100.0%  (9x more work)
+80x16 update inside a window   1,280 pixels = 0.1%   exactly 80x16
+raise a window          66,000 pixels =   8.3%
+hide / show             93,600 pixels =  11.9%
+drag, 40 frames         58,683 pixels per frame = 7.4%
+```
+
+Every one of those frames hashes identically to a full repaint of the same
+scene.
+
+### Proving the tests can fail
+
+Three sabotage runs, each caught by a different check:
+
+| broken on purpose | what happened | which check caught it |
+|---|---|---|
+| `wm_move` stops damaging the old rectangle | move got **cheaper** — 9.7% — and left ghosts | the framebuffer hash |
+| `region_subtract` made a no-op | picture stayed correct, cost went to 137% | the pixel count |
+| `wm_no_damage` ignored | the "off" run cost the same as the "on" run | the off-switch comparison |
+
+The first is the one worth keeping in mind. Dropping the old-position damage
+made the frame measurably *faster* while making it wrong. A pixel counter alone
+would have recorded that as an improvement. Only the comparison against a full
+repaint caught it.
+
+### What this is for
+
+This is the layer that would hand TinyGL a window's backing buffer to render
+into, and then blit that one rectangle. TinyGL cannot do this job itself: it is
+a triangle rasterizer with no concept of a damaged region — `ZB_clear` clears
+the whole buffer and `ZB_copyFrameBuffer` copies the whole buffer, and there is
+nowhere in its API to say which part changed.
+
+It is also entirely integer work. A compositor is coordinates, widths and
+copies, so none of it waits on floating point, which nano_cc still does not
+have.

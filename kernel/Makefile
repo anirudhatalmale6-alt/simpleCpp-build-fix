@@ -26,7 +26,7 @@ QFLAGS := -kernel kernel.elf -no-reboot
         mm mmrun mmtest threads threadsrun threadstest \
         srv srvrun srvtest fs fsrun fstest \
         progs elf elfrun elftest cc ccrun cctest check-miniasm \
-        chain chainrun chaintest clean
+        chain chainrun chaintest wm wmrun wmtest wmshot clean
 
 all: kernel.elf
 
@@ -133,6 +133,65 @@ gfxshot: gfx.elf
 	 timeout 25 $(QEMU) -kernel gfx.elf -no-reboot -display none \
 	   -serial file:gfx-serial.log -monitor stdio >/dev/null 2>&1
 	@convert gfx.ppm gfx.png && echo "wrote gfx.png"
+
+# ---------------------------------------------------------------------------
+# The compositor: windows with their own backing buffers, a damage list, and a
+# present step that copies only the rectangles that changed.
+#
+# The test is not "does it look right" -- a compositor that repaints everything
+# looks identical. It counts the pixels that actually crossed the bus, runs the
+# same frames again with damage tracking switched off to prove the number moves,
+# and hashes the framebuffer after every incremental frame against a full
+# repaint of the same scene.
+# ---------------------------------------------------------------------------
+wm.s: wm.c nano-kernel.h nano-int.h nano-fb.h nano-font.h nano-mm.h nano-wm.h $(NANO)
+	$(NANO) --kernel wm.c wm.s
+
+# isr.s carries the interrupt stubs and irq_save/irq_restore, which the heap
+# uses as its lock -- one CPU, so masking interrupts is the lock.
+wm64.bin: boot64.s isr.s wm.s kernel64.ld
+	as --64 boot64.s -o boot64.o
+	as --64 isr.s    -o isr.o
+	as --64 wm.s     -o wm.o
+	ld -T kernel64.ld -o wm64.elf boot64.o isr.o wm.o
+	objcopy -O binary wm64.elf wm64.bin
+
+blob-wm.s:
+	@printf '.section .blob, "a"\n.incbin "wm64.bin"\n' > $@
+
+wm.elf: boot32.s blob-wm.s wm64.bin final.ld
+	as --32 boot32.s  -o boot32.o
+	as --32 blob-wm.s -o blob-wm.o
+	ld -m elf_i386 -T final.ld -o wm.elf boot32.o blob-wm.o
+
+wm: wm.elf
+
+wmrun: wm.elf
+	$(QEMU) -kernel wm.elf -no-reboot
+
+# The framebuffer read-back in the checksum is 786,432 MMIO reads per hash and
+# there are eight of them, so this one is slower than the other images. The
+# timeout is generous on purpose: a compositor test that fails because QEMU was
+# still working is worse than no test.
+wmtest: wm.elf
+	@rm -f wm-serial.log
+	@( sleep 55; echo quit ) | \
+	 timeout 90 $(QEMU) -kernel wm.elf -no-reboot -display none \
+	   -serial file:wm-serial.log -monitor stdio >/dev/null 2>&1; \
+	 echo "---- serial output ----"; cat wm-serial.log; echo "-----------------------"; \
+	 tr -d '\r' < wm-serial.log > wm-serial.clean; \
+	 grep -q "WMTEST DONE" wm-serial.clean \
+	   && ! grep -q "FAIL" wm-serial.clean \
+	   && grep -q "PASS: the compositor repaints only what changed" wm-serial.clean \
+	   && echo "PASS: damage tracking measured, and the screen matches a full repaint" \
+	   || { echo "FAIL"; exit 1; }
+
+wmshot: wm.elf
+	@rm -f wm.ppm wm.png
+	@( sleep 50; echo "screendump wm.ppm"; sleep 2; echo quit ) | \
+	 timeout 90 $(QEMU) -kernel wm.elf -no-reboot -display none \
+	   -serial file:wm-serial.log -monitor stdio >/dev/null 2>&1
+	@convert wm.ppm wm.png && echo "wrote wm.png"
 
 # ---------------------------------------------------------------------------
 # The graphics shell: same keyboard-driven shell, drawn into the framebuffer,

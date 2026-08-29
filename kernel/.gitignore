@@ -91,3 +91,11 @@ chain-host.asm
 chain-host.bin
 chain-host.hex
 chain-os.hex
+
+# The compositor image. nano-wm.h and wm.c are sources; wm.png is kept because
+# the README shows it.
+wm.s
+blob-wm.s
+wm64.elf
+wm64.bin
+wm.elf
