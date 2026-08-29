@@ -1615,7 +1615,13 @@ static void emit_global(Sym *g, int nasm) {
         // --nasm output of this compiler was 61 MB without it: 19 MB of
         // globals written out as `db 0, 0, 0, ...`, one decimal digit and a
         // comma per byte.
-        if (g_bss) { fprintf(fout, "%s: resb %d\n", asm_sym(g->name), sz); return; }
+        //
+        // "name resb N", with NO colon, which is NASM's form and is not
+        // cosmetic. With a colon the name is a LABEL AT THE CURRENT ADDRESS
+        // and `resb` is left behind as a bare directive on its own: the global
+        // would point into the middle of the code, nothing would be reserved,
+        // and every write through it would overwrite an instruction.
+        if (g_bss) { fprintf(fout, "%s resb %d\n", asm_sym(g->name), sz); return; }
         fprintf(fout, "%s:", asm_sym(g->name));
         for (int i = 0; i < sz; i++) {
             if (i % 32 == 0) fputs(i ? "\n db " : " db ", fout);
