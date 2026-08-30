@@ -19,6 +19,28 @@ int main() {
 
     puts("nano-os interrupt bring-up\n");
 
+    // 0. the machine state C was handed.
+    //
+    // Multiboot specifies that on entry VM is zero, IF is zero, and EVERY
+    // OTHER BIT OF EFLAGS IS UNDEFINED -- which includes the direction flag.
+    // boot32.s clears it before its `rep stosl`, because with DF set that
+    // instruction walks DOWN from the page-table pages, leaves them full of
+    // whatever was there, and the CPU follows garbage into a triple fault with
+    // no IDT to report it: a silent reboot and not one byte of output.
+    //
+    // Checked here rather than trusted, because it is a one-instruction fix
+    // whose absence is invisible until the day it is not. The System V ABI
+    // wants DF clear on entry to every function too, so this is also the
+    // assertion that the compiler's string operations, if it ever emits any,
+    // will run the right way.
+    {
+        long fl;
+        fl = read_eflags();
+        printf("eflags on entry to C: 0x%x\n", fl);
+        if (fl & 0x400) puts("DIRECTION FLAG IS SET\n");
+        else puts("direction flag clear\n");
+    }
+
     interrupts_init(100);                  // 100 Hz
     printf("PIT programmed for %d Hz\n", g_hz);
 

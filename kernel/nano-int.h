@@ -23,6 +23,7 @@ extern void cli_();
 extern void sti_();
 extern void cpu_idle();
 extern void cpu_halt_forever();
+extern long read_eflags();
 extern long read_cr2();
 extern long read_cr3();
 extern long read_rsp();

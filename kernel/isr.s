@@ -293,6 +293,19 @@ cpu_halt_forever:
 1:  hlt
     jmp 1b
 
+/* long read_eflags(void) — so the kernel can check its own machine state.
+ *
+ * Exists for one assertion: that the direction flag is CLEAR by the time C
+ * runs. Multiboot leaves DF undefined on entry, the System V ABI requires it
+ * clear on entry to every function, and a string instruction that runs
+ * backwards is the kind of fault that leaves no output at all. boot32.s clears
+ * it; this is how a test says so. */
+.globl read_eflags
+read_eflags:
+    pushfq
+    pop %rax
+    ret
+
 /* long read_cr2(void) — the faulting address, for a page fault. */
 .globl read_cr2
 read_cr2:

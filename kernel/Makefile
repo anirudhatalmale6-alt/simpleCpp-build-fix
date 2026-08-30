@@ -499,7 +499,9 @@ intrtest: intr.elf
 	   -serial file:intr-serial.log -monitor stdio >/dev/null 2>&1; \
 	 echo "---- serial output ----"; cat intr-serial.log; echo "-----------------------"; \
 	 tr -d '\r' < intr-serial.log > intr-serial.clean; \
-	 grep -q "timer ok" intr-serial.clean \
+	 grep -q "direction flag clear" intr-serial.clean \
+	   && ! grep -q "DIRECTION FLAG IS SET" intr-serial.clean \
+	   && grep -q "timer ok" intr-serial.clean \
 	   && grep -q "idle ok" intr-serial.clean \
 	   && grep -q "EXCEPTION 14: page fault" intr-serial.clean \
 	   && grep -q "page not present, on a write, from kernel mode" intr-serial.clean \

@@ -27,6 +27,31 @@
 .globl _start
 _start:
     cli
+
+    /* Clear the direction flag before anything else.
+     *
+     * Multiboot specifies the machine state on entry and it is explicit about
+     * this: VM must be zero, IF must be zero, and EVERY OTHER BIT OF EFLAGS IS
+     * UNDEFINED. DF is one of those. So `rep stosl` below is not guaranteed to
+     * count upwards -- with DF set it walks DOWN from EDI, zeroing 0x0004
+     * upwards to 0x1000 instead of the two page-table pages, and the CPU then
+     * follows whatever garbage is left in them. With no IDT yet that is a
+     * triple fault: a silent reboot, no output, nothing to read.
+     *
+     * That failure was reproduced deliberately. QEMU's loader happens to leave
+     * DF clear and happens to leave those pages already zeroed, so the bug was
+     * latent and the machine booted anyway -- but only because of two
+     * coincidences, either of which could stop being true. Dirtying the pages
+     * first and setting DF gives exactly the silent death described above.
+     *
+     * It is also an ABI matter and not only a boot one. The System V ABI
+     * requires DF clear on entry to every function, so anything the compiler
+     * emits as a string operation would run backwards. isr.s already clears it
+     * on the way into C from an interrupt; this covers the path before the
+     * first interrupt ever fires.
+     */
+    cld
+
     mov $0x90000, %esp
 
     /* The Multiboot loader leaves the address of its information structure in

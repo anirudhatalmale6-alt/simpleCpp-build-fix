@@ -2669,3 +2669,67 @@ was wrong, and the test went red on a perfectly good measurement. Which of the
 two wins by more is a fact about this machine on this day, so it is **printed**.
 What is asserted is only what is actually claimed: hoisting beats per-pixel
 checking, and batching beats the baseline.
+
+## The direction flag: a one-instruction bug that had never fired
+
+`boot32.s` zeroes the two page-table pages with `rep stosl` and never cleared
+the direction flag first. `stosl` steps EDI up or down depending on DF, and
+**Multiboot explicitly leaves DF undefined** — its machine-state section
+guarantees exactly two things about EFLAGS, that VM is zero and IF is zero, and
+says every other bit is undefined.
+
+### Proving it, which took two attempts
+
+The obvious experiment is to set DF and boot. That **passed**. Everything
+worked.
+
+Two coincidences were covering for it: QEMU's loader happens to leave DF clear,
+*and* it happens to leave those pages already zeroed — so the `rep stosl` was
+agreeing with memory rather than changing it, and the direction it agreed in did
+not matter.
+
+So the pages were dirtied with `0xFFFFFFFF` first, to make the zeroing do real
+work:
+
+```
+DF clear, pages dirtied:   boots, PASS
+DF set,   pages dirtied:   not one byte of serial output
+```
+
+With DF set, the `rep stosl` walks **down** from 0x1000 and zeroes 0x0004 up to
+0x1000 instead — the real-mode interrupt vector table and the BIOS data area,
+which is incidentally where the EBDA pointer at 0x40E lives that the linebench
+image tripped over. The two page-table pages keep their garbage, the CPU follows
+it, and with no IDT installed yet that is a triple fault. Silent: no output, no
+fault report, just a machine that stops. Exactly the failure mode this file's
+own comments already worry about for the framebuffer mapping.
+
+So the bug was **latent, not harmless**. It survives on this emulator today and
+stops surviving the moment either coincidence changes.
+
+### The fix, and its blast radius
+
+`cld` is now the first instruction after `cli`, covering the whole file rather
+than that one `rep`. And `rep stosl` in `boot32.s` turns out to be the **only
+string instruction in the entire tree** — `isr.s` already does `cld` before
+calling into C, with a comment saying the ABI wants it, so after the first
+interrupt the flag was being fixed anyway. The window was boot to first
+interrupt, and nothing in it happened to care.
+
+It is an ABI point as much as a boot one, and that is the part that could bite
+later: System V requires DF clear on entry to every function. Nothing in the
+tree emits string operations from C *today*, but that is a fact about the
+current compiler output, not a guarantee — gcc will emit `rep movsb` for a large
+struct copy without being asked.
+
+### A standing check, because "it works now" is how this stayed hidden
+
+`read_eflags` in `isr.s`, printed and gated on by `intrtest`:
+
+```
+eflags on entry to C: 0x46
+direction flag clear
+```
+
+Verified by replacing the `cld` with `std`: the test goes red on that specific
+line rather than passing by luck.
