@@ -151,3 +151,14 @@ glapi.elf
 glapik.o
 sabotage-glapi.log
 sabotage-glapi.log.clean
+
+# The texture image. nano-gl.h's texture code and gltex.c are sources; gltex.png
+# and gltex-live.png are kept because the README shows them.
+gltex.s
+blob-gltex.s
+gltex64.elf
+gltex64.bin
+gltex.elf
+gltexk.o
+sabotage-gltex.log
+sabotage-gltex.log.clean

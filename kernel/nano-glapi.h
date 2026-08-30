@@ -55,6 +55,7 @@
 #define GL_CULL_FACE      0x0B44
 #define GL_LIGHTING       0x0B50
 #define GL_DEPTH_TEST     0x0B71
+#define GL_TEXTURE_2D     0x0DE1
 
 // GL guarantees at least 32 modelview and 2 projection. A scenegraph walk
 // pushes once per level, so the modelview depth is the one that has to be
@@ -74,9 +75,15 @@ struct GlState {
     long prim;                 // current glBegin mode, or -1
     long total;                // vertices seen since glBegin
     long nv;                   // vertices currently held in vbuf
-    struct V3 vbuf[4];         // the running window -- four is enough for a
-                               // quad strip, which is the widest primitive
-    struct V3 first;           // fan / loop / polygon anchor
+    // The running window of buffered vertices -- four is enough for a quad
+    // strip, which is the widest primitive. struct Vtx and not struct V3,
+    // because a vertex is a position AND a texture coordinate and the two must
+    // not be able to drift apart: keeping them in parallel arrays is how a
+    // strip ends up drawing the right shape with the wrong texture on it.
+    struct Vtx vbuf[4];
+    struct Vtx first;          // fan / loop / polygon anchor
+    long cs;                   // the current glTexCoord2x
+    long ct;
     long colour;
     long nvalid;               // a normal was given since the last glEnd
     struct V3 nrm;             // ...in model space
@@ -264,6 +271,7 @@ void glEnable(struct GlState *st, long cap) {
     if (cap == GL_CULL_FACE)  st->c->cull = 1;
     if (cap == GL_DEPTH_TEST) st->c->depth = 1;
     if (cap == GL_LIGHTING)   st->c->lighting = 1;
+    if (cap == GL_TEXTURE_2D) st->c->texturing = 1;
 }
 
 void glDisable(struct GlState *st, long cap) {
@@ -271,6 +279,56 @@ void glDisable(struct GlState *st, long cap) {
     if (cap == GL_CULL_FACE)  st->c->cull = 0;
     if (cap == GL_DEPTH_TEST) st->c->depth = 0;
     if (cap == GL_LIGHTING)   st->c->lighting = 0;
+    if (cap == GL_TEXTURE_2D) st->c->texturing = 0;
+}
+
+// ---------- texture objects ----------
+
+// glGenTextures, one at a time. The real one fills an array; nano_cc has no
+// trouble with that, but returning the name is what every call site actually
+// wants and it makes the failure case (no free slot) a value rather than a
+// silent zero.
+long glGenTexture() {
+    long i;
+    i = 0;
+    while (i < GL_MAXTEX) {
+        if (!g_tex[i].used) { g_tex[i].used = 1; g_tex[i].pix = 0; return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+void glBindTexture(struct GlState *st, long target, long name) {
+    if (!st->c || target != GL_TEXTURE_2D) return;
+    st->c->tex = name;
+}
+
+// glTexImage2D, with four of its nine arguments dropped.
+//
+// The real signature is (target, level, internalformat, width, height, border,
+// format, type, pixels). Six of those describe a conversion this renderer does
+// not do -- there is exactly one texel format here, the same packed RGB the
+// window backing buffer holds -- and nine arguments is three past nano_cc's
+// ceiling anyway. So the name is GL's and the argument list is not, which is
+// worth stating rather than hoping nobody compares.
+//
+// `pixels` is NOT copied. The caller owns it, exactly as GL does not own the
+// pointer you hand it, and the texture is only valid while that memory is.
+long glTexImage2D(struct GlState *st, long w, long h, long *pixels) {
+    long name;
+    if (!st->c) return 0;
+    name = st->c->tex;
+    if (name < 0 || name >= GL_MAXTEX || !g_tex[name].used) return 0;
+    // Powers of two only, and REJECTED rather than rounded. Rounding would
+    // give a texture that samples wrongly everywhere, which looks like a bug
+    // in the mapping rather than a bug in the upload.
+    if (!gl_pow2(w) || !gl_pow2(h) || w < 1 || h < 1) return 0;
+    g_tex[name].w = w;
+    g_tex[name].h = h;
+    g_tex[name].wmask = w - 1;
+    g_tex[name].hmask = h - 1;
+    g_tex[name].pix = pixels;
+    return 1;
 }
 
 // ---------- lines and points, in view space ----------
@@ -287,8 +345,19 @@ void gl_seg_view(struct GLCtx *c, struct V3 *a, struct V3 *b, long colour) {
     p = *a;
     q = *b;
     if (p.z < c->near && q.z < c->near) return;
-    if (p.z < c->near) { struct V3 t; gl_clip_edge(c, &t, &q, &p); p = t; }
-    else if (q.z < c->near) { struct V3 t; gl_clip_edge(c, &t, &p, &q); q = t; }
+    // gl_clip_edge works on a Vtx because a clipped TRIANGLE has to carry its
+    // texture coordinate across the cut. A line has none, so the wrapping is
+    // just noise -- but sharing the clipper is right anyway: two copies of a
+    // near-plane interpolation is two chances to get the sign wrong.
+    if (p.z < c->near || q.z < c->near) {
+        struct Vtx vp;
+        struct Vtx vq;
+        struct Vtx o;
+        vp.p = p; vp.s = 0; vp.t = 0;
+        vq.p = q; vq.s = 0; vq.t = 0;
+        if (p.z < c->near) { gl_clip_edge(c, &o, &vq, &vp); p = o.p; }
+        else               { gl_clip_edge(c, &o, &vp, &vq); q = o.p; }
+    }
 
     if (!gl_project(c, &p, &ax, &ay, &az)) return;
     if (!gl_project(c, &q, &bx, &by, &bz)) return;
@@ -324,6 +393,17 @@ void glNormal3x(struct GlState *st, long x, long y, long z) {
     st->nvalid = 1;
 }
 
+// glTexCoord2x. Like glColor and glNormal, this is CURRENT STATE: it applies
+// to every vertex issued after it until it is changed, and each vertex carries
+// away its own copy. That is what makes `texcoord; vertex; texcoord; vertex`
+// work, and it is why the coordinate is stored into the vertex buffer rather
+// than read again when the triangle completes -- by then the caller has moved
+// on and set the next one.
+void glTexCoord2x(struct GlState *st, long s, long t) {
+    st->cs = s;
+    st->ct = t;
+}
+
 void glBegin(struct GlState *st, long mode) {
     if (st->prim >= 0) { st->overflow = st->overflow + 1; return; }
     st->prim = mode;
@@ -339,9 +419,15 @@ void glBegin(struct GlState *st, long mode) {
     }
 }
 
-// Hand three view-space vertices to the rasteriser, with the current colour
-// and, if one was given, the current normal transformed into view space.
-void gl_emit_tri(struct GlState *st, struct V3 *a, struct V3 *b, struct V3 *c) {
+// Hand three vertices to the rasteriser, with the current colour and, if one
+// was given, the current normal transformed into view space.
+//
+// The texture coordinates go onto the context here, in the same order as the
+// vertices. Every caller below passes the SAME struct Vtx it stored the
+// position in, so a triangle cannot end up with one vertex's position and
+// another's texture coordinate -- which is the failure mode of keeping them in
+// two parallel arrays and indexing them separately.
+void gl_emit_tri(struct GlState *st, struct Vtx *a, struct Vtx *b, struct Vtx *c) {
     if (!st->c) return;
     if (st->nvalid) {
         struct V3 n;
@@ -351,22 +437,30 @@ void gl_emit_tri(struct GlState *st, struct V3 *a, struct V3 *b, struct V3 *c) {
     } else {
         st->c->nvalid = 0;
     }
+    st->c->vs[0] = a->s; st->c->vt[0] = a->t;
+    st->c->vs[1] = b->s; st->c->vt[1] = b->t;
+    st->c->vs[2] = c->s; st->c->vt[2] = c->t;
     st->tris = st->tris + 1;
-    gl_tri_view(st->c, a, b, c, st->colour);
+    gl_tri_view(st->c, &a->p, &b->p, &c->p, st->colour);
 }
 
 void glVertex3x(struct GlState *st, long x, long y, long z) {
     struct V3 m;
-    struct V3 p;
+    struct Vtx p;
 
     if (st->prim < 0 || !st->c) return;
     m.x = x; m.y = y; m.z = z;
     // Model space to view space, once, here -- exactly where OpenGL does it.
-    m4_apply(&p, &st->mv[st->mvsp], &m);
+    m4_apply(&p.p, &st->mv[st->mvsp], &m);
+    // The texture coordinate is snapshotted onto the vertex NOW, not read
+    // later. glTexCoord is current state and the caller will have changed it
+    // by the time this vertex completes a triangle.
+    p.s = st->cs;
+    p.t = st->ct;
     st->verts = st->verts + 1;
 
     if (st->prim == GL_POINTS) {
-        gl_point_view(st->c, &p, st->colour);
+        gl_point_view(st->c, &p.p, st->colour);
         st->points = st->points + 1;
         st->total = st->total + 1;
         return;
@@ -375,7 +469,7 @@ void glVertex3x(struct GlState *st, long x, long y, long z) {
     if (st->prim == GL_LINES) {
         if (st->nv == 0) { st->vbuf[0] = p; st->nv = 1; }
         else {
-            gl_seg_view(st->c, &st->vbuf[0], &p, st->colour);
+            gl_seg_view(st->c, &st->vbuf[0].p, &p.p, st->colour);
             st->lines = st->lines + 1;
             st->nv = 0;
         }
@@ -386,7 +480,7 @@ void glVertex3x(struct GlState *st, long x, long y, long z) {
     if (st->prim == GL_LINE_STRIP || st->prim == GL_LINE_LOOP) {
         if (st->total == 0) { st->vbuf[0] = p; st->first = p; }
         else {
-            gl_seg_view(st->c, &st->vbuf[0], &p, st->colour);
+            gl_seg_view(st->c, &st->vbuf[0].p, &p.p, st->colour);
             st->lines = st->lines + 1;
             st->vbuf[0] = p;
         }
@@ -465,7 +559,7 @@ void glVertex3x(struct GlState *st, long x, long y, long z) {
 
 void glEnd(struct GlState *st) {
     if (st->prim == GL_LINE_LOOP && st->total > 2 && st->c) {
-        gl_seg_view(st->c, &st->vbuf[0], &st->first, st->colour);
+        gl_seg_view(st->c, &st->vbuf[0].p, &st->first.p, st->colour);
         st->lines = st->lines + 1;
     }
     st->prim = -1;
@@ -579,6 +673,8 @@ void gl_state_init(struct GlState *st, struct GLCtx *c) {
     st->prim = -1;
     st->total = 0;
     st->nv = 0;
+    st->cs = 0;
+    st->ct = 0;
     st->colour = rgb(200, 200, 200);
     st->nvalid = 0;
     st->verts = 0;

@@ -290,6 +290,58 @@ void v3_norm(struct V3 *o, struct V3 *a) {
     o->z = fx_div(a->z, l);
 }
 
+// ---------- textures ----------
+//
+// Power-of-two only, which is not a shortcut: OpenGL 1.1 required it too, and
+// it is what lets GL_REPEAT be a bitwise AND instead of a modulo. A modulo per
+// pixel on a machine with no divider worth the name is the difference between
+// a textured floor and a slideshow.
+//
+// One format, 32-bit packed RGB, the same thing the window backing buffer
+// holds. There is no conversion anywhere in the pipeline.
+
+#define GL_MAXTEX 8
+
+struct Texture {
+    long used;
+    long w;
+    long h;
+    long wmask;            // w - 1, valid because w is a power of two
+    long hmask;
+    long *pix;
+};
+
+struct Texture g_tex[GL_MAXTEX];
+
+void gl_tex_init() {
+    long i;
+    i = 0;
+    while (i < GL_MAXTEX) { g_tex[i].used = 0; g_tex[i].pix = 0; i = i + 1; }
+}
+
+long gl_pow2(long v) {
+    long p;
+    p = 1;
+    while (p < v) p = p << 1;
+    return p == v;
+}
+
+// Fetch a texel. s and t are 16.16 texture coordinates, and they may be
+// anything at all -- negative, or far outside [0,1].
+//
+// The wrap is `& mask` on a value that has already been arithmetic-shifted
+// down. That is correct for negatives too and it is worth saying why, because
+// it looks like it should not be: -1 in two's complement is all ones, so
+// (-1 & 63) is 63, which is exactly the texel GL_REPEAT asks for at s = -1/64.
+// Writing it as a modulo would give -1 and index out of the array.
+long gl_texel(struct Texture *t, long s, long tt) {
+    long u;
+    long v;
+    u = ((s * t->w) >> GL_FRAC) & t->wmask;
+    v = ((tt * t->h) >> GL_FRAC) & t->hmask;
+    return t->pix[v * t->w + u];
+}
+
 // ---------- the context, bound to a window ----------
 
 #define GL_MAXW 640
@@ -322,6 +374,22 @@ struct GLCtx {
     long cull;             // GL_CULL_FACE
     long depth;            // GL_DEPTH_TEST
     long lighting;         // GL_LIGHTING
+    long texturing;        // GL_TEXTURE_2D
+    long tex;              // bound texture, or -1
+
+    // The texture coordinates of the triangle about to be drawn, one pair per
+    // vertex, in the same order as the vertices. On the context rather than in
+    // the signature for the usual reason: gl_tri_view already takes five
+    // arguments and nano_cc's ceiling is six.
+    long vs[3];
+    long vt[3];
+
+    // ...and, after projection, s/z and t/z per vertex, which is what actually
+    // gets interpolated. Kept as the FULL 32.32 product with no shift: the
+    // precision here is what perspective-correct texturing lives or dies on,
+    // and 64 bits is what the machine has.
+    long rs[3];
+    long rt[3];
 
     struct V3 light;       // unit direction, view space
 
@@ -414,6 +482,10 @@ long gl_bind(struct GLCtx *c, long win, long x, long y, long w, long h) {
     c->cull = 1;
     c->depth = 1;
     c->lighting = 1;
+    c->texturing = 0;
+    c->tex = -1;
+    c->vs[0] = 0; c->vs[1] = 0; c->vs[2] = 0;
+    c->vt[0] = 0; c->vt[1] = 0; c->vt[2] = 0;
     c->wire = 0;
     c->bg = rgb(12, 14, 22);
     c->light.x = 0; c->light.y = 0; c->light.z = 0 - GL_ONE;
@@ -530,6 +602,32 @@ void gl_tri_raster(struct GLCtx *c, long *sx, long *sy, long *iz, long colour) {
     long minx; long miny; long maxx; long maxy;
     long area;
     long y;
+    long textured;
+    long cr; long cg; long cb;
+    struct Texture *tx;
+
+    // The texture, and the colour it is modulated by, hoisted out of the loop.
+    // GL's default texture environment is GL_MODULATE: the fragment is the
+    // texel times the primary colour, which here already carries the lighting
+    // term. So a white primary colour gives the texel lit, and a tinted one
+    // tints it -- the same behaviour, from the same arithmetic.
+    textured = 0;
+    tx = &g_tex[0];
+    // `pix` and not just `used`. glGenTexture marks a name used before
+    // anything has been uploaded to it, which is exactly what GL does -- a
+    // name exists from the moment it is generated -- so a program that binds a
+    // name and draws before calling glTexImage2D is doing something ordinary
+    // and slightly wrong. Without this test it reads through a null pointer
+    // and takes the machine down with a page fault at address 0. Found by a
+    // test that did precisely that on purpose.
+    if (c->texturing && c->tex >= 0 && c->tex < GL_MAXTEX &&
+        g_tex[c->tex].used && g_tex[c->tex].pix) {
+        textured = 1;
+        tx = &g_tex[c->tex];
+    }
+    cr = (colour >> 16) & 255;
+    cg = (colour >> 8) & 255;
+    cb = colour & 255;
 
     minx = sx[0]; if (sx[1] < minx) minx = sx[1]; if (sx[2] < minx) minx = sx[2];
     maxx = sx[0]; if (sx[1] > maxx) maxx = sx[1]; if (sx[2] > maxx) maxx = sx[2];
@@ -568,7 +666,38 @@ void gl_tri_raster(struct GLCtx *c, long *sx, long *sy, long *iz, long colour) {
                 // same pixel.
                 if (d >= c->izfar && (!c->depth || d > c->zbuf[idx])) {
                     c->zbuf[idx] = d;
-                    gl_put(c, x, y, colour);
+                    if (textured) {
+                        long uoz;
+                        long voz;
+                        long texel;
+                        // PERSPECTIVE CORRECTION, and the whole reason it is
+                        // done this way. s and t are not linear in screen
+                        // space; s/z and t/z are, and so is 1/z. So
+                        // interpolate those three and divide at the end.
+                        //
+                        // Interpolating s directly is the cheap way and it is
+                        // what gave the PlayStation 1 its swimming floors: a
+                        // quad split along one diagonal renders differently
+                        // from the same quad split along the other. There is a
+                        // test for exactly that, because it is an invariant
+                        // rather than something to judge from a screenshot.
+                        uoz = (w0 * c->rs[0] + w1 * c->rs[1] + w2 * c->rs[2]) / area;
+                        voz = (w0 * c->rt[0] + w1 * c->rt[1] + w2 * c->rt[2]) / area;
+                        // rs is the full 32.32 product of s and 1/z, and d is
+                        // 1/z in 16.16, so this quotient is s in 16.16 with no
+                        // shift. Shifting the product down to 16.16 first
+                        // would throw away exactly the bits that matter for a
+                        // distant surface, where 1/z is small.
+                        if (d != 0) {
+                            texel = gl_texel(tx, uoz / d, voz / d);
+                            gl_put(c, x, y,
+                                   rgb(((texel >> 16) & 255) * cr / 255,
+                                       ((texel >> 8) & 255) * cg / 255,
+                                       (texel & 255) * cb / 255));
+                        }
+                    } else {
+                        gl_put(c, x, y, colour);
+                    }
                 }
             }
             x = x + 1;
@@ -595,28 +724,47 @@ long gl_shade(struct GLCtx *c, struct V3 *n, long base) {
     return rgb(r, g, b);
 }
 
+// A vertex as it moves through the back of the pipeline: a position and a
+// texture coordinate, travelling together.
+//
+// They HAVE to travel together, and that is the whole reason this struct
+// exists. The near-plane clipper cuts an edge partway and invents a new
+// vertex; if it interpolates the position but not the texture coordinate, the
+// new vertex gets whatever was in the slot before, and a wall smears sideways
+// the moment one of its corners passes behind the camera. That is a bug that
+// only appears when you walk INTO something, which is exactly when nobody is
+// looking at the far corner of the screen.
+struct Vtx {
+    struct V3 p;
+    long s;
+    long t;
+};
+
 // One triangle, already in VIEW space. Handles the near plane by clipping
 // rather than rejecting: rejecting is easier and makes geometry vanish in whole
 // faces as it approaches the camera, which looks like a bug in the renderer.
 void gl_tri_view(struct GLCtx *c, struct V3 *a, struct V3 *b, struct V3 *v, long base);
 
-// Interpolate to the near plane between p (inside) and q (outside).
-void gl_clip_edge(struct GLCtx *c, struct V3 *o, struct V3 *p, struct V3 *q) {
+// Interpolate to the near plane between p (inside) and q (outside) -- position
+// and texture coordinate both, by the same parameter.
+void gl_clip_edge(struct GLCtx *c, struct Vtx *o, struct Vtx *p, struct Vtx *q) {
     long t;
-    t = fx_div(c->near - p->z, q->z - p->z);
-    o->x = p->x + fx_mul(q->x - p->x, t);
-    o->y = p->y + fx_mul(q->y - p->y, t);
-    o->z = c->near;
+    t = fx_div(c->near - p->p.z, q->p.z - p->p.z);
+    o->p.x = p->p.x + fx_mul(q->p.x - p->p.x, t);
+    o->p.y = p->p.y + fx_mul(q->p.y - p->p.y, t);
+    o->p.z = c->near;
+    o->s = p->s + fx_mul(q->s - p->s, t);
+    o->t = p->t + fx_mul(q->t - p->t, t);
 }
 
-void gl_tri_project(struct GLCtx *c, struct V3 *a, struct V3 *b, struct V3 *v,
+void gl_tri_project(struct GLCtx *c, struct Vtx *a, struct Vtx *b, struct Vtx *v,
                     long colour) {
     long sx[3];
     long sy[3];
     long iz[3];
-    if (!gl_project(c, a, &sx[0], &sy[0], &iz[0])) return;
-    if (!gl_project(c, b, &sx[1], &sy[1], &iz[1])) return;
-    if (!gl_project(c, v, &sx[2], &sy[2], &iz[2])) return;
+    if (!gl_project(c, &a->p, &sx[0], &sy[0], &iz[0])) return;
+    if (!gl_project(c, &b->p, &sx[1], &sy[1], &iz[1])) return;
+    if (!gl_project(c, &v->p, &sx[2], &sy[2], &iz[2])) return;
 
     if (c->wire) {
         gl_line(c, sx[0], sy[0], sx[1], sy[1], colour);
@@ -624,6 +772,13 @@ void gl_tri_project(struct GLCtx *c, struct V3 *a, struct V3 *b, struct V3 *v,
         gl_line(c, sx[2], sy[2], sx[0], sy[0], colour);
         return;
     }
+
+    // s/z and t/z, as full 64-bit products with no shift. These are the
+    // quantities that ARE linear in screen space; s and t themselves are not.
+    c->rs[0] = a->s * iz[0]; c->rt[0] = a->t * iz[0];
+    c->rs[1] = b->s * iz[1]; c->rt[1] = b->t * iz[1];
+    c->rs[2] = v->s * iz[2]; c->rt[2] = v->t * iz[2];
+
     gl_tri_raster(c, sx, sy, iz, colour);
 }
 
@@ -631,6 +786,9 @@ void gl_tri_view(struct GLCtx *c, struct V3 *a, struct V3 *b, struct V3 *v, long
     struct V3 e0;
     struct V3 e1;
     struct V3 n;
+    struct Vtx va;
+    struct Vtx vb;
+    struct Vtx vc;
     long inside;
     long colour;
 
@@ -654,12 +812,20 @@ void gl_tri_view(struct GLCtx *c, struct V3 *a, struct V3 *b, struct V3 *v, long
     colour = (c->wire || !c->lighting) ? base
                                        : gl_shade(c, c->nvalid ? &c->nrm : &n, base);
 
+    va.p = *a; va.s = c->vs[0]; va.t = c->vt[0];
+    vb.p = *b; vb.s = c->vs[1]; vb.t = c->vt[1];
+    vc.p = *v; vc.s = c->vs[2]; vc.t = c->vt[2];
+
     inside = 0;
     if (a->z >= c->near) inside = inside + 1;
     if (b->z >= c->near) inside = inside + 2;
     if (v->z >= c->near) inside = inside + 4;
 
-    if (inside == 7) { c->tris_drawn = c->tris_drawn + 1; gl_tri_project(c, a, b, v, colour); return; }
+    if (inside == 7) {
+        c->tris_drawn = c->tris_drawn + 1;
+        gl_tri_project(c, &va, &vb, &vc, colour);
+        return;
+    }
     if (inside == 0) { c->tris_clipped = c->tris_clipped + 1; return; }
 
     c->tris_clipped = c->tris_clipped + 1;
@@ -668,26 +834,26 @@ void gl_tri_view(struct GLCtx *c, struct V3 *a, struct V3 *b, struct V3 *v, long
     // cases -- one vertex in, or two. Writing all six cases out is where the
     // sign errors live.
     {
-        struct V3 p0;
-        struct V3 p1;
-        struct V3 p2;
+        struct Vtx p0;
+        struct Vtx p1;
+        struct Vtx p2;
         long one_in;
-        if (inside == 1 || inside == 6) { p0 = *a; p1 = *b; p2 = *v; one_in = (inside == 1); }
-        else if (inside == 2 || inside == 5) { p0 = *b; p1 = *v; p2 = *a; one_in = (inside == 2); }
-        else { p0 = *v; p1 = *a; p2 = *b; one_in = (inside == 4); }
+        if (inside == 1 || inside == 6) { p0 = va; p1 = vb; p2 = vc; one_in = (inside == 1); }
+        else if (inside == 2 || inside == 5) { p0 = vb; p1 = vc; p2 = va; one_in = (inside == 2); }
+        else { p0 = vc; p1 = va; p2 = vb; one_in = (inside == 4); }
 
         if (one_in) {
             // p0 inside, p1 and p2 out: one triangle.
-            struct V3 q1;
-            struct V3 q2;
+            struct Vtx q1;
+            struct Vtx q2;
             gl_clip_edge(c, &q1, &p0, &p1);
             gl_clip_edge(c, &q2, &p0, &p2);
             c->tris_drawn = c->tris_drawn + 1;
             gl_tri_project(c, &p0, &q1, &q2, colour);
         } else {
             // p0 outside, p1 and p2 in: a quad, as two triangles.
-            struct V3 q1;
-            struct V3 q2;
+            struct Vtx q1;
+            struct Vtx q2;
             gl_clip_edge(c, &q1, &p1, &p0);
             gl_clip_edge(c, &q2, &p2, &p0);
             c->tris_drawn = c->tris_drawn + 2;

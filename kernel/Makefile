@@ -31,7 +31,8 @@ QFLAGS := -kernel kernel.elf -no-reboot
         wmin wminrun wmintest wminshot wminlive \
         ui uirun uitest uishot uilive \
         gl glrun gltest glshot gllive \
-        glapi glapirun glapitest glapishot glapilive clean
+        glapi glapirun glapitest glapishot glapilive \
+        gltex gltexrun gltextest gltexshot gltexlive clean
 
 all: kernel.elf
 
@@ -1074,6 +1075,74 @@ glapilive: glapi.elf
 	 timeout 260 $(QEMU) -kernel glapi.elf -no-reboot -display none \
 	   -serial file:glapi-live.log -monitor stdio >/dev/null 2>&1
 	@convert glapi-live.ppm glapi-live.png && echo "wrote glapi-live.png"
+
+# ---------------------------------------------------------------------------
+# gltex -- textures, and the one thing that separates "draws coloured
+# triangles" from "draws a scene": mapping them CORRECTLY. s and t are not
+# linear in screen space; s/z, t/z and 1/z are. Interpolating s directly is
+# what gave the PlayStation 1 its swimming floors.
+# ---------------------------------------------------------------------------
+gltex.s: gltex.c nano-kernel.h nano-mouse.h nano-int.h nano-fb.h nano-font.h \
+      nano-mm.h nano-wm.h nano-wmin.h nano-term.h nano-ui.h nano-gl.h \
+      nano-glapi.h $(NANO)
+	$(NANO) --kernel gltex.c gltex.s
+
+gltex64.bin: boot64.s isr.s gltex.s kernel64.ld
+	as --64 boot64.s -o boot64.o
+	as --64 isr.s    -o isr.o
+	as --64 gltex.s  -o gltexk.o
+	ld -T kernel64.ld -o gltex64.elf boot64.o isr.o gltexk.o
+	objcopy -O binary gltex64.elf gltex64.bin
+
+blob-gltex.s:
+	@printf '.section .blob, "a"\n.incbin "gltex64.bin"\n' > $@
+
+gltex.elf: boot32.s blob-gltex.s gltex64.bin final.ld
+	as --32 boot32.s     -o boot32.o
+	as --32 blob-gltex.s -o blob-gltex.o
+	ld -m elf_i386 -T final.ld -o gltex.elf boot32.o blob-gltex.o
+
+gltex: gltex.elf
+
+gltexrun: gltex.elf
+	$(QEMU) -kernel gltex.elf -no-reboot
+
+gltextest: gltex.elf
+	@rm -f gltex-serial.log
+	@( sleep 150; echo quit ) | \
+	 timeout 220 $(QEMU) -kernel gltex.elf -no-reboot -display none \
+	   -serial file:gltex-serial.log -monitor stdio >/dev/null 2>&1; \
+	 echo "---- serial output ----"; cat gltex-serial.log; echo "-----------------------"; \
+	 tr -d '\r' < gltex-serial.log > gltex-serial.clean; \
+	 grep -q "GLTEXTEST DONE" gltex-serial.clean \
+	   && ! grep -q "FAIL" gltex-serial.clean \
+	   && grep -q "PASS: textures, mapped correctly" gltex-serial.clean \
+	   && echo "PASS: perspective-correct textures, checked against a closed form" \
+	   || { echo "FAIL"; exit 1; }
+
+gltexshot: gltex.elf
+	@rm -f gltex.ppm gltex.png
+	@( sleep 158; echo "screendump gltex.ppm"; sleep 2; echo quit ) | \
+	 timeout 230 $(QEMU) -kernel gltex.elf -no-reboot -display none \
+	   -serial file:gltex-serial.log -monitor stdio >/dev/null 2>&1
+	@convert gltex.ppm gltex.png && echo "wrote gltex.png"
+
+# Driven through the real emulated mouse. Every step is at most 120 pixels
+# because a PS/2 packet carries ONE SIGNED BYTE of motion per axis -- a larger
+# "move" is a packet with the overflow bit set, which the decoder drops.
+gltexlive: gltex.elf
+	@rm -f gltex-live.ppm gltex-live.png
+	@( sleep 155; \
+	   for i in 1 2 3 4 5 6; do echo "mouse_move -120 -120"; sleep 1; done; \
+	   echo "mouse_move 120 120"; sleep 1; \
+	   echo "mouse_move 40 60";   sleep 1; \
+	   echo "mouse_button 1"; sleep 1; \
+	   echo "mouse_move 20 6";    sleep 1; \
+	   echo "mouse_button 0"; sleep 3; \
+	   echo "screendump gltex-live.ppm"; sleep 2; echo quit ) | \
+	 timeout 260 $(QEMU) -kernel gltex.elf -no-reboot -display none \
+	   -serial file:gltex-live.log -monitor stdio >/dev/null 2>&1
+	@convert gltex-live.ppm gltex-live.png && echo "wrote gltex-live.png"
 
 clean:
 	@# NOT user/*.s -- ustart.s is a source file, and the generated ones are

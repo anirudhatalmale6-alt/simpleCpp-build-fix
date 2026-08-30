@@ -2294,3 +2294,156 @@ is what `glPushMatrix`/`glPopMatrix` and the model-space frustum planes were
 built for. And still outstanding from K15: the in-OS compile, which needs the
 process/filesystem stack and the window manager in one image plus syscalls for
 open-a-window, blit and present.
+
+## K17 — textures, and the difference between mapping them and mapping them right
+
+```
+make gltex        # build
+make gltexrun     # boot it with a window
+make gltextest    # headless, checks everything below
+make gltexshot    # boot and screenshot
+make gltexlive    # drive the real emulated mouse
+```
+
+![a textured floor and textured cubes](gltex.png)
+
+### The whole milestone is one word: *correctly*
+
+Interpolating texture coordinates linearly across a triangle is easy — three
+additions per pixel — and it is wrong. `s` and `t` are not linear in screen
+space. `s/z`, `t/z` and `1/z` are. So those three get interpolated and the
+divide happens per pixel:
+
+```c
+uoz = (w0 * rs[0] + w1 * rs[1] + w2 * rs[2]) / area;
+voz = (w0 * rt[0] + w1 * rt[1] + w2 * rt[2]) / area;
+texel = gl_texel(tx, uoz / d, voz / d);       /* d is the interpolated 1/z */
+```
+
+`rs` is the **full 64-bit product** of `s` and `1/z`, deliberately not shifted
+back down to 16.16. That shift is the obvious way to write it and it throws
+away exactly the bits that matter for a distant surface, where `1/z` is small
+and there is little precision left to lose.
+
+Skipping the divide is what gave the PlayStation 1 its swimming, wobbling
+floors. It is a famous artefact and it has a clean invariant behind it, which
+is what makes it testable without looking at anything.
+
+### Two checks, neither of them a screenshot
+
+**1. Against a closed form.** The texture is 16×16 and each texel *encodes its
+own coordinates*: texel (u,v) is red = u·17, green = v·17. So a pixel read back
+off the screen says exactly which texel the renderer chose. For a floor plane
+and a camera at the origin, the texture coordinate under any screen pixel has
+an analytic answer — intersect the ray with the plane — and nothing in that
+calculation consults the renderer.
+
+```
+18460 floor pixels checked against the closed form
+0 disagreed by more than one texel; worst was 1
+```
+
+One texel of slack, because the closed form uses the pixel's nominal centre and
+the rasteriser samples on the integer grid. Half a pixel of disagreement is
+arithmetic, not a mapping error.
+
+**2. The diagonal invariant.** A quad can be split into two triangles along
+either diagonal. Both triangulations describe the same projective map, so a
+perspective-correct renderer draws the same picture either way. An affine one
+does not — the texture kinks along whichever diagonal was used, and swapping
+the diagonal moves the kink.
+
+```
+the two triangulations: 18460 covered pixels, 125 differ (6 per mille)
+```
+
+The six per mille are the shared diagonal itself, where the two triangulations
+round the edge test differently.
+
+### The clipper had to learn about textures
+
+The near-plane clipper cuts an edge partway and *invents* a vertex. If it
+interpolates the position but not the texture coordinate, the new vertex
+inherits whatever was in the slot before, and a wall smears sideways the moment
+one of its corners passes behind the camera.
+
+That is a bug you only see when you walk **into** something, which is exactly
+when nobody is looking at the far corner of the screen. So the pipeline now
+carries a `struct Vtx` — position and texture coordinate travelling together,
+never in two arrays that can be indexed apart — and the clipped case is checked
+against the same closed form:
+
+```
+18460 pixels of a clipped quad checked, 0 wrong
+```
+
+### A crash the tests found
+
+A texture name exists from the moment `glGenTextures` returns it, before
+anything has been uploaded to it — that is GL's behaviour and it is worth
+keeping. The rasteriser checked that the bound name was *used* but not that it
+had *pixels*, so binding a fresh name and drawing read through a null pointer:
+
+```
+*** EXCEPTION 14: page fault
+faulting address 0x0
+cause: page not present, on a read, from kernel mode
+```
+
+Found by a test that did exactly that on purpose. Binding-before-uploading is
+an ordinary, slightly-wrong thing for a program to do, and it should not take
+the machine down.
+
+### Two more tests that failed on correct output
+
+Both mine, both the same shape as the mirror in K16 — an assertion that was a
+guess rather than a property.
+
+- *"Lighting darkens a textured surface."* The default light points straight
+  down the view axis and the test quad faces straight down the view axis, so it
+  is **fully lit** and correctly not darkened at all. Tilting the light fixes
+  the test. The invariant worth asserting is not "darker" but **"scaled"**:
+  GL_MODULATE multiplies every channel of every texel by the same number, which
+  is checked by sampling *two* texels and comparing the ratios. A renderer that
+  simply replaced the texel with the lit primary colour would pass a
+  one-sample darkening test perfectly.
+- *"The texture repeats every 32 pixels."* It repeats every 42.5 — the quad is
+  170 pixels wide at that depth, not 128. I derived the period on paper and
+  asserted the wrong half of the comparison. The test now **measures** the
+  quad's span by scanning for it.
+
+### What is there
+
+| | |
+|---|---|
+| objects | `glGenTexture`, `glBindTexture`, `glTexImage2D` |
+| coordinates | `glTexCoord2x`, carried per vertex through assembly and clipping |
+| environment | GL_MODULATE — texel × primary colour, and the primary colour carries the lighting |
+| wrapping | GL_REPEAT, as `& (w-1)`, which is correct for negative coordinates too |
+| enable | `glEnable(GL_TEXTURE_2D)` |
+
+Power-of-two only, and non-power-of-two is **refused** rather than rounded.
+Rounding gives a texture that samples wrongly everywhere, which reads as a bug
+in the mapping rather than a bug in the upload. GL 1.1 required powers of two
+as well, and it is what makes GL_REPEAT a bitwise AND instead of a modulo — on
+a machine with no divider worth the name, that is the difference between a
+textured floor and a slideshow.
+
+`glTexImage2D` keeps GL's name with four of its nine arguments dropped. Six of
+those describe a conversion this renderer does not do — there is one texel
+format, the same packed RGB the window backing buffer holds — and nine
+arguments is three past nano_cc's ceiling anyway. The name is GL's and the
+argument list is not, which is worth stating rather than hoping nobody compares.
+
+### Cost
+
+```
+a textured frame: 49152 pixels; the viewport is 49152, the screen 786432
+```
+
+Texturing adds a divide per pixel, not a pixel.
+
+### What is next
+
+The in-OS compile, then VBOs and vertex arrays, a scenegraph, an OBJ loader and
+a lit gears demo.
