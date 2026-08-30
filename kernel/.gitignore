@@ -140,3 +140,14 @@ gl64.elf
 gl64.bin
 gl.elf
 glk.o
+
+# The OpenGL-shaped API image. nano-glapi.h and glapi.c are sources; glapi.png
+# and glapi-live.png are kept because the README shows them.
+glapi.s
+blob-glapi.s
+glapi64.elf
+glapi64.bin
+glapi.elf
+glapik.o
+sabotage-glapi.log
+sabotage-glapi.log.clean

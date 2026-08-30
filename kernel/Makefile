@@ -30,7 +30,8 @@ QFLAGS := -kernel kernel.elf -no-reboot
         sse sserun ssetest check-addsd-len \
         wmin wminrun wmintest wminshot wminlive \
         ui uirun uitest uishot uilive \
-        gl glrun gltest glshot gllive clean
+        gl glrun gltest glshot gllive \
+        glapi glapirun glapitest glapishot glapilive clean
 
 all: kernel.elf
 
@@ -994,6 +995,85 @@ chaintest: chaink.elf $(NANO) user/as.elf user/as/hostas
 	   && [ -s chain-os.hex ] \
 	   && echo "PASS: the machine compiled, assembled and ran a program by itself" \
 	   || { echo "FAIL"; exit 1; }
+
+# ---------------------------------------------------------------------------
+# glapi -- the OpenGL-shaped layer: glBegin/glEnd with strips, fans, quads and
+# quad strips, a matrix stack, gluLookAtx, six frustum planes pulled out of the
+# live projection * modelview matrix, and a 3D viewport that is a widget.
+#
+# The numeric spelling is OpenGL ES 1.1's fixed-point profile -- GLfixed is
+# 16.16 and every real-valued entry point takes an `x` suffix -- so glRotatex
+# and glTranslatex are standard names, not invented ones.
+# ---------------------------------------------------------------------------
+glapi.s: glapi.c nano-kernel.h nano-mouse.h nano-int.h nano-fb.h nano-font.h \
+      nano-mm.h nano-wm.h nano-wmin.h nano-term.h nano-ui.h nano-gl.h \
+      nano-glapi.h $(NANO)
+	$(NANO) --kernel glapi.c glapi.s
+
+glapi64.bin: boot64.s isr.s glapi.s kernel64.ld
+	as --64 boot64.s -o boot64.o
+	as --64 isr.s    -o isr.o
+	as --64 glapi.s  -o glapik.o
+	ld -T kernel64.ld -o glapi64.elf boot64.o isr.o glapik.o
+	objcopy -O binary glapi64.elf glapi64.bin
+
+blob-glapi.s:
+	@printf '.section .blob, "a"\n.incbin "glapi64.bin"\n' > $@
+
+glapi.elf: boot32.s blob-glapi.s glapi64.bin final.ld
+	as --32 boot32.s     -o boot32.o
+	as --32 blob-glapi.s -o blob-glapi.o
+	ld -m elf_i386 -T final.ld -o glapi.elf boot32.o blob-glapi.o
+
+glapi: glapi.elf
+
+glapirun: glapi.elf
+	$(QEMU) -kernel glapi.elf -no-reboot
+
+glapitest: glapi.elf
+	@rm -f glapi-serial.log
+	@( sleep 150; echo quit ) | \
+	 timeout 220 $(QEMU) -kernel glapi.elf -no-reboot -display none \
+	   -serial file:glapi-serial.log -monitor stdio >/dev/null 2>&1; \
+	 echo "---- serial output ----"; cat glapi-serial.log; echo "-----------------------"; \
+	 tr -d '\r' < glapi-serial.log > glapi-serial.clean; \
+	 grep -q "GLAPITEST DONE" glapi-serial.clean \
+	   && ! grep -q "FAIL" glapi-serial.clean \
+	   && grep -q "PASS: an OpenGL-shaped API" glapi-serial.clean \
+	   && echo "PASS: glBegin/glEnd, a camera, a frustum, and a 3D widget" \
+	   || { echo "FAIL"; exit 1; }
+
+glapishot: glapi.elf
+	@rm -f glapi.ppm glapi.png
+	@( sleep 158; echo "screendump glapi.ppm"; sleep 2; echo quit ) | \
+	 timeout 230 $(QEMU) -kernel glapi.elf -no-reboot -display none \
+	   -serial file:glapi-serial.log -monitor stdio >/dev/null 2>&1
+	@convert glapi.ppm glapi.png && echo "wrote glapi.png"
+
+# Driven through the real emulated mouse: drag inside the 3D viewport to turn
+# the camera, then tick "wireframe" on the HUD floating over it.
+#
+# Every step is at most 120 pixels because a PS/2 packet carries ONE SIGNED
+# BYTE per axis. A "mouse_move -178 -120" is not a smaller move, it is a
+# packet with the overflow bit set, which the decoder drops -- so the pointer
+# simply does not go where the script says and the click lands on the desktop.
+glapilive: glapi.elf
+	@rm -f glapi-live.ppm glapi-live.png
+	@( sleep 155; \
+	   for i in 1 2 3 4 5 6; do echo "mouse_move -120 -120"; sleep 1; done; \
+	   echo "mouse_move 120 120"; sleep 1; \
+	   echo "mouse_move 60 70";   sleep 1; \
+	   echo "mouse_button 1"; sleep 1; \
+	   echo "mouse_move 25 0";    sleep 1; \
+	   echo "mouse_move 25 8";    sleep 1; \
+	   echo "mouse_button 0"; sleep 2; \
+	   echo "mouse_move -120 -120"; sleep 1; \
+	   echo "mouse_move -58 0";     sleep 1; \
+	   echo "mouse_button 1"; sleep 1; echo "mouse_button 0"; sleep 3; \
+	   echo "screendump glapi-live.ppm"; sleep 2; echo quit ) | \
+	 timeout 260 $(QEMU) -kernel glapi.elf -no-reboot -display none \
+	   -serial file:glapi-live.log -monitor stdio >/dev/null 2>&1
+	@convert glapi-live.ppm glapi-live.png && echo "wrote glapi-live.png"
 
 clean:
 	@# NOT user/*.s -- ustart.s is a source file, and the generated ones are

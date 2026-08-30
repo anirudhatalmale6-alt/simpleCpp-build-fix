@@ -129,6 +129,28 @@ long gl_sin(long deg) {
 
 long gl_cos(long deg) { return gl_sin(deg + 90); }
 
+// The same, for an angle that is itself 16.16 degrees, linearly interpolated
+// between the two nearest table entries.
+//
+// Needed because glRotatex takes a fixed-point angle. Rounding it to whole
+// degrees instead is visible: a cube turning at a third of a degree per frame
+// sits still for two frames and then jumps, which reads as a dropped frame
+// rather than as coarse arithmetic.
+long gl_sin_fx(long deg) {
+    long i;
+    long f;
+    long a;
+    long b;
+    i = deg >> GL_FRAC;
+    f = deg & 0xFFFF;
+    if (f < 0) f = 0;
+    a = gl_sin(i);
+    b = gl_sin(i + 1);
+    return a + (((b - a) * f) >> GL_FRAC);
+}
+
+long gl_cos_fx(long deg) { return gl_sin_fx(deg + (90 << GL_FRAC)); }
+
 // ---------- vectors and matrices ----------
 //
 // Passed by pointer throughout. nano_cc has no struct-by-value parameters,
@@ -281,12 +303,34 @@ struct GLCtx {
     long vh;
     long focal;            // focal length in pixels
     long near;             // near plane, fixed point, view space
+    long far;              // far plane -- see the note on gl_frustum
+    long izfar;            // 1/far, the rasteriser's far rejection test
+
+    // The projection matrix. Everything that reaches the screen goes through
+    // it, which is the point: the six clipping planes are extracted from this
+    // same matrix, so the frustum test and the rasteriser cannot disagree
+    // about where the edge of the screen is.
+    struct M4 proj;
 
     long *zbuf;            // vw*vh reciprocal depths; larger is nearer
     long wire;             // wireframe instead of solid
     long bg;
 
+    // glEnable/glDisable state. Kept on the context rather than in a global
+    // because two viewports in two windows are two independent renderers, and
+    // OpenGL's one-big-global-state is the part of the design nobody defends.
+    long cull;             // GL_CULL_FACE
+    long depth;            // GL_DEPTH_TEST
+    long lighting;         // GL_LIGHTING
+
     struct V3 light;       // unit direction, view space
+
+    // A normal supplied by glNormal3x, in view space. When absent the
+    // geometric normal of the triangle is used, which is what K15 did and is
+    // right for flat-shaded solids; a supplied normal is what lets a curved
+    // surface be lit as if it were curved.
+    long nvalid;
+    struct V3 nrm;
 
     // The bounding box of pixels actually written since the last flush. This
     // is what makes the renderer a good citizen of the compositor: it does not
@@ -303,6 +347,56 @@ struct GLCtx {
     long pixels;           // buffer pixels written
 };
 
+// Build the projection matrix for an off-centre frustum, exactly as
+// glFrustum specifies it -- with one deliberate difference of convention.
+//
+// Standard OpenGL looks down -z, so its w row is (0,0,-1,0). This renderer
+// looks down +z: `v->z >= near` means "in front of the camera" everywhere in
+// K15, and the near-plane clipper is written that way. Substituting z -> -z
+// through glFrustum's matrix gives the one below: the w row is (0,0,1,0) and
+// the third column of the x and y rows changes sign. Everything else -- the
+// 2n/(r-l) scale, the (f+n)/(f-n) depth mapping -- is glFrustum's.
+//
+// Stating that here rather than in a comment somewhere in the demo, because a
+// handedness convention that is only implied is the thing that later makes
+// somebody's imported model appear mirrored.
+void gl_frustum(struct GLCtx *c, long l, long r, long b, long t) {
+    long n;
+    long f;
+    n = c->near;
+    f = c->far;
+    m4_identity(&c->proj);
+    c->proj.m[0]  = fx_div(2 * n, r - l);
+    c->proj.m[2]  = 0 - fx_div(r + l, r - l);
+    c->proj.m[5]  = fx_div(2 * n, t - b);
+    c->proj.m[6]  = 0 - fx_div(t + b, t - b);
+    c->proj.m[10] = fx_div(f + n, f - n);
+    c->proj.m[11] = 0 - fx_div(fx_mul(2 * f, n), f - n);
+    c->proj.m[14] = GL_ONE;
+    c->proj.m[15] = 0;
+    // The far plane as a reciprocal depth, so the rasteriser can reject
+    // fragments beyond it with one comparison against a number it already has.
+    //
+    // This matters more than it looks. Object-level frustum culling is only
+    // sound if throwing an object away is invisible -- and without a far clip
+    // in the rasteriser, an object past the far plane is culled by the frustum
+    // test but WOULD have drawn pixels, so switching culling on changes the
+    // picture. Then "culling is free" stops being true and starts being an
+    // argument. One compare per fragment buys the property back.
+    c->izfar = fx_div(GL_ONE, f);
+}
+
+// The symmetric frustum implied by a focal length in pixels, which is how K15
+// expressed the camera. r = near * (vw/2) / focal, and likewise for t, so this
+// produces exactly the projection the old divide-by-z was doing.
+void gl_perspective_pixels(struct GLCtx *c) {
+    long r;
+    long t;
+    r = fx_div(fx_mul(c->near, fx_from_int(c->vw / 2)), fx_from_int(c->focal));
+    t = fx_div(fx_mul(c->near, fx_from_int(c->vh / 2)), fx_from_int(c->focal));
+    gl_frustum(c, 0 - r, r, 0 - t, t);
+}
+
 long gl_bind(struct GLCtx *c, long win, long x, long y, long w, long h) {
     if (w <= 0 || h <= 0 || w > GL_MAXW || h > GL_MAXH) return 0;
     if (!g_win[win].used) return 0;
@@ -310,12 +404,23 @@ long gl_bind(struct GLCtx *c, long win, long x, long y, long w, long h) {
     c->vx = x; c->vy = y; c->vw = w; c->vh = h;
     c->focal = w;                       // ~53 degree horizontal field of view
     c->near = GL_ONE / 4;
+    // 64 units, not a million. The far plane's coefficient in the extracted
+    // plane equation is (1 - (f+n)/(f-n)), which tends to zero as f grows --
+    // push it far enough and the plane is all rounding error. 64 keeps it at
+    // about 500 units of 1/65536, so far-plane distances are good to a fifth
+    // of a percent. A renderer with no floats has to choose its ranges.
+    c->far = fx_from_int(64);
+    c->nvalid = 0;
+    c->cull = 1;
+    c->depth = 1;
+    c->lighting = 1;
     c->wire = 0;
     c->bg = rgb(12, 14, 22);
     c->light.x = 0; c->light.y = 0; c->light.z = 0 - GL_ONE;
     c->zbuf = (long *)kmalloc(w * h * 8);
     if (!c->zbuf) return 0;
     c->dx0 = 0; c->dy0 = 0; c->dx1 = -1; c->dy1 = -1;
+    gl_perspective_pixels(c);
     return 1;
 }
 
@@ -369,13 +474,21 @@ void gl_flush(struct GLCtx *c) {
 // View space to viewport pixels. Returns 0 if the point is at or behind the
 // near plane, where the divide is meaningless.
 long gl_project(struct GLCtx *c, struct V3 *v, long *sx, long *sy, long *iz) {
-    long rx;
-    long ry;
+    long cx;
+    long cy;
+    long cw;
     if (v->z < c->near) return 0;
-    rx = fx_div(v->x, v->z);
-    ry = fx_div(v->y, v->z);
-    *sx = c->vw / 2 + fx_to_int(rx * c->focal);
-    *sy = c->vh / 2 - fx_to_int(ry * c->focal);
+    // Clip space. Only the rows that can be non-zero for a frustum matrix are
+    // multiplied out; the full 4x4 would be three wasted multiplies per vertex
+    // for terms that glFrustum guarantees are zero.
+    cx = fx_mul(c->proj.m[0], v->x) + fx_mul(c->proj.m[2], v->z);
+    cy = fx_mul(c->proj.m[5], v->y) + fx_mul(c->proj.m[6], v->z);
+    cw = fx_mul(c->proj.m[14], v->z) + c->proj.m[15];
+    if (cw <= 0) return 0;
+    // Normalised device coordinates, then the viewport transform. y is flipped
+    // because NDC grows upwards and a framebuffer row index grows downwards.
+    *sx = c->vw / 2 + fx_to_int(fx_div(cx, cw) * (c->vw / 2));
+    *sy = c->vh / 2 - fx_to_int(fx_div(cy, cw) * (c->vh / 2));
     // Depth is stored as 1/z and interpolated linearly, which is exact in
     // screen space. Interpolating z itself is not, and it shows as geometry
     // poking through other geometry near the edges of large triangles.
@@ -449,9 +562,11 @@ void gl_tri_raster(struct GLCtx *c, long *sx, long *sy, long *iz, long colour) {
                 long idx;
                 d = (w0 * iz[0] + w1 * iz[1] + w2 * iz[2]) / area;
                 idx = y * c->vw + x;
-                // Larger 1/z is nearer. `>` and not `>=` so that coplanar
-                // surfaces drawn later do not fight for the same pixel.
-                if (d > c->zbuf[idx]) {
+                // Larger 1/z is nearer, so a fragment beyond the far plane has
+                // the SMALLER reciprocal. `>` and not `>=` on the depth test,
+                // so that coplanar surfaces drawn later do not fight for the
+                // same pixel.
+                if (d >= c->izfar && (!c->depth || d > c->zbuf[idx])) {
                     c->zbuf[idx] = d;
                     gl_put(c, x, y, colour);
                 }
@@ -527,13 +642,17 @@ void gl_tri_view(struct GLCtx *c, struct V3 *a, struct V3 *b, struct V3 *v, long
     v3_sub(&e0, b, a);
     v3_sub(&e1, v, a);
     v3_cross(&n, &e0, &e1);
-    {
+    if (c->cull) {
         struct V3 toeye;
         toeye.x = 0 - a->x; toeye.y = 0 - a->y; toeye.z = 0 - a->z;
         if (v3_dot(&n, &toeye) <= 0) { c->tris_culled = c->tris_culled + 1; return; }
     }
 
-    colour = c->wire ? base : gl_shade(c, &n, base);
+    // Cull with the geometric normal always -- which way a triangle faces is a
+    // property of its winding, not of whatever normal the caller supplied.
+    // Shade with the supplied one when there is one.
+    colour = (c->wire || !c->lighting) ? base
+                                       : gl_shade(c, c->nvalid ? &c->nrm : &n, base);
 
     inside = 0;
     if (a->z >= c->near) inside = inside + 1;
@@ -576,6 +695,132 @@ void gl_tri_view(struct GLCtx *c, struct V3 *a, struct V3 *b, struct V3 *v, long
             gl_tri_project(c, &p1, &q2, &q1, colour);
         }
     }
+}
+
+// ---------- the view frustum ----------
+//
+// Six planes pulled straight out of the combined projection * modelview
+// matrix, the way Mark Morley's article describes. The whole idea is that you
+// never work out where the planes are: the matrix already contains them,
+// because "inside the frustum" is by definition -w <= x,y,z <= w in clip
+// space, and each of those six inequalities is one row of the matrix added to
+// or subtracted from the w row.
+//
+//     left   = row3 + row0        right = row3 - row0
+//     bottom = row3 + row1        top   = row3 - row1
+//     near   = row3 + row2        far   = row3 - row2
+//
+// The article writes them as columns because it assumes OpenGL's
+// column-major storage; struct M4 here is row-major, so they are rows.
+//
+// The payoff is that the test cannot drift away from the renderer. If someone
+// widens the field of view, the planes widen with it, because both come from
+// the same sixteen numbers. There is a test that checks exactly this by
+// comparing the frustum's verdict against whether the rasteriser actually
+// puts any pixels on the screen.
+
+#define GL_OUTSIDE   0
+#define GL_INTERSECT 1
+#define GL_INSIDE    2
+
+struct Plane { long a; long b; long c; long d; };   // a*x+b*y+c*z+d, >0 inside
+struct Frustum { struct Plane p[6]; };
+
+// Scale a plane so that (a,b,c) is a unit vector. Without this the value of
+// a*x+b*y+c*z+d still has the right SIGN, so a point test works, but it is not
+// a distance, so no sphere or box test does.
+void gl_plane_norm(struct Plane *p) {
+    long l;
+    l = fx_sqrt(fx_mul(p->a, p->a) + fx_mul(p->b, p->b) + fx_mul(p->c, p->c));
+    if (l == 0) return;
+    p->a = fx_div(p->a, l);
+    p->b = fx_div(p->b, l);
+    p->c = fx_div(p->c, l);
+    p->d = fx_div(p->d, l);
+}
+
+// `clip` is projection * modelview. The planes come out in whatever space the
+// modelview started from -- pass projection alone for view space, or
+// projection * modelview for the model's own space, which is what makes
+// culling a model by its bounding sphere free of any per-object transform.
+void gl_frustum_extract(struct Frustum *f, struct M4 *clip) {
+    long i;
+    long r;
+    i = 0;
+    while (i < 3) {
+        r = i * 4;
+        // Even index: row3 + row_i (left, bottom, near).
+        f->p[i * 2].a = clip->m[12] + clip->m[r];
+        f->p[i * 2].b = clip->m[13] + clip->m[r + 1];
+        f->p[i * 2].c = clip->m[14] + clip->m[r + 2];
+        f->p[i * 2].d = clip->m[15] + clip->m[r + 3];
+        // Odd index: row3 - row_i (right, top, far).
+        f->p[i * 2 + 1].a = clip->m[12] - clip->m[r];
+        f->p[i * 2 + 1].b = clip->m[13] - clip->m[r + 1];
+        f->p[i * 2 + 1].c = clip->m[14] - clip->m[r + 2];
+        f->p[i * 2 + 1].d = clip->m[15] - clip->m[r + 3];
+        gl_plane_norm(&f->p[i * 2]);
+        gl_plane_norm(&f->p[i * 2 + 1]);
+        i = i + 1;
+    }
+}
+
+// Signed distance from a plane. Positive is the inside half-space.
+long gl_plane_dist(struct Plane *p, struct V3 *v) {
+    return fx_mul(p->a, v->x) + fx_mul(p->b, v->y) + fx_mul(p->c, v->z) + p->d;
+}
+
+long gl_frustum_point(struct Frustum *f, struct V3 *v) {
+    long i;
+    i = 0;
+    while (i < 6) {
+        if (gl_plane_dist(&f->p[i], v) < 0) return GL_OUTSIDE;
+        i = i + 1;
+    }
+    return GL_INSIDE;
+}
+
+// GL_OUTSIDE, GL_INTERSECT or GL_INSIDE. Rejecting on the first plane the
+// sphere is wholly behind is what makes this cheap: most rejected objects cost
+// one plane, not six.
+long gl_frustum_sphere(struct Frustum *f, struct V3 *v, long radius) {
+    long i;
+    long partial;
+    long d;
+    partial = 0;
+    i = 0;
+    while (i < 6) {
+        d = gl_plane_dist(&f->p[i], v);
+        if (d < 0 - radius) return GL_OUTSIDE;
+        if (d < radius) partial = 1;
+        i = i + 1;
+    }
+    return partial ? GL_INTERSECT : GL_INSIDE;
+}
+
+// An axis-aligned box given by its centre and half-extents. The "p-vertex"
+// trick: for each plane only the single corner furthest along the plane
+// normal decides rejection, so this is eight corners' worth of answer for one
+// corner's worth of work.
+long gl_frustum_box(struct Frustum *f, struct V3 *v, struct V3 *half) {
+    long i;
+    long partial;
+    long d;
+    long r;
+    partial = 0;
+    i = 0;
+    while (i < 6) {
+        long ax; long ay; long az;
+        ax = f->p[i].a; if (ax < 0) ax = 0 - ax;
+        ay = f->p[i].b; if (ay < 0) ay = 0 - ay;
+        az = f->p[i].c; if (az < 0) az = 0 - az;
+        r = fx_mul(ax, half->x) + fx_mul(ay, half->y) + fx_mul(az, half->z);
+        d = gl_plane_dist(&f->p[i], v);
+        if (d < 0 - r) return GL_OUTSIDE;
+        if (d < r) partial = 1;
+        i = i + 1;
+    }
+    return partial ? GL_INTERSECT : GL_INSIDE;
 }
 
 // A triangle in MODEL space, transformed by the current modelview.

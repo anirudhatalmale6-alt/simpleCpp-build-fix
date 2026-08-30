@@ -2019,3 +2019,240 @@ that the process/filesystem images and the window manager images have never been
 the same image, and a user process has no way to ask for a window. That is new
 syscalls — open a window, blit into it, present — and a build with the compiler,
 the loader and the compositor all running at once.
+
+## K16 — an OpenGL-shaped API, a real frustum, and a 3D viewport that is a widget
+
+K15 proved a triangle could be rasterised in 16.16 into a window's backing
+buffer. This is the layer above it, and it is the layer people actually write
+code against.
+
+```
+make glapi        # build
+make glapirun     # boot it with a window
+make glapitest    # headless, checks everything below
+make glapishot    # boot and screenshot
+make glapilive    # drive the real emulated mouse: orbit, then tick the HUD
+```
+
+### The names are not invented — OpenGL ES 1.1 already specified this
+
+The obvious objection to "OpenGL, but fixed point" is that OpenGL is a float
+API, so any fixed-point spelling must be a private dialect. It is not. Khronos
+standardised exactly this: **OpenGL ES 1.1 defines a fixed-point profile whose
+type `GLfixed` is 16.16** — the same format this renderer already used — and
+gives every entry point that takes a real number an `x` suffix.
+
+`glRotatex`, `glTranslatex`, `glScalex`, `glFrustumx`, `glColor4x`,
+`glNormal3x`, `glLightx`, `glMaterialx`. Real names, from a real specification,
+with the argument orders that specification gives them.
+
+One honest exception, flagged in the header rather than left to be discovered:
+**`glVertex3x` is not standard.** ES 1.1 dropped immediate mode entirely — there
+is no `glBegin` in it, only vertex arrays — so there is no standard fixed-point
+spelling of `glVertex`. `glVertex3x` is desktop GL 1.1's `glVertex3i` with the
+ES suffix. A name that looks standard and is not is worse than one that
+obviously is not.
+
+The primitive enum values are the genuine ones too. `GL_TRIANGLE_STRIP` really
+is `0x0005`, and `GL_LINE_LOOP` really is `0x0002` while `GL_LINE_STRIP` is
+`0x0003` — which is the opposite of the order everybody remembers.
+
+### What is in `nano-glapi.h`
+
+| | |
+|---|---|
+| primitives | `GL_POINTS` `GL_LINES` `GL_LINE_STRIP` `GL_LINE_LOOP` `GL_TRIANGLES` `GL_TRIANGLE_STRIP` `GL_TRIANGLE_FAN` `GL_QUADS` `GL_QUAD_STRIP` `GL_POLYGON` |
+| matrix stack | `glMatrixMode` `glPushMatrix` `glPopMatrix` `glLoadIdentity` `glLoadMatrixx` `glMultMatrixx` |
+| transforms | `glTranslatex` `glScalex` `glRotatex` (arbitrary axis, Rodrigues) |
+| projection | `glFrustumx` `gluPerspectivex` `gluLookAtx` |
+| state | `glColor3ub` `glColor4x` `glNormal3x` `glEnable`/`glDisable` of `GL_CULL_FACE`, `GL_DEPTH_TEST`, `GL_LIGHTING` |
+| frustum | `gl_frustum_extract` `gl_frustum_point` `gl_frustum_sphere` `gl_frustum_box` |
+| camera | `cam_init` `cam_apply` `cam_move` `cam_look` |
+
+`gluLookAt` takes nine scalars in the original, which nano_cc cannot express —
+the limit is six arguments. It takes three vectors here, and reads better for
+it. `glFrustumx` fits in exactly six with the state pointer, so the far plane
+had to move onto the context; that is the argument limit visible in the API's
+shape again, the same way it was in K14.
+
+### The test that matters: same geometry, four spellings, same pixels
+
+A triangle **count** cannot see a winding error. A strip whose alternate
+triangles are not swapped has exactly the same count, and half of it faces away
+and disappears under culling — "half my strip is missing". So the test renders
+the same square four ways and compares the framebuffer:
+
+```
+ok  a quad draws the same pixels as two triangles
+ok  a strip draws the same pixels as its triangles
+ok  a fan draws the same pixels as its triangles
+ok  a quad strip draws the same pixels as two quads
+ok  ...and the SAME strip wound wrongly does NOT match
+ok  ...and none of them is an empty viewport
+```
+
+The last two lines are the point. Four equal hashes are also what four empty
+viewports produce.
+
+### The frustum: Mark Morley's planes, checked against the rasteriser
+
+Six planes come straight out of the combined projection × modelview matrix.
+"Inside the frustum" is by definition `-w <= x,y,z <= w` in clip space, and each
+of those six inequalities is one row of the matrix added to or subtracted from
+the `w` row:
+
+```
+left   = row3 + row0        right = row3 - row0
+bottom = row3 + row1        top   = row3 - row1
+near   = row3 + row2        far   = row3 - row2
+```
+
+(Morley writes them as columns because he assumes OpenGL's column-major
+storage. `struct M4` here is row-major, so they are rows.)
+
+The payoff is that the test cannot drift away from the renderer — widen the
+field of view and the planes widen with it, because both come out of the same
+sixteen numbers. Which is checked directly, against a second opinion:
+
+```
+-- 5. the frustum against the rasteriser --
+  66521 points away from every boundary
+  ok  the planes and the rasteriser never disagree = 0
+```
+
+Two genuinely independent computations. One extracts six planes and takes six
+dot products. The other pushes the point through the projection, divides by w,
+and asks whether it landed in the viewport. Sixty-six thousand samples, no
+disagreement outside a two-pixel band at the edges where rounding decides ties.
+
+### Culling changes the cost, never the picture
+
+```
+looking into the grid: 9 of 25 objects rejected, 300 triangles down to 192
+looking away from it: 25 of 25 objects rejected, 300 triangles down to 0
+ok  the picture is bit-for-bit identical
+ok  nothing the frustum rejected would have been visible = 0
+```
+
+The second check is the load-bearing one: every object the frustum threw away
+is then drawn **on its own** and must produce zero pixels. Equal hashes alone
+could be luck; this is soundness, object by object, verified by the rasteriser
+rather than by the planes that made the decision.
+
+**This needed a change to the rasteriser.** Without a far clip, an object past
+the far plane is rejected by the frustum but *would* have drawn pixels — so
+turning culling on changes the image, and "culling is free" stops being true and
+starts being an argument. One comparison per fragment against `1/far` buys the
+property back.
+
+It is also why the far plane is 64 units and not a million. The far plane's
+coefficient in the extracted equation is `1 - (f+n)/(f-n)`, which tends to zero
+as `f` grows; push it far enough and the plane is nothing but rounding error. At
+64 it is about 500 units of 1/65536, so far distances are good to a fifth of a
+percent. A renderer with no floats has to choose its ranges.
+
+### `ui_glview` — the viewport as a widget
+
+The one widget that draws none of its own interior. It claims a rectangle from
+the K14 layout, draws a one-pixel border, and hands the inside to
+`gl_bind(&ctx, win, v.x, v.y, v.w, v.h)`.
+
+It is a widget in every other respect: it takes hover, it takes focus, it owns
+the pointer while dragged — so a drag **continues when the pointer leaves it**,
+which is the difference between a camera you can use and one you cannot — and it
+reports pointer motion and the keystrokes that arrive while it has focus.
+
+Widgets sit **on top of it** with no compositing machinery at all: draw the 3D
+into the backing buffer, then draw the panel into the same buffer afterwards.
+Ordering the writes is the whole mechanism. That is immediate mode paying off
+again.
+
+### The overlay bug the screenshot found and the unit tests did not
+
+The first `make glapilive` run drove the mouse into the HUD checkbox floating
+over the 3D, clicked it, and *nothing happened*. The checkbox highlighted on
+hover and was completely dead — a picture of a widget.
+
+A viewport fills its whole rectangle, so anything drawn on top of it is also
+*inside* it. Both wanted the press, and the viewport was being asked first, so
+it took the pointer out from under the checkbox every time.
+
+The fix is an order, and it is the one place in an immediate-mode UI where
+**input order and draw order must deliberately differ**:
+
+```
+1. the scene           -> backing buffer
+2. the HUD             -> same buffer, on top; offered the pointer FIRST
+3. the viewport widget -> last; takes the pointer only if nothing above wanted it
+```
+
+Plus `ui->active < 0` on the viewport's press, so it can never take a pointer
+another widget already owns. Each widget is still called exactly once — calling
+one twice, "once for input and once to paint over the new scene", fires its
+toggle twice, because a press edge lasts the whole frame.
+
+Two checks, because either alone passes for a broken build. The overlay must
+get the press *and* the bare viewport must still get one:
+
+```
+ok  pressing the HUD does not hand the pointer to the viewport = 0
+ok  ...and the release toggles it = 1
+ok  ...without the camera having been dragged = 0
+ok  a press on the bare viewport does reach it = 1
+ok  ...and drags the camera = 20
+```
+
+There is a second lesson in how it was found. `make glapilive` had *also* been
+lying: PS/2 carries **one signed byte of motion per axis**, so the
+`mouse_move -178 -120` in the script was not a smaller move, it was a packet
+with the overflow bit set, which the decoder correctly drops. The pointer never
+went where the script said, so the first run's failure to tick the box was
+ambiguous. Every step in that script is now at most 120 pixels.
+
+Damage: the border is tracked like any widget, so it costs nothing while focus
+is unchanged; the interior is not tracked at all, because the renderer already
+reports the exact box of pixels it wrote.
+
+### A bug this found in K14's widgets
+
+`ui_label` remembered the **address** of its text rather than its contents. Two
+identical literals at two call sites are two different addresses in a compiler
+that does not pool them, so the same word was "new text" every frame and the
+label repainted forever — 2,400 pixels a frame, in a frame that claimed to be
+idle.
+
+It hid for a whole milestone because the frames it lived in were repainting a 3D
+viewport anyway, and `wm_damage` merged the label's rectangle into the
+viewport's. It only surfaced in a frame where nothing else moved.
+
+Both directions are now tested, because both fail differently: hashing the
+pointer misses a text change made in place; hashing only the length misses a
+character swap. Buttons and checkboxes fold their caption into their state for
+the same reason — a button relabelled "Play" to "Pause" looks different.
+
+```
+ok  the same text from a different pointer is not a change
+ok  ...but different text at the same pointer is
+ok  ...and it cost exactly the label
+```
+
+### What a frame costs
+
+```
+a frame with the scene re-rendered: 66000 pixels   (the viewport, exactly)
+the screen is 786432
+an idle frame: 0 pixels
+```
+
+### Driven through the real hardware
+
+`make glapilive` drives QEMU's emulated PS/2 mouse: it drags inside the 3D
+viewport to turn the camera, then ticks a checkbox on the HUD floating over it.
+
+### What is next
+
+Textures, lighting with a point light, and a simple scenegraph — the scenegraph
+is what `glPushMatrix`/`glPopMatrix` and the model-space frustum planes were
+built for. And still outstanding from K15: the in-OS compile, which needs the
+process/filesystem stack and the window manager in one image plus syscalls for
+open-a-window, blit and present.

@@ -107,12 +107,17 @@ void ui_forget_all() {
 
 // ---------- frame ----------
 
-// Start a panel at (x,y) in window coordinates, `w` wide.
+// Point the layout at a window and a panel origin, and convert the pointer
+// from SCREEN coordinates into that window's, once. Doing that per widget is
+// the kind of duplication that ends with one widget using the wrong space and
+// being unclickable in a way that looks like a hit-testing bug.
 //
-// The pointer arrives in SCREEN coordinates and is converted here, once. Doing
-// it per widget is the kind of duplication that ends with one widget using the
-// wrong space and being unclickable in a way that looks like a hit-testing bug.
-void ui_begin(struct Ui *ui, long win, long x, long y, long w) {
+// Continue the same frame in a DIFFERENT window. The id counter is not reset,
+// which is what makes it safe: two windows drawn in one frame get one shared,
+// continuous id space, so no widget in the panel can collide with a widget in
+// the viewport. Calling ui_begin twice instead would give them both ids
+// starting at zero and a hover in one window would light up the other.
+void ui_window(struct Ui *ui, long win, long x, long y, long w) {
     ui->win = win;
     ui->ox = x;
     ui->oy = y;
@@ -121,15 +126,29 @@ void ui_begin(struct Ui *ui, long win, long x, long y, long w) {
     ui->y = y;
     ui->cols = 0;
     ui->colw = w;
-    ui->id = 0;
-    ui->hot = -1;
-    ui->invalidations = 0;
-    ui->drawn = 0;
 
     ui->mx = g_mouse_x - g_win[win].x;
     ui->my = g_mouse_y - g_win[win].y;
     ui->inside = (ui->mx >= 0 && ui->my >= 0 &&
                   ui->mx < g_win[win].w && ui->my < g_win[win].h);
+#ifdef NANO_WMIN_H
+    // With more than one window on screen, "the pointer is within this
+    // window's rectangle" is not the same question as "the pointer is over
+    // this window". Two overlapping windows both answer yes to the first, and
+    // a button hidden underneath another window is then still clickable
+    // through it. wmin already walks the z-order front to back; ask it.
+    if (ui->inside && wm_hit_win(g_mouse_x, g_mouse_y) != win) ui->inside = 0;
+#endif
+}
+
+// Start a frame: reset the id counter and the per-frame counters, then point
+// the layout at `win`.
+void ui_begin(struct Ui *ui, long win, long x, long y, long w) {
+    ui->id = 0;
+    ui->hot = -1;
+    ui->invalidations = 0;
+    ui->drawn = 0;
+    ui_window(ui, win, x, y, w);
 }
 
 // End the frame and consume the edges.
@@ -174,15 +193,31 @@ long ui_slot(struct Ui *ui) {
     return w;
 }
 
-void ui_advance(struct Ui *ui, long w) {
+void ui_advance_h(struct Ui *ui, long w, long h) {
     if (ui->cols > 1) {
         ui->cols = ui->cols - 1;
         ui->x = ui->x + w + UI_PAD;
     } else {
         ui->cols = 0;
         ui->x = ui->ox;
-        ui->y = ui->y + UI_ROW_H + UI_PAD;
+        ui->y = ui->y + h + UI_PAD;
     }
+}
+
+void ui_advance(struct Ui *ui, long w) { ui_advance_h(ui, w, UI_ROW_H); }
+
+// Restart the layout somewhere else in the same window WITHOUT resetting the
+// id counter. That distinction is the whole point: ui_begin resets ids, so
+// calling it twice in a frame gives two widgets the same identity and they
+// share a hover state at a distance. This is how a panel gets drawn on top of
+// a 3D viewport in the same frame.
+void ui_move_to(struct Ui *ui, long x, long y, long w) {
+    ui->ox = x;
+    ui->x = x;
+    ui->y = y;
+    ui->pw = w;
+    ui->cols = 0;
+    ui->colw = w;
 }
 
 // ---------- identity ----------
@@ -249,6 +284,31 @@ long ui_strlen(char *s) {
     return n;
 }
 
+// djb2 over the CONTENTS of a string.
+//
+// Widgets that show text used to remember the pointer instead, which is
+// cheaper and wrong in two ways that both really happen:
+//
+//   - Two identical literals at two call sites are two different addresses in
+//     a compiler that does not pool them, so the same word is "new text" every
+//     frame and the widget repaints forever. That is exactly what it did: a
+//     label reading "frustum" cost 2,400 pixels a frame while claiming to be
+//     idle, and the frame it sat in was already repainting a 3D viewport, so
+//     the extra rectangle merged into the viewport's damage and was invisible
+//     in the total. It only showed up in a frame where nothing else moved.
+//
+//   - A label formatted into a scratch buffer keeps ONE address whatever it
+//     says, so it would go the other way and never repaint at all.
+//
+// Hashing the bytes costs a few nanoseconds per widget per frame and is right
+// in both directions.
+long ui_hash_str(char *s) {
+    long h;
+    h = 5381;
+    while (*s) { h = ((h * 33) + (*s & 255)) & 0xFFFFFFF; s = s + 1; }
+    return h;
+}
+
 // Left-aligned text, drawn one glyph at a time and STOPPED at `maxw` pixels.
 //
 // A widget that draws outside its own rectangle is a widget that lies to the
@@ -304,12 +364,12 @@ void ui_label(struct Ui *ui, char *s) {
     long w;
     w = ui_slot(ui);
     // A label has no state of its own, but it still has to be tracked: the
-    // first frame must draw it, and after that it never changes. Hashing the
-    // pointer means a label whose TEXT is swapped redraws.
+    // first frame must draw it, and after that it changes only when its text
+    // does. Which means hashing the text, not the pointer -- see ui_hash_str.
     wm_win_fill(ui->win, ui->x, ui->y, w, UI_ROW_H, ui->panel);
     ui_text_clip(ui, ui->x + 2, ui->y, UI_ROW_H, s, w - 4);
     ui->drawn = ui->drawn + 1;
-    ui_track(ui, ui_next_id(ui), (long)s);
+    ui_track(ui, ui_next_id(ui), ui_hash_str(s));
     ui_advance(ui, w);
 }
 
@@ -348,7 +408,11 @@ long ui_button(struct Ui *ui, char *s) {
     ui_text_mid(ui, s, (act && ui->mdown) ? rgb(255, 255, 255) : ui->fg);
     ui->drawn = ui->drawn + 1;
 
-    ui_track(ui, id, (hot ? 2 : 0) + ((act && ui->mdown) ? 1 : 0));
+    // The caption is part of the visual state. A button whose label is
+    // swapped -- "Play" to "Pause" -- looks different and must repaint, and
+    // hot/pressed alone cannot tell.
+    ui_track(ui, id, (ui_hash_str(s) << 2) + (hot ? 2 : 0) +
+                     ((act && ui->mdown) ? 1 : 0));
     ui_advance(ui, w);
     return clicked;
 }
@@ -398,7 +462,7 @@ long ui_checkbox(struct Ui *ui, char *s, long *v) {
     ui_text_clip(ui, bx + UI_BOX + 6, ui->y, UI_ROW_H, s, w - UI_BOX - 8);
     ui->drawn = ui->drawn + 1;
 
-    ui_track(ui, id, (hot ? 2 : 0) + (*v ? 1 : 0));
+    ui_track(ui, id, (ui_hash_str(s) << 2) + (hot ? 2 : 0) + (*v ? 1 : 0));
     ui_advance(ui, w);
     return changed;
 }
@@ -481,8 +545,11 @@ long ui_text(struct Ui *ui, char *buf, long cap) {
     // Clicking a field focuses it; clicking anywhere else must UNfocus it, or
     // two fields both take the same keystroke.
     if (ui->mpressed) {
-        if (hot) { ui->focus = id; ui->active = id; }
-        else if (ui->focus == id) ui->focus = -1;
+        // `ui->active < 0` for the same reason as everywhere else: a widget
+        // that already owns the pointer keeps it. Without it, dragging a
+        // slider across a text field hands the field the focus mid-drag.
+        if (hot && ui->active < 0) { ui->focus = id; ui->active = id; }
+        else if (!hot && ui->focus == id) ui->focus = -1;
     }
     focused = (ui->focus == id);
 
@@ -550,6 +617,122 @@ void ui_progress(struct Ui *ui, long v, long lo, long hi) {
     ui->drawn = ui->drawn + 1;
     ui_track(ui, id, v);
     ui_advance(ui, w);
+}
+
+// ---------- the 3D viewport widget ----------
+//
+// The one widget that draws none of its own interior. It claims a rectangle,
+// draws a one-pixel border, and hands the inside to whoever is rendering --
+// which for this project means gl_bind(&ctx, win, v.x, v.y, v.w, v.h).
+//
+// It is a widget in every other respect: it takes hover, it takes focus, it
+// owns the pointer while dragged, and it reports the pointer motion and the
+// keystrokes that arrive while it has focus. That is what makes "orbit with
+// the mouse, walk with the keys" work without the application hit-testing
+// anything, and what lets other widgets sit ON TOP of it -- draw the 3D first,
+// draw the panel afterwards, and the buffer holds the composite.
+//
+// Damage: the border is tracked like any other widget, so it costs nothing
+// while the focus state is unchanged. The interior is not tracked at all,
+// because the renderer already reports the exact box of pixels it wrote. A
+// widget that invalidated its whole viewport every frame would throw away
+// precisely the saving the last two milestones were about.
+
+struct GlView {
+    long x;                    // interior, in WINDOW coordinates
+    long y;
+    long w;
+    long h;
+    long hot;
+    long active;               // owns the pointer -- a drag continues outside
+    long focused;
+    long mx;                   // pointer in viewport coordinates, or -1
+    long my;
+    long dx;                   // pointer motion this frame, while dragging
+    long dy;
+    long key;                  // a keystroke, only when focused
+    long clicked;
+    long px;                   // internal: last pointer position
+    long py;
+    long seen;                 // internal: has px/py ever been set
+};
+
+void ui_glview_init(struct GlView *v) {
+    v->hot = 0; v->active = 0; v->focused = 0;
+    v->mx = -1; v->my = -1;
+    v->dx = 0; v->dy = 0;
+    v->key = 0; v->clicked = 0;
+    v->px = 0; v->py = 0; v->seen = 0;
+}
+
+long ui_glview(struct Ui *ui, struct GlView *v, long h) {
+    long id;
+    long w;
+    long hot;
+    long act;
+
+    id = ui_next_id(ui);
+    w = ui_slot(ui);
+    ui->ch = h;
+    hot = ui_hit(ui, ui->x, ui->y, w, h);
+
+    v->x = ui->x + 1;
+    v->y = ui->y + 1;
+    v->w = w - 2;
+    v->h = h - 2;
+    v->clicked = 0;
+    v->dx = 0;
+    v->dy = 0;
+    v->key = 0;
+
+    if (hot) ui->hot = id;
+    // `ui->active < 0` matters more here than on any other widget. A viewport
+    // fills its whole rectangle, so a widget drawn ON TOP of it is inside it
+    // too, and without this guard the viewport takes the pointer out from
+    // under the button the user actually pressed -- the button is painted, is
+    // highlighted, and does nothing.
+    //
+    // The guard is necessary and not sufficient: the overlay must also be
+    // asked BEFORE the viewport. Immediate mode ties input order to draw
+    // order, and this is the one place they have to differ -- the overlay is
+    // painted last and must be offered the pointer first. See glapi.c's
+    // event loop, where the HUD is built between the render and this call.
+    if (ui->mpressed) {
+        if (hot && ui->active < 0) { ui->active = id; ui->focus = id; }
+        else if (!hot && ui->focus == id) ui->focus = -1;
+    }
+    act = (ui->active == id);
+    if (act && ui->mreleased && hot) v->clicked = 1;
+
+    v->hot = hot;
+    v->active = act;
+    v->focused = (ui->focus == id);
+
+    if (hot) { v->mx = ui->mx - v->x; v->my = ui->my - v->y; }
+    else     { v->mx = -1; v->my = -1; }
+
+    // Motion is measured from the previous frame's pointer position, and only
+    // while this view owns the pointer. Measuring it from the press point
+    // instead gives an accelerating drag; measuring it every frame regardless
+    // of ownership makes the camera swing when the user drags a slider past.
+    if (act && ui->mdown) {
+        if (v->seen) { v->dx = ui->mx - v->px; v->dy = ui->my - v->py; }
+        v->px = ui->mx;
+        v->py = ui->my;
+        v->seen = 1;
+    } else {
+        v->seen = 0;
+    }
+
+    if (v->focused && ui->key) v->key = ui->key;
+
+    wm_win_frame(ui->win, ui->x, ui->y, w, h,
+                 v->focused ? ui->accent : (hot ? ui->fg : ui->edge));
+    ui->drawn = ui->drawn + 1;
+
+    ui_track(ui, id, (hot ? 2 : 0) + (v->focused ? 1 : 0));
+    ui_advance_h(ui, w, h);
+    return act && ui->mdown;
 }
 
 // ---------- setup ----------
