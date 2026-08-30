@@ -191,9 +191,11 @@ void glRotatex(struct GlState *st, long deg, long x, long y, long z) {
     glMultMatrixx(st, &t);
 }
 
-// glFrustumx. Six arguments, which is exactly nano_cc's ceiling -- the
-// signature could not have taken a seventh, and that is why the context is
-// reached through st->c rather than passed.
+// glFrustumx. The original takes six numbers -- l, r, b, t, near, far -- and
+// with the state pointer that is seven, one past nano_cc's ceiling. So `far`
+// lives on the context and is set separately. That is the argument limit
+// showing up in the shape of the API for the third time on this project, after
+// gluLookAt's nine scalars and K14's widget rectangle.
 //
 // The near and far given here become the renderer's actual clip planes, not
 // just numbers in a matrix: gl_frustum reads them off the context.

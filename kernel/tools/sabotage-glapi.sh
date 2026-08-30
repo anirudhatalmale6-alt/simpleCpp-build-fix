@@ -159,12 +159,16 @@ want 15 && sabotage nano-ui.h \
   "15. the first frame of a drag reports motion from a stale sample"
 
 want 16 && sabotage nano-ui.h \
-  '/^long ui_glview/,/^}$/ s|        else if (ui->focus == id) ui->focus = -1;|        ;|' \
+  '/^long ui_glview/,/^}$/ s|        else if (!hot \&\& ui->focus == id) ui->focus = -1;|        ;|' \
   "16. clicking away never unfocuses the viewport, so it keeps taking keys"
 
 want 17 && sabotage nano-ui.h \
   's|    ui_track(ui, ui_next_id(ui), ui_hash_str(s));|    ui_track(ui, ui_next_id(ui), (long)s);|' \
   "17. a label remembers the address of its text, not the text (the K14 bug)"
+
+want 18 && sabotage nano-ui.h \
+  '/^long ui_glview/,/^}$/ s|        if (hot \&\& ui->active < 0) { ui->active = id; ui->focus = id; }|        if (hot) { ui->active = id; ui->focus = id; }|' \
+  "18. the viewport takes a pointer another widget already owns"
 
 echo
 echo "=== done; the tree is unchanged ==="

@@ -918,6 +918,31 @@ void test_camera() {
     measure_drawn();
     expect_true("...and a cube at +x is now in front", g_bx1 >= 0);
 
+    // HANDEDNESS. Every check above survives a MIRRORED world, because every
+    // one of them puts the object on the view axis or measures a size. Build
+    // gluLookAtx's basis with its cross products the other way round and the
+    // world is reflected -- and the sabotage matrix showed the whole suite
+    // passing with exactly that bug in place.
+    //
+    // The question a mirror cannot survive is which SIDE something lands on.
+    cam_init(&g_cam);
+    draw_quad_at(2 * GL_ONE, 0, 10 * GL_ONE);
+    measure_drawn();
+    expect_true("something to the right of the camera appears right of centre",
+                g_bx1 >= 0 && g_bx0 > VPW / 2);
+    draw_quad_at(0 - 2 * GL_ONE, 0, 10 * GL_ONE);
+    measure_drawn();
+    expect_true("...and something to its left, left of centre",
+                g_bx1 >= 0 && g_bx1 < VPW / 2);
+    draw_quad_at(0, 2 * GL_ONE, 10 * GL_ONE);
+    measure_drawn();
+    expect_true("something above appears above centre",
+                g_by1 >= 0 && g_by1 < VPH / 2);
+    draw_quad_at(0, 0 - 2 * GL_ONE, 10 * GL_ONE);
+    measure_drawn();
+    expect_true("...and something below, below centre",
+                g_by1 >= 0 && g_by0 > VPH / 2);
+
     // Pitch is clamped short of vertical. At exactly 90 the forward vector is
     // parallel to `up`, the cross product is zero, and gluLookAt builds a
     // matrix of zeroes -- a black viewport that looks like a renderer fault.

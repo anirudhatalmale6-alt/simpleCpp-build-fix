@@ -2244,6 +2244,44 @@ the screen is 786432
 an idle frame: 0 pixels
 ```
 
+### The sabotage matrix, and the hole it found
+
+`sh tools/sabotage-glapi.sh` breaks the GL and widget layers eighteen ways on
+purpose — each one built, booted and checked for the suite going red — with a
+baseline row first, because if the unmodified tree is not clean nothing below
+it means anything.
+
+Seventeen were caught on the first run. **One was not:**
+
+```
+9. gluLookAtx builds a mirrored basis
+   *** NOT CAUGHT -- the suite passed with this bug in place ***
+```
+
+Swap `cross(up, f)` for `cross(f, up)` and the camera basis is reflected — the
+world comes out mirrored. Every camera check passed anyway, and in hindsight
+obviously so: they all put the object **on the view axis** or measure a
+**size**, and a mirror changes neither. "Twice as close is twice as big" is
+true in a mirror. "Turn ninety degrees and it is gone" is true in a mirror.
+
+The question a mirror cannot survive is which *side* something lands on:
+
+```
+ok  something to the right of the camera appears right of centre
+ok  ...and something to its left, left of centre
+ok  something above appears above centre
+ok  ...and something below, below centre
+```
+
+Four checks, all four directions, because a reflection in one axis is still a
+plausible-looking scene. This is the sabotage matrix earning its hour: the
+suite had ninety-odd checks and a whole class of error it structurally could
+not see.
+
+The eighteenth sabotage came out of the overlay bug above — a viewport that
+takes a pointer another widget already owns — and is caught by the HUD input
+checks.
+
 ### Driven through the real hardware
 
 `make glapilive` drives QEMU's emulated PS/2 mouse: it drags inside the 3D
