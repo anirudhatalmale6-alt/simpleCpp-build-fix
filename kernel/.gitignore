@@ -171,3 +171,11 @@ oswin64.elf
 oswin64.bin
 oswin.elf
 oswink.o
+
+# The line benchmark. linebench.c is the source.
+linebench.s
+blob-linebench.s
+linebench64.elf
+linebench64.bin
+linebench.elf
+linebenchk.o

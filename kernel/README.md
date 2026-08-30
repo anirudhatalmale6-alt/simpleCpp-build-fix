@@ -2579,3 +2579,93 @@ A solid-colour blit satisfies "every pixel changed" and fails both.
 ### What is next
 
 VBOs and vertex arrays, a scenegraph, an OBJ loader, and a lit gears demo.
+
+## Lines, measured — and the answer was not where it looked
+
+```
+make linebench        # build
+make linebenchtest    # check they draw the same line, then time them
+```
+
+The question: would a line be faster stepped from **both ends at once**, or
+written out as **spans** the way a glyph blit does? Both are real techniques.
+Rather than have an opinion, four routines were written and timed on the ACPI
+power-management timer — the 3.579545 MHz free-running counter from K2 — over a
+fan of 224 lines from the centre of a 320×240 viewport to every point on its
+border, which covers every slope plus the axis-aligned and exact-diagonal cases.
+
+### Correctness first, and it is not a formality
+
+A faster line that is one pixel different is not a faster line, it is a
+different line. Every variant is hashed against the baseline before it is
+allowed to be timed. One of them fails:
+
+```
+gl_line_sym  (both ends at once)
+    31488 pixels written, 732 differ from the baseline
+```
+
+**Bresenham is not symmetric.** It looks it — the line is symmetric about its
+midpoint — but walking the error term from the far end makes different rounding
+choices wherever it ties, so the two halves meet with a kink. 23 per mille of
+the pixels. This is the well-known trap that makes "draw from both ends" not
+simply free, and it is exactly the kind of thing that is worth measuring rather
+than reasoning about.
+
+### The timings
+
+```
+gl_line_slow (baseline, gl_put per pixel)      38,311 ns per line    100%
+gl_line_sym  (both ends at once)               39,686 ns per line    103%
+gl_line_span (runs batched into spans)         13,166 ns per line     34%
+gl_line      (bounds checked once)              8,473 ns per line     22%
+```
+
+Stepping from both ends is **slower**. It halves the iterations and does two
+error updates inside each one, so the arithmetic is unchanged and the loop
+bookkeeping is doubled. The intuition behind the question — *each pixel needs to
+be placed anyway* — was right, and then some.
+
+### Where the time actually was
+
+The variants change several things at once, so the suspect was pulled out on
+its own: the same number of stores, with and without the guard around each.
+
+```
+1,536,000 pixels stored directly:  51 ms
+the same through gl_put:          357 ms      -- 7x
+```
+
+The line was never the line. It was the five operations of bookkeeping around
+each store — two bounds tests, a window-size test, a damage-box update and a
+counter increment, **per pixel**.
+
+And all of it hoists, because of one fact about straight lines: **if both
+endpoints are inside a rectangle then every pixel between them is too.** A line
+cannot leave a rectangle and come back. So the tests happen once per segment and
+the inner loop becomes an add, a compare and a store. The damage box is not an
+approximation either — `gl_mark` only ever computes a bounding box, so marking
+the two endpoints is exactly what marking every pixel would have produced.
+
+That is now `gl_line`, five times faster and bit-identical, with `gl_line_slow`
+kept for segments that really do leave the viewport. `gltest`, `glapitest` and
+`gltextest` all pass unchanged, which is what says the wireframe pixels did not
+move.
+
+### And the span version deserves its 34%
+
+Batching runs is a real win over the baseline — it just is not a win over
+hoisting the guard, because once the inner loop is three instructions there is
+nothing left for the batching to save, and the run bookkeeping costs more than
+it removes. It would pay on a machine where the per-pixel path stayed expensive.
+Both rejected variants live in `linebench.c` rather than in `nano-gl.h`: they
+are not shipped, they are the reason the shipped one looks the way it does.
+
+### One more test that failed on a correct measurement
+
+The first draft asserted that the span version would be at least as fast as the
+hoisted one. That is not a property of anything — it was a prediction, and it
+was wrong, and the test went red on a perfectly good measurement. Which of the
+two wins by more is a fact about this machine on this day, so it is **printed**.
+What is asserted is only what is actually claimed: hoisting beats per-pixel
+checking, and batching beats the baseline.

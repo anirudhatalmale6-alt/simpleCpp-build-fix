@@ -33,7 +33,8 @@ QFLAGS := -kernel kernel.elf -no-reboot
         gl glrun gltest glshot gllive \
         glapi glapirun glapitest glapishot glapilive \
         gltex gltexrun gltextest gltexshot gltexlive \
-        oswin oswinrun oswintest oswinshot clean
+        oswin oswinrun oswintest oswinshot \
+        linebench linebenchrun linebenchtest linebenchshot clean
 
 all: kernel.elf
 
@@ -1202,6 +1203,57 @@ oswinshot: oswin.elf
 	 timeout 200 $(QEMU) -m 512 -kernel oswin.elf -no-reboot -display none \
 	   -serial file:oswin-serial.log -monitor stdio >/dev/null 2>&1
 	@convert oswin.ppm oswin.png && echo "wrote oswin.png"
+
+# ---------------------------------------------------------------------------
+# linebench -- four ways to draw a line, timed on the ACPI PM timer.
+#
+# Asked whether stepping a line from both ends, or writing it out as spans the
+# way a glyph blit does, would be faster. The honest answer is a measurement.
+# Correctness first: a faster line that is one pixel different is a different
+# line, so every variant is hashed against the baseline before it is timed.
+# ---------------------------------------------------------------------------
+linebench.s: linebench.c nano-kernel.h nano-int.h nano-fb.h nano-font.h \
+      nano-acpi.h nano-mm.h nano-wm.h nano-gl.h $(NANO)
+	$(NANO) --kernel linebench.c linebench.s
+
+linebench64.bin: boot64.s isr.s linebench.s kernel64.ld
+	as --64 boot64.s   -o boot64.o
+	as --64 isr.s      -o isr.o
+	as --64 linebench.s -o linebenchk.o
+	ld -T kernel64.ld -o linebench64.elf boot64.o isr.o linebenchk.o
+	objcopy -O binary linebench64.elf linebench64.bin
+
+blob-linebench.s:
+	@printf '.section .blob, "a"\n.incbin "linebench64.bin"\n' > $@
+
+linebench.elf: boot32.s blob-linebench.s linebench64.bin final.ld
+	as --32 boot32.s         -o boot32.o
+	as --32 blob-linebench.s -o blob-linebench.o
+	ld -m elf_i386 -T final.ld -o linebench.elf boot32.o blob-linebench.o
+
+linebench: linebench.elf
+
+linebenchrun: linebench.elf
+	$(QEMU) -kernel linebench.elf -no-reboot
+
+linebenchtest: linebench.elf
+	@rm -f linebench-serial.log
+	@( sleep 150; echo quit ) | \
+	 timeout 220 $(QEMU) -kernel linebench.elf -no-reboot -display none \
+	   -serial file:linebench-serial.log -monitor stdio >/dev/null 2>&1; \
+	 echo "---- serial output ----"; cat linebench-serial.log; echo "-----------------------"; \
+	 tr -d '\r' < linebench-serial.log > linebench-serial.clean; \
+	 grep -q "LINEBENCHTEST DONE" linebench-serial.clean \
+	   && ! grep -q "FAIL" linebench-serial.clean \
+	   && echo "PASS: four line routines, checked identical and then timed" \
+	   || { echo "FAIL"; exit 1; }
+
+linebenchshot: linebench.elf
+	@rm -f linebench.ppm linebench.png
+	@( sleep 158; echo "screendump linebench.ppm"; sleep 2; echo quit ) | \
+	 timeout 230 $(QEMU) -kernel linebench.elf -no-reboot -display none \
+	   -serial file:linebench-serial.log -monitor stdio >/dev/null 2>&1
+	@convert linebench.ppm linebench.png && echo "wrote linebench.png"
 
 clean:
 	@# NOT user/*.s -- ustart.s is a source file, and the generated ones are

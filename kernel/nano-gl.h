@@ -570,7 +570,10 @@ long gl_project(struct GLCtx *c, struct V3 *v, long *sx, long *sy, long *iz) {
 
 // ---------- lines, for wireframe ----------
 
-void gl_line(struct GLCtx *c, long x0, long y0, long x1, long y1, long colour) {
+// The general case: every pixel through gl_put, which bounds-checks it. Kept
+// because a line with an endpoint outside the viewport needs it, and because
+// it is the baseline the fast path is measured and checked against.
+void gl_line_slow(struct GLCtx *c, long x0, long y0, long x1, long y1, long colour) {
     long dx;
     long dy;
     long sx;
@@ -584,6 +587,80 @@ void gl_line(struct GLCtx *c, long x0, long y0, long x1, long y1, long colour) {
     for (;;) {
         long e2;
         gl_put(c, x0, y0, colour);
+        if (x0 == x1 && y0 == y1) return;
+        e2 = err * 2;
+        if (e2 > (0 - dy)) { err = err - dy; x0 = x0 + sx; }
+        if (e2 < dx)       { err = err + dx; y0 = y0 + sy; }
+    }
+}
+
+// ---------- lines, faster ----------
+//
+// Asked whether a line would be faster stepped from both ends, or written out
+// as spans the way a glyph blit does. Both were built and timed against the
+// baseline on the ACPI PM timer -- see linebench.c, which still contains them
+// -- and the answer was neither. What the measurement found instead:
+//
+//     the same 1.5M stores, written directly:   52 ms
+//     the same 1.5M stores, through gl_put:    352 ms      -- 6.7x
+//
+// The line was never the line. It was the FIVE OPERATIONS OF BOOKKEEPING
+// around each store: two bounds tests, a window-size test, a damage-box update
+// and a counter increment, per pixel.
+//
+// And all of it can be hoisted, because of one fact about straight lines: if
+// both endpoints are inside a rectangle then every pixel between them is too.
+// A line cannot leave a rectangle and come back. So the tests happen ONCE per
+// segment and the inner loop becomes an add, a compare and a store.
+//
+//     baseline                       43,447 ns per line   100%
+//     both ends at once              46,059 ns per line   106%   (and wrong)
+//     runs batched into spans        17,383 ns per line    40%
+//     bounds checked once             9,104 ns per line    20%
+//
+// Five times faster, and bit-identical over a fan of 224 lines at every slope.
+
+long gl_line_inside(struct GLCtx *c, long x0, long y0, long x1, long y1) {
+    if (x0 < 0 || y0 < 0 || x0 >= c->vw || y0 >= c->vh) return 0;
+    if (x1 < 0 || y1 < 0 || x1 >= c->vw || y1 >= c->vh) return 0;
+    return 1;
+}
+
+void gl_line(struct GLCtx *c, long x0, long y0, long x1, long y1, long colour) {
+    long dx; long dy; long sx; long sy; long err;
+    long *pix;
+    long stride;
+    long ox;
+    long oy;
+    long n;
+
+    if (!gl_line_inside(c, x0, y0, x1, y1)) {
+        gl_line_slow(c, x0, y0, x1, y1, colour);
+        return;
+    }
+
+    // The damage box for the whole segment, once. gl_mark only ever computes a
+    // bounding box, so marking the two ends is exactly what marking every
+    // pixel would have produced -- this is not an approximation.
+    gl_mark(c, x0, y0);
+    gl_mark(c, x1, y1);
+
+    pix = g_win[c->win].pix;
+    stride = g_win[c->win].w;
+    ox = c->vx;
+    oy = c->vy;
+
+    dx = x1 - x0; if (dx < 0) dx = 0 - dx;
+    dy = y1 - y0; if (dy < 0) dy = 0 - dy;
+    sx = x0 < x1 ? 1 : -1;
+    sy = y0 < y1 ? 1 : -1;
+    err = dx - dy;
+    n = (dx > dy ? dx : dy) + 1;
+    c->pixels = c->pixels + n;
+
+    for (;;) {
+        long e2;
+        pix[(oy + y0) * stride + ox + x0] = colour;
         if (x0 == x1 && y0 == y1) return;
         e2 = err * 2;
         if (e2 > (0 - dy)) { err = err - dy; x0 = x0 + sx; }
