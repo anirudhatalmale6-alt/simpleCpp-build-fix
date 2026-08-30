@@ -84,6 +84,11 @@ make uirun      # boot it and click things
 make uitest     # headless: and prove an unchanged frame costs 0 pixels
 make uilive     # drive the real emulated mouse; save ui-live.png
 sh tools/sabotage-ui.sh      # eleven deliberate bugs; the suite must see them
+
+make gl         # 3D in 16.16 fixed point, rendering into a window handle
+make glrun      # boot it: a shaded cube, with the widget panel driving it
+make gltest     # headless: maths, culling, depth, clipping, and what it costs
+make gllive     # drive the real emulated mouse; save gl-live.png
 ```
 
 `make test` needs no display; it drives real keystrokes through QEMU's
@@ -1846,3 +1851,171 @@ every widget after it, so a button can inherit the pressed state of whatever
 used to hold its number. `ui_id()` sets an explicit id, and there is a test that
 pins both halves of that behaviour rather than leaving it to be discovered by a
 button that fires on its own.
+
+---
+
+## K15 — 3D in fixed point, rendering into a window handle
+
+The question was "TinyGL next, and a demo compiled inside the OS, passing a
+window handle to our window manager". This is the renderer and the window
+contract; the in-OS compile is the next piece.
+
+![a shaded cube, with the widget panel driving it](gl.png)
+
+### Where TinyGL's floats actually are
+
+TinyGL is 9,146 lines across 36 files under a permissive zlib-style licence —
+Bellard's original notice — and nano_cc cannot build it. That was known. What
+was worth measuring is *where* the problem is:
+
+| file | lines | float uses | float literals |
+|---|---|---|---|
+| `zbuffer.c` | 389 | **0** | **0** |
+| `texture.c` | 432 | **0** | **0** |
+| `list.c` | 303 | **0** | **0** |
+| `api.c` | 648 | 65 | 0 |
+| `zraster.c` | 229 | 26 | 1 |
+| `clip.c` | 475 | 21 | 2 |
+| `zmath.c` | 311 | 19 | 10 |
+| `matrix.c` | 274 | 18 | 9 |
+
+257 uses of `GLfloat` overall, 99 float literals, and `typedef float GLfloat` in
+`gl.h`, so floats are in the public signature too.
+
+But the span rasteriser is already integer. The float dependency is the API, the
+matrix stack, the clipper and the transform — which is exactly the part that can
+be written in fixed point today. So that is what `nano-gl.h` is.
+
+### The contract
+
+```c
+gl_bind(&ctx, window_handle, x, y, w, h);
+...draw...
+gl_flush(&ctx);
+```
+
+The renderer never touches the screen. It writes into that window's backing
+buffer — ordinary RAM — and `gl_flush` hands the compositor the bounding box of
+what it actually changed. When floats arrive in the compiler, TinyGL's ZBuffer
+points at the same backing buffer and nothing above this line changes. That is
+the reason to define it now rather than after.
+
+Measured: a rendered frame costs **52,000 pixels**, its viewport, against
+786,432 for the screen. Forty rotating frames cost 52,000 each — flat, and
+identical to a full repaint every time by framebuffer hash.
+
+The test that matters for the contract fills the whole window with a sentinel
+colour, binds a viewport smaller than the window, renders a cube big enough to
+overflow it, and then counts pixels outside the viewport that are no longer the
+sentinel. **Zero.** A renderer that writes outside the rectangle it was given
+corrupts whatever else the application drew, and no framebuffer checksum can see
+it — the buffer and the screen agree perfectly on the wrong picture. There is a
+matching check that a lot *was* written inside, so the first one cannot pass by
+drawing nothing.
+
+### The maths
+
+16.16, the same format as the C64 library, validated against `double` on the
+host before it ever ran in the kernel: **sin and cos to 0.5 units out of 65536,
+`fx_sqrt` to 1 unit, and `fx_mul` exact over 200,000 random pairs** against the
+64-bit answer.
+
+One hazard from the C64 job cannot happen here and one nearly did.
+
+`sin(90)` is 65536, which does not fit in a `uint16_t`. On the C64 library that
+entry stored as 0 and took `cos(0)` with it, collapsing every circle at the
+cardinal angles. The table here is `long`, so it cannot happen — and there is a
+check that says so rather than assuming it.
+
+Then gcc warned that my first `fx_sqrt` wrote `1 << 46` to find a starting
+value, which is undefined where an integer literal is 32 bits. That is the exact
+trap from the C64 audit, in my own code, four days later. It builds the value by
+shifting a `long` now.
+
+Depth is stored as **1/z** and interpolated linearly, which is exact in screen
+space. Interpolating `z` itself is not, and it shows as geometry poking through
+other geometry near the edges of large triangles.
+
+### A compiler bug found on the way
+
+Struct assignment copied eight bytes regardless of the size of the struct.
+
+```c
+struct V3 { long x; long y; long z; };
+struct V3 p; p = *a;          // 1,2,3 in -> 1,0,0 out
+```
+
+```
+mov rax, [rax]
+mov [rcx], rax
+```
+
+One move, twenty-four byte struct, no diagnostic — a single `mov` is perfectly
+valid code for the wrong amount of data. It surfaced as `p0 = *a` in the
+near-plane clipper, where the symptom would have been triangles with garbage
+vertices and a long hunt through the clipping maths.
+
+Two causes. A struct rvalue was not decaying to its address — `N_VAR` and
+`N_MEMBER` already treated structs by-address and passing one by value is
+refused outright, so the design was consistent; `*p` on a struct pointer just
+fell through to the scalar path. And assignment always emitted one move; it now
+copies `ty_size` bytes and returns the destination so chaining works.
+
+`make checkall` still matches gcc on 14 demos, `selfhost.sh` still produces a
+stage1 binary byte-identical to stage2, and the kernel's `test`, `uitest`,
+`wmintest` and `chaintest` all still pass — that last one being the compiler and
+assembler running *inside* the OS. There is a regression test in `structs.c`
+covering direct copy, copy through a dereferenced pointer, and a nested member,
+with the destination pre-filled with a sentinel so a field that merely is not
+copied cannot pass by looking right.
+
+### Two tests I got wrong before the code was wrong
+
+Worth recording, because both times the renderer was right and the assertion was
+not.
+
+**"Six of twelve faces are culled."** It draws four. Rotated about Y alone, with
+the camera on the z axis, the top and bottom faces are exactly edge-on — their
+normals are perpendicular to the view direction. You see two faces, not three.
+Six only appears once the view direction has all three components non-zero. Both
+orientations are now checked, because a culler that ignores orientation gives
+the same answer twice.
+
+The cube's winding *was* wrong, separately, and the count is what caught it: a
+table wound uniformly backwards still gives six, just the other six. Only an
+*inconsistent* table gives anything else, which is precisely what a hand-typed
+index list produces. The winding is now derived by computing all twelve normals,
+and there is a depth check that separates "outward" from "uniformly inward".
+
+**"The cube must never render as one flat colour."** It must, at four angles out
+of the sweep — those are the degenerate orientations. The assertion belongs on
+the *maximum* over a full turn: three faces at once, six triangles. Asserting
+the minimum failed on correct output, which is the more embarrassing direction
+to get a test wrong.
+
+```
+angle   0:  2 triangles, 1 face colour
+angle  45:  6 triangles, 3 face colours
+angle  90:  2 triangles, 1 face colour
+angle 135:  4 triangles, 2 face colours
+```
+
+### Driven through the real hardware
+
+`make gllive` drives QEMU's emulated PS/2 mouse: it ticks "wireframe" on the
+render panel and drags the speed slider.
+
+![the K14 panel driving the K15 renderer](gl-live.png)
+
+The immediate-mode panel from K14 is controlling the renderer from K15, through
+IRQ12, with the compositor from K11 deciding what any of it costs the screen.
+
+### What is next
+
+The in-OS compile. The machine already has both halves — K8 put nano_cc inside
+the OS and K9 put the assembler in, so `cc demo.c demo.asm`, `as demo.asm
+/bin/demo`, `exec /bin/demo` already works on the RAM disk. What is missing is
+that the process/filesystem images and the window manager images have never been
+the same image, and a user process has no way to ask for a window. That is new
+syscalls — open a window, blit into it, present — and a build with the compiler,
+the loader and the compositor all running at once.

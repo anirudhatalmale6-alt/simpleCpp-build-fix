@@ -29,7 +29,8 @@ QFLAGS := -kernel kernel.elf -no-reboot
         chain chainrun chaintest wm wmrun wmtest wmshot \
         sse sserun ssetest check-addsd-len \
         wmin wminrun wmintest wminshot wminlive \
-        ui uirun uitest uishot uilive clean
+        ui uirun uitest uishot uilive \
+        gl glrun gltest glshot gllive clean
 
 all: kernel.elf
 
@@ -1103,3 +1104,71 @@ uilive: ui.elf
 	 timeout 220 $(QEMU) -kernel ui.elf -no-reboot -display none \
 	   -serial file:ui-live.log -monitor stdio >/dev/null 2>&1
 	@convert ui-live.ppm ui-live.png && echo "wrote ui-live.png"
+
+# ---------------------------------------------------------------------------
+# K15: a 3D pipeline in fixed point, rendering into a window handle.
+#
+# TinyGL cannot be compiled by nano_cc -- 257 uses of GLfloat and no floating
+# point in the compiler -- but its span rasteriser is already integer, and the
+# float dependency is the API, matrix stack, clipper and transform. This is
+# those stages in 16.16, bound to a window handle so that the compositor still
+# decides what a frame costs the screen.
+# ---------------------------------------------------------------------------
+gl.s: gl.c nano-kernel.h nano-mouse.h nano-int.h nano-fb.h nano-font.h \
+      nano-mm.h nano-wm.h nano-wmin.h nano-term.h nano-ui.h nano-gl.h $(NANO)
+	$(NANO) --kernel gl.c gl.s
+
+gl64.bin: boot64.s isr.s gl.s kernel64.ld
+	as --64 boot64.s -o boot64.o
+	as --64 isr.s    -o isr.o
+	as --64 gl.s     -o glk.o
+	ld -T kernel64.ld -o gl64.elf boot64.o isr.o glk.o
+	objcopy -O binary gl64.elf gl64.bin
+
+blob-gl.s:
+	@printf '.section .blob, "a"\n.incbin "gl64.bin"\n' > $@
+
+gl.elf: boot32.s blob-gl.s gl64.bin final.ld
+	as --32 boot32.s  -o boot32.o
+	as --32 blob-gl.s -o blob-gl.o
+	ld -m elf_i386 -T final.ld -o gl.elf boot32.o blob-gl.o
+
+gl: gl.elf
+
+glrun: gl.elf
+	$(QEMU) -kernel gl.elf -no-reboot
+
+gltest: gl.elf
+	@rm -f gl-serial.log
+	@( sleep 110; echo quit ) | \
+	 timeout 170 $(QEMU) -kernel gl.elf -no-reboot -display none \
+	   -serial file:gl-serial.log -monitor stdio >/dev/null 2>&1; \
+	 echo "---- serial output ----"; cat gl-serial.log; echo "-----------------------"; \
+	 tr -d '\r' < gl-serial.log > gl-serial.clean; \
+	 grep -q "GLTEST DONE" gl-serial.clean \
+	   && ! grep -q "FAIL" gl-serial.clean \
+	   && grep -q "PASS: fixed-point 3D into a window handle" gl-serial.clean \
+	   && echo "PASS: 3D in fixed point, into a window, paying only for its viewport" \
+	   || { echo "FAIL"; exit 1; }
+
+glshot: gl.elf
+	@rm -f gl.ppm gl.png
+	@( sleep 118; echo "screendump gl.ppm"; sleep 2; echo quit ) | \
+	 timeout 180 $(QEMU) -kernel gl.elf -no-reboot -display none \
+	   -serial file:gl-serial.log -monitor stdio >/dev/null 2>&1
+	@convert gl.ppm gl.png && echo "wrote gl.png"
+
+# Driven through the real emulated mouse: tick "wireframe" on the render panel.
+gllive: gl.elf
+	@rm -f gl-live.ppm gl-live.png
+	@( sleep 115; \
+	   echo "mouse_move -47 -128"; sleep 1; \
+	   echo "mouse_move -47 -128"; sleep 1; \
+	   echo "mouse_button 1"; sleep 1; echo "mouse_button 0"; sleep 2; \
+	   echo "mouse_move 0 48";     sleep 1; \
+	   echo "mouse_button 1"; sleep 1; echo "mouse_move 60 0"; sleep 1; \
+	   echo "mouse_button 0"; sleep 3; \
+	   echo "screendump gl-live.ppm"; sleep 2; echo quit ) | \
+	 timeout 200 $(QEMU) -kernel gl.elf -no-reboot -display none \
+	   -serial file:gl-live.log -monitor stdio >/dev/null 2>&1
+	@convert gl-live.ppm gl-live.png && echo "wrote gl-live.png"

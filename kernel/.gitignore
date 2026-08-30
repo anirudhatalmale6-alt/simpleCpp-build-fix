@@ -131,3 +131,12 @@ ui.elf
 uik.o
 sabotage-ui.log
 sabotage-ui.log.clean
+
+# The 3D image. nano-gl.h and gl.c are sources; gl.png and gl-live.png are
+# kept because the README shows them.
+gl.s
+blob-gl.s
+gl64.elf
+gl64.bin
+gl.elf
+glk.o
