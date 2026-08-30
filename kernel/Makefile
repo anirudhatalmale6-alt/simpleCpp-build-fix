@@ -28,7 +28,8 @@ QFLAGS := -kernel kernel.elf -no-reboot
         progs elf elfrun elftest cc ccrun cctest check-miniasm \
         chain chainrun chaintest wm wmrun wmtest wmshot \
         sse sserun ssetest check-addsd-len \
-        wmin wminrun wmintest wminshot wminlive clean
+        wmin wminrun wmintest wminshot wminlive \
+        ui uirun uitest uishot uilive clean
 
 all: kernel.elf
 
@@ -1027,3 +1028,78 @@ clean:
 	      fs64.elf fs64.bin fs.elf fs-serial.log fs-serial.clean \
 	      threads-serial.log threads-serial.clean \
 	      vga.ppm gfx.ppm gshell.ppm
+
+# ---------------------------------------------------------------------------
+# K14: immediate-mode widgets.
+#
+# nano_cc has no function pointers, so no retained-mode toolkit can be used or
+# written -- `widget->on_click = handler` cannot be expressed in the language.
+# Immediate mode does not need callbacks: a button is a function that draws
+# itself and returns whether it was clicked.
+#
+# The claim being tested is not "here are some buttons". It is that an API
+# which rebuilds every widget every frame can sit on a damage-tracking
+# compositor without turning each frame into a full repaint. The central
+# assertion is that a second, identical frame pushes ZERO pixels to the screen.
+# ---------------------------------------------------------------------------
+ui.s: ui.c nano-kernel.h nano-mouse.h nano-int.h nano-fb.h nano-font.h \
+      nano-mm.h nano-wm.h nano-wmin.h nano-term.h nano-ui.h $(NANO)
+	$(NANO) --kernel ui.c ui.s
+
+ui64.bin: boot64.s isr.s ui.s kernel64.ld
+	as --64 boot64.s -o boot64.o
+	as --64 isr.s    -o isr.o
+	as --64 ui.s     -o uik.o
+	ld -T kernel64.ld -o ui64.elf boot64.o isr.o uik.o
+	objcopy -O binary ui64.elf ui64.bin
+
+blob-ui.s:
+	@printf '.section .blob, "a"\n.incbin "ui64.bin"\n' > $@
+
+ui.elf: boot32.s blob-ui.s ui64.bin final.ld
+	as --32 boot32.s  -o boot32.o
+	as --32 blob-ui.s -o blob-ui.o
+	ld -m elf_i386 -T final.ld -o ui.elf boot32.o blob-ui.o
+
+ui: ui.elf
+
+uirun: ui.elf
+	$(QEMU) -kernel ui.elf -no-reboot
+
+uitest: ui.elf
+	@rm -f ui-serial.log
+	@( sleep 110; echo quit ) | \
+	 timeout 170 $(QEMU) -kernel ui.elf -no-reboot -display none \
+	   -serial file:ui-serial.log -monitor stdio >/dev/null 2>&1; \
+	 echo "---- serial output ----"; cat ui-serial.log; echo "-----------------------"; \
+	 tr -d '\r' < ui-serial.log > ui-serial.clean; \
+	 grep -q "UITEST DONE" ui-serial.clean \
+	   && ! grep -q "FAIL" ui-serial.clean \
+	   && grep -q "PASS: immediate-mode widgets" ui-serial.clean \
+	   && echo "PASS: widgets behave, and an unchanged frame costs 0 pixels" \
+	   || { echo "FAIL"; exit 1; }
+
+uishot: ui.elf
+	@rm -f ui.ppm ui.png
+	@( sleep 110; echo "screendump ui.ppm"; sleep 2; echo quit ) | \
+	 timeout 170 $(QEMU) -kernel ui.elf -no-reboot -display none \
+	   -serial file:ui-serial.log -monitor stdio >/dev/null 2>&1
+	@convert ui.ppm ui.png && echo "wrote ui.png"
+
+# Driven through QEMU's real emulated mouse: walk onto "count up", click it
+# three times, then drag the slider. Everything else is injected; this is the
+# only target that goes through the 8042 and IRQ12.
+uilive: ui.elf
+	@rm -f ui-live.ppm ui-live.png
+	@( sleep 110; \
+	   echo "mouse_move -160 -120"; sleep 1; \
+	   echo "mouse_move -152 -116"; sleep 1; \
+	   for i in 1 2 3; do echo "mouse_button 1"; sleep 1; echo "mouse_button 0"; sleep 1; done; \
+	   echo "mouse_move 0 72";      sleep 1; \
+	   echo "mouse_button 1";       sleep 1; \
+	   echo "mouse_move 55 0";      sleep 1; \
+	   echo "mouse_button 0";       sleep 1; \
+	   echo "screendump ui-live.ppm"; sleep 2; echo quit ) | \
+	 timeout 220 $(QEMU) -kernel ui.elf -no-reboot -display none \
+	   -serial file:ui-live.log -monitor stdio >/dev/null 2>&1
+	@convert ui-live.ppm ui-live.png && echo "wrote ui-live.png"

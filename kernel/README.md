@@ -78,6 +78,12 @@ make wminrun    # boot it and use it -- this one is interactive
 make wmintest   # headless: inject mouse packets, count pixels, hash the screen
 make wminshot   # save wmin.png
 sh tools/sabotage-wmin.sh    # break it on purpose; check the tests notice
+
+make ui         # immediate-mode widgets: buttons, checkbox, slider, text field
+make uirun      # boot it and click things
+make uitest     # headless: and prove an unchanged frame costs 0 pixels
+make uilive     # drive the real emulated mouse; save ui-live.png
+sh tools/sabotage-ui.sh      # eleven deliberate bugs; the suite must see them
 ```
 
 `make test` needs no display; it drives real keystrokes through QEMU's
@@ -1661,3 +1667,182 @@ Resizing, minimise and maximise, window borders as drag handles, and a scroll
 wheel. The wheel needs the Intellimouse sample-rate handshake (200, 100, 80) to
 switch the mouse into a four-byte packet, which is a self-contained piece of
 work for a later milestone.
+
+---
+
+## K14 — immediate-mode widgets, and no callbacks anywhere
+
+The question this answers is "do we need a lightweight widgets library". The
+answer is that we need widgets and cannot use a library, and the reason is the
+compiler rather than size or licence.
+
+### What nano_cc rejects
+
+```
+long (*f)(long, long);        parse error: expected token kind 1, found kind 32
+struct B { long f : 4; };     parse error: expected token kind 38, found kind 41
+struct D d = { .a = 7 };      expression expected
+```
+
+No function pointers, no bitfields, no designated initialisers — on top of no
+floats, no struct-by-value parameters, six call arguments maximum, and
+`unsigned` parsed and ignored.
+
+The function pointer one decides it. Every retained-mode toolkit is built on
+callbacks: you write `widget->on_click = handler` and the toolkit calls you back
+later. Without function pointers that model cannot be *written down*. Not
+harder, not needing a shim — there is no way to say "call this function later".
+
+### The library that came closest
+
+microui is the right thing to check: MIT, and genuinely small at 1,504 lines
+including its header. Counted against what nano_cc accepts:
+
+| | |
+|---|---|
+| struct-by-value parameters | 43 |
+| functions returning a struct | 12 |
+| function pointers | 3 |
+| bitfields | 2 |
+| libc calls (`memcpy`, `qsort`, …) | 22 |
+| `float` | configurable — `MU_REAL` is a `#define` |
+
+The floats are fine, which is the surprise. The blocker is `mu_Rect`, which is
+`typedef struct { int x, y, w, h; } mu_Rect` and is passed by value into and out
+of nearly every function in the library. That is the same shape as SoftFloat's
+`float128`-by-value problem, forty-three times over. Its three function pointers
+are `text_width`, `text_height` and `draw_frame` — host hooks, the easy ones.
+
+### Why immediate mode is the answer and not a workaround
+
+microui is 1,504 lines while LVGL is over 100,000 for one architectural reason:
+it is **immediate mode**. There is no widget tree, nothing persists between
+frames, and nothing calls you back. A button is a function that draws itself and
+returns whether it was clicked:
+
+```c
+if (ui_button(&ui, "OK")) { ...do the thing, right here... }
+```
+
+That is the one GUI architecture that does not need function pointers. So
+`nano-ui.h` is about four hundred lines: button, label, checkbox, integer
+slider, text field, progress bar.
+
+![the widget panel](ui.png)
+
+### The claim, and the number that tests it
+
+Immediate mode rebuilds every widget every frame. The obvious objection is that
+this throws away everything K11's compositor is for.
+
+It does not, because rebuilding happens into the window's **backing buffer**,
+which is ordinary RAM. Nothing reaches the screen until the compositor is told a
+rectangle is damaged. So each widget compares its visual state against last
+frame's and invalidates only when it differs — an immediate-mode interface with
+retained damage tracking underneath.
+
+That is falsifiable, so `make uitest` falsifies it or does not:
+
+```
+an unchanged frame: 7 widgets rebuilt, 0 invalidated, 0 pixels to the screen
+hovering one button: 1 invalidated, 4,000 pixels  (exactly 200x20, its own rect)
+100 idle frames:   700 widgets rebuilt, 0 pixels to the screen
+                   (a full repaint each frame would have been 78,643,200)
+```
+
+Zero. Every widget was recomputed a hundred times and nothing crossed the bus.
+
+### The behaviour that is easy to get wrong
+
+- **Press, drag off, release is not a click.** This is the entire reason `active`
+  is tracked separately from `hot`, and it is what lets a user change their mind
+  after pressing.
+- **A slider keeps tracking when the pointer leaves it.** Letting go the moment
+  the cursor strays a pixel above the track is the most irritating slider bug
+  there is.
+- **Clicking away unfocuses a text field.** If focus is only ever set and never
+  cleared, one field keeps eating every keystroke.
+- **The field stops at `cap - 1`.** Off by one here overruns the caller's buffer,
+  which in a kernel means corrupting whatever is next to it.
+
+### The bug the framebuffer hash found
+
+Thirty-one characters typed into a 200-pixel field drew straight past the end of
+the widget. `wm_win_text` clips to the *window*, which is far too late.
+
+The pixels landed in the backing buffer, but `ui_track` invalidates the widget's
+own rectangle and nothing else — so they were never pushed to the screen, and
+the buffer and the screen disagreed permanently. Nothing about the picture
+looked wrong; the incremental hash simply stopped matching a full repaint.
+
+**A widget that draws outside its own rectangle is a widget that lies to the
+compositor.** Widgets now clip their own text, and the field scrolls to keep the
+tail visible, because that is where the caret is.
+
+### Proving the tests can fail
+
+`sh tools/sabotage-ui.sh` applies eleven deliberate bugs, one at a time, with a
+baseline run first that requires the clean tree to come back clean.
+
+| broken on purpose | checks that caught it |
+|---|---|
+| a button fires on release wherever the pointer ended up | 2 |
+| the press edge is never consumed | 1 |
+| a second press edge transfers ownership to another widget | 1 |
+| the slider stops tracking once the pointer leaves it | 3 |
+| the slider is not clamped to its range at all | 9 |
+| **every widget invalidates every frame** (the whole claim of K14) | **8** |
+| a text field is never unfocused by clicking elsewhere | 2 |
+| the text field writes one past the end of the caller's buffer | 2 |
+| the text field draws outside its own rectangle | 1 |
+| the field's state hash counts characters instead of reading them | 2 |
+| `hot` is never reset, so it survives the pointer leaving | 2 |
+
+Four were not caught on the first run. One was my own fault twice over and the
+others were real holes:
+
+- **Nothing checked that `active` returns to −1 while merely hovering.** With
+  the press edge never consumed, a hovered button silently owned the pointer
+  forever, and no existing check read that.
+- **The "a second widget cannot steal the pointer" test never produced a second
+  press *edge*.** Holding the button down across two frames gives one press and
+  no more, so the test did not exercise the guard it was named after. It now
+  injects the edge directly — which is also the real-world case, since that is
+  what a dropped release event looks like.
+- **Clicking a *button* to unfocus a text field proved nothing**, because the
+  button takes focus for itself. The branch that actually clears focus is the
+  one for a click landing on something that takes no focus at all, so the test
+  now clicks a label.
+- **The fifth sabotage was a no-op, and so was my first fix for it.** The
+  slider clamps twice — once on the track position, again on the resulting
+  value — and *each is sufficient on its own*, so removing either one is
+  invisible. That is genuine redundancy rather than an untested line, and no
+  test can distinguish it. The property worth testing is "the slider stays in
+  range", so the sabotage now removes all four clamp lines together; nine
+  checks fail.
+
+### End to end, through the actual hardware
+
+`make uilive` drives QEMU's emulated PS/2 mouse from the monitor: it walks the
+pointer onto "count up", clicks it three times, then drags the slider. Nothing
+is injected — the movement arrives as an IRQ12 interrupt.
+
+![driven through the real emulated mouse](ui-live.png)
+
+Three clicks, three lines in the console, the checkbox ticked and the progress
+bar following the slider. The window also took focus on the first click, which
+is why its title bar is lit and the console's is not.
+
+### What is not here
+
+Scrolling regions, drop-down menus, radio groups, and multi-line text. Layout is
+a vertical stack with an equal-width row; there is no wrapping or minimum sizing.
+All of it is additive — the frame, the identity scheme and the damage tracking
+do not change.
+
+Widgets are identified by call order, which is the normal immediate-mode scheme
+and has one sharp edge: hiding a widget behind an `if` shifts the identity of
+every widget after it, so a button can inherit the pressed state of whatever
+used to hold its number. `ui_id()` sets an explicit id, and there is a test that
+pins both halves of that behaviour rather than leaving it to be discovered by a
+button that fires on its own.

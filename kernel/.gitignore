@@ -120,3 +120,14 @@ wmin.elf
 sabotage.log
 sabotage.log.clean
 *.h.orig
+
+# The immediate-mode widget image. nano-ui.h and ui.c are sources; ui.png and
+# ui-live.png are kept because the README shows them.
+ui.s
+blob-ui.s
+ui64.elf
+ui64.bin
+ui.elf
+uik.o
+sabotage-ui.log
+sabotage-ui.log.clean
