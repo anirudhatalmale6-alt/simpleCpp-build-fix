@@ -162,3 +162,12 @@ gltex.elf
 gltexk.o
 sabotage-gltex.log
 sabotage-gltex.log.clean
+
+# The image where a compiled program gets a window. oswin.c, src/wingl.c and
+# src/winbad.c are sources; oswin.png is kept because the README shows it.
+oswin.s
+blob-oswin.s
+oswin64.elf
+oswin64.bin
+oswin.elf
+oswink.o

@@ -32,7 +32,8 @@ QFLAGS := -kernel kernel.elf -no-reboot
         ui uirun uitest uishot uilive \
         gl glrun gltest glshot gllive \
         glapi glapirun glapitest glapishot glapilive \
-        gltex gltexrun gltextest gltexshot gltexlive clean
+        gltex gltexrun gltextest gltexshot gltexlive \
+        oswin oswinrun oswintest oswinshot clean
 
 all: kernel.elf
 
@@ -1143,6 +1144,64 @@ gltexlive: gltex.elf
 	 timeout 260 $(QEMU) -kernel gltex.elf -no-reboot -display none \
 	   -serial file:gltex-live.log -monitor stdio >/dev/null 2>&1
 	@convert gltex-live.ppm gltex-live.png && echo "wrote gltex-live.png"
+
+# ---------------------------------------------------------------------------
+# oswin -- the compiler, the assembler, the ELF loader and the window manager
+# in ONE image, plus five syscalls so a process can ask for a window.
+#
+#     cc --minimal --nasm --bss --kernel wingl.c wingl.asm
+#     as wingl.asm /bin/wingl -b 0x8000000000
+#     exec /bin/wingl
+#
+# ...and a rotating cube appears in a window, drawn by a program this machine
+# compiled, in its own address space, with its own arithmetic. What crosses the
+# syscall boundary is a HANDLE and a copy, never a pointer into the window.
+# ---------------------------------------------------------------------------
+oswin.s: oswin.c nano-kernel.h nano-mouse.h nano-int.h nano-fb.h nano-font.h \
+      nano-mm.h nano-thread.h nano-fs.h nano-wm.h nano-wmin.h nano-proc.h \
+      nano-term.h $(NANO)
+	$(NANO) --kernel oswin.c oswin.s
+
+oswin64.bin: boot64.s isr.s oswin.s progs.s $(UPROGS) src/wingl.c src/winbad.c kernel64.ld
+	as --64 boot64.s -o boot64.o
+	as --64 isr.s    -o isr.o
+	as --64 oswin.s  -o oswink.o
+	as --64 progs.s  -o progs.o
+	ld -T kernel64.ld -o oswin64.elf boot64.o isr.o oswink.o progs.o
+	objcopy -O binary oswin64.elf oswin64.bin
+
+blob-oswin.s:
+	@printf '.section .blob, "a"\n.incbin "oswin64.bin"\n' > $@
+
+oswin.elf: boot32.s blob-oswin.s oswin64.bin final.ld
+	as --32 boot32.s     -o boot32.o
+	as --32 blob-oswin.s -o blob-oswin.o
+	ld -m elf_i386 -T final.ld -o oswin.elf boot32.o blob-oswin.o
+
+oswin: oswin.elf
+
+oswinrun: oswin.elf
+	$(QEMU) -m 512 -kernel oswin.elf -no-reboot
+
+oswintest: oswin.elf
+	@rm -f oswin-serial.log
+	@( sleep 120; echo quit ) | \
+	 timeout 190 $(QEMU) -m 512 -kernel oswin.elf -no-reboot -display none \
+	   -serial file:oswin-serial.log -monitor stdio >/dev/null 2>&1; \
+	 echo "---- serial output ----"; cat oswin-serial.log; echo "-----------------------"; \
+	 tr -d '\r' < oswin-serial.log > oswin-serial.clean; \
+	 grep -q "OSWINTEST DONE" oswin-serial.clean \
+	   && ! grep -q "FAIL" oswin-serial.clean \
+	   && grep -q "PASS: the machine compiled a graphical program" oswin-serial.clean \
+	   && echo "PASS: source to a window, entirely inside the machine" \
+	   || { echo "FAIL"; exit 1; }
+
+oswinshot: oswin.elf
+	@rm -f oswin.ppm oswin.png
+	@( sleep 128; echo "screendump oswin.ppm"; sleep 2; echo quit ) | \
+	 timeout 200 $(QEMU) -m 512 -kernel oswin.elf -no-reboot -display none \
+	   -serial file:oswin-serial.log -monitor stdio >/dev/null 2>&1
+	@convert oswin.ppm oswin.png && echo "wrote oswin.png"
 
 clean:
 	@# NOT user/*.s -- ustart.s is a source file, and the generated ones are

@@ -459,6 +459,12 @@ struct Proc {
 };
 
 struct Proc g_procs[MAX_PROCS];
+
+// How many finished processes have had their table entry taken back because
+// nothing was left. Worth counting rather than doing silently: it is exactly
+// the number of exit codes that were thrown away.
+long g_procs_recycled;
+
 long g_next_pid;
 long g_proc_faults;
 
@@ -468,14 +474,48 @@ void proc_init() {
     while (i < MAX_PROCS) { g_procs[i].state = P_FREE; g_procs[i].pid = 0; i = i + 1; }
     g_next_pid = 1;
     g_proc_faults = 0;
+    g_procs_recycled = 0;
     enable_write_protect();
     g_nx_on = enable_nx();
 }
 
 long proc_slot() {
     long i;
+    long oldest;
+    long oldest_pid;
+
     i = 0;
     while (i < MAX_PROCS) { if (g_procs[i].state == P_FREE) return i; i = i + 1; }
+
+    // Nothing free. Take back the OLDEST finished entry.
+    //
+    // Without this the table fills up with the corpses of processes that ran
+    // and exited, and the machine can only ever run MAX_PROCS programs in its
+    // whole lifetime -- which is what happened the first time this image left
+    // a program respawning on a loop for a screenshot: it ran ten times and
+    // then quietly stopped, and the desktop was empty.
+    //
+    // Oldest by pid, because pids only increase. Recycling loses that entry's
+    // exit code, so the count above says how often it has happened; if it is
+    // climbing, something is spawning and never collecting.
+    oldest = -1;
+    oldest_pid = 0;
+    i = 0;
+    while (i < MAX_PROCS) {
+        if (g_procs[i].state == P_EXITED || g_procs[i].state == P_KILLED) {
+            if (oldest < 0 || g_procs[i].pid < oldest_pid) {
+                oldest = i;
+                oldest_pid = g_procs[i].pid;
+            }
+        }
+        i = i + 1;
+    }
+    if (oldest >= 0) {
+        g_procs[oldest].state = P_FREE;
+        g_procs[oldest].pid = 0;
+        g_procs_recycled = g_procs_recycled + 1;
+        return oldest;
+    }
     return -1;
 }
 
@@ -685,6 +725,11 @@ long proc_poll() {
                 }
                 as_destroy(g_procs[i].root);
                 g_procs[i].root = 0;
+#ifdef NANO_WM_H
+                // A window with no process behind it can never be repainted,
+                // and its handle can be reissued to somebody else.
+                win_close_owned(g_procs[i].pid);
+#endif
                 g_threads[t].state = T_UNUSED;
                 n = n + 1;
             }
@@ -736,6 +781,17 @@ long proc_wait(long pid) {
 #define SYS_TICKS  10
 #define SYS_UNLINK 11
 #define SYS_BRK    12
+
+// The window calls. Numbers exist whether or not a window manager was
+// compiled in; the IMPLEMENTATIONS are behind #ifdef NANO_WM_H and every one
+// of them answers -1 when it is absent. A syscall number that means one thing
+// in one image and nothing in another would be far worse than a number that
+// always means the same thing and sometimes fails.
+#define SYS_WINOPEN    13
+#define SYS_WINBLIT    14
+#define SYS_WINPRESENT 15
+#define SYS_WINPOLL    16
+#define SYS_WINCLOSE   17
 
 // Set by a syscall that must not simply return to its caller. The dispatcher
 // in nano-int.h checks it and reschedules instead.
@@ -837,12 +893,64 @@ long sys_sbrk(long slot, long delta) {
 // virtual addresses in the address space that is currently installed -- which
 // is the calling process's, because the interrupt did not change it.
 //
+#ifdef NANO_WM_H
+// ---------- windows, owned by processes ----------
+//
+// A window handle crosses the syscall boundary, and that is the whole point of
+// this layer: the process asks for a window, draws into ITS OWN memory, and
+// blits. The window's backing buffer never leaves the kernel, so the address
+// space isolation from K7 holds -- a process cannot be handed a pointer into
+// another process's window, because it is never handed a pointer at all.
+//
+// Ownership is recorded here rather than in struct Win, so that nano-wm.h
+// stays a window manager and knows nothing about processes. A window opened by
+// the kernel itself has owner 0, which no process has.
+long g_win_owner[WM_MAXWIN];
+
+long win_owned_by(long hnd, long pid) {
+    if (hnd < 0 || hnd >= WM_MAXWIN) return 0;
+    if (!g_win[hnd].used) return 0;
+    return g_win_owner[hnd] == pid && pid != 0;
+}
+
+// Destroy every window a process left behind. Called from proc_poll, which is
+// the first point at which the process is provably not running.
+//
+// Without this a window outlives the only thing that could repaint it: it sits
+// on the desktop showing the last frame forever, and worse, the handle can be
+// reissued to a different process which then inherits somebody else's pixels.
+long win_close_owned(long pid) {
+    long i;
+    long n;
+    n = 0;
+    if (pid == 0) return 0;
+    i = 0;
+    while (i < WM_MAXWIN) {
+        if (g_win[i].used && g_win_owner[i] == pid) {
+            g_win_owner[i] = 0;
+            wm_destroy(i);
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    return n;
+}
+#endif
+
 // Those pointers are NOT validated. At CPL 0 there is nothing to validate
 // against: the process could dereference the same address itself without
 // asking. Once programs run in ring 3 every pointer here needs a range check,
 // and that check is part of the ring-3 milestone rather than something to
 // pretend is already here.
-long syscall_dispatch(long nr, long a, long b, long c) {
+// Six arguments, which is exactly nano_cc's ceiling and exactly what
+// SYS_WINBLIT needs: a handle, a pointer, a width, a height and a destination
+// x and y. The first three arrive in rdi/rsi/rdx as before; the fourth and
+// fifth are r10 and r8, which is the register Linux picked for the same reason
+// -- `syscall` destroys rcx, so the fourth argument cannot live there.
+//
+// Everything that already existed still passes 0 for d and e, so no existing
+// program or call site changes meaning.
+long syscall_dispatch(long nr, long a, long b, long c, long d, long e) {
     long slot;
 
     g_syscalls = g_syscalls + 1;
@@ -948,6 +1056,139 @@ long syscall_dispatch(long nr, long a, long b, long c) {
     // SYS_TICKS is answered by the dispatcher in nano-int.h, which is the file
     // that owns g_ticks and is included after this one.
     if (nr == SYS_UNLINK) return fs_unlink(proc_path(slot, (char *)a));
+
+#ifdef NANO_WM_H
+    // ---------- the window calls ----------
+
+    // (x, y, w, h, title) -> a handle, or -1. The title is copied by
+    // wm_create, so the process's string does not have to outlive the call.
+    if (nr == SYS_WINOPEN) {
+        long hnd;
+        if (slot < 0) return -1;
+        if (c < 16 || d < 16 || c > 1024 || d > 768) return -1;
+        hnd = wm_create(a, b, c, d, (char *)e);
+        if (hnd < 0) return -1;
+        wm_decorate(hnd);
+        g_win_owner[hnd] = g_procs[slot].pid;
+        wm_raise(hnd);
+        return hnd;
+    }
+
+    // (handle, pixels, w, h, offset) -> pixels copied, or -1.
+    //
+    // ONE destination offset, not an x and a y, and that is the argument limit
+    // showing up again: syscall_dispatch takes six parameters and the syscall
+    // number is one of them, so five are left. A handle, a pointer, a width, a
+    // height and a position is six things. So the position is a LINEAR offset
+    // into the client area -- row-major, the same index you would use into the
+    // backing buffer itself -- which is one number and reads as one idea,
+    // rather than an x and a y bit-packed into a long, which is one number and
+    // reads as a trick.
+    //
+    // The copy goes one row at a time and is clipped to the window's CLIENT
+    // area, so a process cannot paint over its own title bar or past the edge
+    // of its window, let alone into the next one. Clipping here rather than
+    // trusting the caller is the whole difference between a syscall and a
+    // shared buffer.
+    if (nr == SYS_WINBLIT) {
+        long *src;
+        long j;
+        long copied;
+        long cw;
+        long ch;
+        long ox;
+        long oy;
+        if (slot < 0 || !win_owned_by(a, g_procs[slot].pid)) return -1;
+        if (b == 0 || c <= 0 || d <= 0) return -1;
+        cw = wm_client_w(a);
+        ch = wm_client_h(a);
+        if (cw <= 0 || ch <= 0) return -1;
+        if (e < 0) return -1;
+        ox = e % cw;
+        oy = e / cw;
+        src = (long *)b;
+        copied = 0;
+        j = 0;
+        while (j < d) {
+            long dy;
+            dy = oy + j;
+            if (dy >= 0 && dy < ch) {
+                long i;
+                i = 0;
+                while (i < c) {
+                    long dx;
+                    dx = ox + i;
+                    if (dx >= 0 && dx < cw) {
+                        wm_win_pixel(a, wm_client_x() + dx, wm_client_y() + dy,
+                                     src[j * c + i]);
+                        copied = copied + 1;
+                    }
+                    i = i + 1;
+                }
+            }
+            j = j + 1;
+        }
+        // Damage only the rectangle that was actually written, clipped the
+        // same way. Invalidating the whole client area would work and would
+        // throw away everything the compositor milestone was for.
+        {
+            long rx; long ry; long rw; long rh;
+            rx = ox; ry = oy; rw = c; rh = d;
+            if (rx < 0) { rw = rw + rx; rx = 0; }
+            if (ry < 0) { rh = rh + ry; ry = 0; }
+            if (rx + rw > cw) rw = cw - rx;
+            if (ry + rh > ch) rh = ch - ry;
+            if (rw > 0 && rh > 0)
+                wm_invalidate(a, wm_client_x() + rx, wm_client_y() + ry, rw, rh);
+        }
+        return copied;
+    }
+
+    // (handle) -> 0. Push whatever this window has damaged to the screen.
+    // Separate from the blit on purpose: a process that blits three times and
+    // presents once pays for one composite, not three.
+    if (nr == SYS_WINPRESENT) {
+        if (slot < 0 || !win_owned_by(a, g_procs[slot].pid)) return -1;
+        wm_present();
+        return 0;
+    }
+
+    // (handle, ptr to six longs) -> 1 while the window exists, 0 once it does
+    // not. The six are the pointer x and y in CLIENT coordinates, the button
+    // state, one keystroke, and the CLIENT SIZE.
+    //
+    // The size is in there because a program has no other way to learn it. It
+    // asked for a window of a given outside size; how much of that is border
+    // and title bar is the window manager's business and can change. A program
+    // that hardcodes "minus four and minus eighteen" is a program that draws
+    // over its own title bar the day the theme changes.
+    //
+    // Returning 0 for a window that is gone is how a process finds out that
+    // somebody clicked its close box. Without it, a program whose window has
+    // been destroyed spins forever blitting into nothing.
+    if (nr == SYS_WINPOLL) {
+        long *out;
+        if (slot < 0) return 0;
+        if (!win_owned_by(a, g_procs[slot].pid)) return 0;
+        out = (long *)b;
+        if (out) {
+            out[0] = g_mouse_x - g_win[a].x - wm_client_x();
+            out[1] = g_mouse_y - g_win[a].y - wm_client_y();
+            out[2] = g_mouse_btn;
+            out[3] = 0;
+            out[4] = wm_client_w(a);
+            out[5] = wm_client_h(a);
+        }
+        return 1;
+    }
+
+    if (nr == SYS_WINCLOSE) {
+        if (slot < 0 || !win_owned_by(a, g_procs[slot].pid)) return -1;
+        g_win_owner[a] = 0;
+        wm_destroy(a);
+        return 0;
+    }
+#endif
 
     return -1;
 }

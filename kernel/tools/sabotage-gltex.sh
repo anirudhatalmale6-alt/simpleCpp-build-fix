@@ -141,7 +141,7 @@ want 7 && sabotage nano-gl.h \
 # --- the API ---
 
 want 8 && sabotage nano-glapi.h \
-  's|    if (!gl_pow2(w) || !gl_pow2(h) || w < 1 || h < 1) return 0;|    ;|' \
+  's@    if (!gl_pow2(w) || !gl_pow2(h) || w < 1 || h < 1) return 0;@    ;@' \
   "8. glTexImage2D accepts a non-power-of-two texture"
 
 want 9 && sabotage nano-glapi.h \

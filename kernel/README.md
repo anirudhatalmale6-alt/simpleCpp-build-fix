@@ -2447,3 +2447,135 @@ Texturing adds a divide per pixel, not a pixel.
 
 The in-OS compile, then VBOs and vertex arrays, a scenegraph, an OBJ loader and
 a lit gears demo.
+
+## K18 — the machine compiles a graphical program and gives it a window
+
+```
+make oswin        # build
+make oswinrun     # boot it with a window
+make oswintest    # headless: compile, assemble, run, and check the boundary
+make oswinshot    # boot and screenshot
+```
+
+![a cube drawn by a program this machine compiled](oswin.png)
+
+The two halves of this had existed separately for a while. K8 put the C
+compiler inside the OS; K9 put the assembler in, so source became a process
+without anything outside the machine being involved. K11 through K17 built a
+compositor, a window manager, widgets and a renderer. What was missing was that
+those had **never been the same image**, and a user process had no way to ask
+for a window even if they had been.
+
+```
+cc --minimal --nasm --bss --kernel wingl.c wingl.asm
+as wingl.asm /bin/wingl -b 0x8000000000
+exec /bin/wingl
+```
+
+...and a rotating wireframe cube appears in a window. The sine table, the 3×3
+rotation in 16.16, the perspective divide and Bresenham's line algorithm are
+all in `src/wingl.c` — computed by the program, in the program's own address
+space. The kernel's renderer is not involved and could not be: a process cannot
+call a kernel function.
+
+### What crosses the boundary is a handle, not a pointer
+
+Five new syscalls:
+
+| | |
+|---|---|
+| `SYS_WINOPEN(x, y, w, h, title)` | → a handle, or -1 |
+| `SYS_WINBLIT(handle, pixels, w, h, offset)` | → pixels copied, clipped |
+| `SYS_WINPRESENT(handle)` | composite to the screen |
+| `SYS_WINPOLL(handle, out)` | pointer, buttons, key, **and the client size** |
+| `SYS_WINCLOSE(handle)` | |
+
+The process draws into memory it got from `sbrk` and calls `SYS_WINBLIT`; the
+kernel **copies**, clipped to the window's client area. The window's backing
+buffer never leaves the kernel, so the address-space isolation from K7 holds —
+there is no shared mapping to get wrong, because there is no shared mapping.
+
+`SYS_WINPOLL` reports the client size because a program has no other way to
+learn it. It asked for a window of a given outside size; how much of that is
+border and title bar is the window manager's business and can change. A program
+that hardcodes "minus four and minus eighteen" draws over its own title bar the
+day the theme changes.
+
+The dispatcher was widened from three arguments to six — `r10` and `r8` for the
+fourth and fifth, which is the register Linux picked for the same reason
+(`syscall` destroys `rcx`). Six parameters is nano_cc's ceiling and the syscall
+number is one of them, so **five** are usable. A handle, a pointer, a width, a
+height and a position is six things, so the position is a **linear offset** into
+the client area — one number that reads as one idea, rather than an x and a y
+bit-packed into a long, which is one number that reads as a trick.
+
+### The boundary, tested from the wrong side of it
+
+`src/winbad.c` is a second program the machine compiles, and it misbehaves on
+purpose. Twelve checks, every one of them made from **inside a process**:
+
+- a window smaller than the minimum is refused
+- blitting into window 0, which the kernel owns → refused
+- blitting into handle 999, and handle -1 → refused
+- an in-bounds blit copies exactly what it was given
+- a blit hanging off the right and bottom edges copies **fewer** pixels than it
+  was given, which is the only observable proof from out there that it was
+  clipped rather than trusted
+- a null pixel pointer, and a zero-sized blit → refused, not dereferenced
+- polling a window it does not own says "gone"
+- after closing, its own handle polls "gone" and blits refused
+
+Its exit code is a bit mask, one bit per check that failed, so 0 is the only
+passing value and the number says which ones if it is not. And after all of
+that, the kernel's own window is **bit-for-bit unchanged**.
+
+A kernel test that calls its own clipping code and finds that it clips proves
+the function works. Only a process can prove that a process cannot get past it.
+
+### A leak this found: the process table filled up with corpses
+
+The image was left respawning the demo on a loop so the screenshot would catch
+it. The screenshot came back with an empty desktop.
+
+A finished process still occupies a table entry. `proc_slot` only ever returned
+a `P_FREE` one, so after `MAX_PROCS` programs the machine could not start
+another — it ran ten times and then **quietly** stopped. `proc_spawn` returned
+0, nothing faulted, nothing printed.
+
+`proc_slot` now takes back the oldest finished entry when nothing is free, and
+**counts** how often it has to, because recycling loses that entry's exit code
+and doing it silently would be the same bug in a different place. The test runs
+twenty-two programs through a sixteen-entry table:
+
+```
+22 of 22 runs started; 12 table entries were recycled
+ok  every run started, table full or not = 22
+ok  ...and every one of them passed its own checks
+ok  ...and the table did have to recycle
+ok  no window leaked across twenty-two runs = 2
+```
+
+The window count matters as much as the run count: twenty-two windows opened
+and closed, and the desktop ended with exactly the two it started with.
+
+### And one test that measured the wrong thing
+
+The check for "the program animated" counted pixels differing from the
+**window's** background. The program blits its whole client area every frame, so
+from the second frame onward every pixel differs and the count is the area,
+forever. It reported *two distinct frames* for sixty frames of animation, and
+the failure read as the program not drawing.
+
+Two properties replaced it, neither deciding in advance what the picture should
+look like:
+
+```
+the hash of the client area CHANGES between frames  -> it animated   (47 frames)
+several distinct colours are present                -> it drew structure, not a fill
+```
+
+A solid-colour blit satisfies "every pixel changed" and fails both.
+
+### What is next
+
+VBOs and vertex arrays, a scenegraph, an OBJ loader, and a lit gears demo.

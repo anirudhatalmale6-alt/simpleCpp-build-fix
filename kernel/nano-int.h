@@ -278,7 +278,8 @@ long isr_dispatch(struct Regs *r) {
             // dispatcher above can see the scheduler and the process table.
             r->rax = g_ticks;
         } else {
-            r->rax = syscall_dispatch(r->rax, r->rdi, r->rsi, r->rdx);
+            r->rax = syscall_dispatch(r->rax, r->rdi, r->rsi, r->rdx,
+                                      r->r10, r->r8);
         }
         // exit() and yield() must not resume the caller: one has no caller
         // left, the other asked to be moved off the CPU. Both go through the

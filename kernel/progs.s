@@ -68,7 +68,42 @@ p_prog:
     .incbin "src/prog.c"
 p_prog_end:
 
+/* The graphical programs. Same idea as src/prog.c -- real files, compiled
+ * inside the machine -- but these ask the window manager for a window and blit
+ * their own pixels into it. src/winbad.c is the one that misbehaves on
+ * purpose: it blits out of bounds and at a handle it does not own, and reports
+ * what the kernel said. */
+.align 16
+p_wingl:
+    .incbin "src/wingl.c"
+p_wingl_end:
+
+.align 16
+p_winbad:
+    .incbin "src/winbad.c"
+p_winbad_end:
+
 .section .text
+
+.globl prog_wingl_addr
+prog_wingl_addr:
+    lea p_wingl(%rip), %rax
+    ret
+
+.globl prog_wingl_size
+prog_wingl_size:
+    mov $(p_wingl_end - p_wingl), %rax
+    ret
+
+.globl prog_winbad_addr
+prog_winbad_addr:
+    lea p_winbad(%rip), %rax
+    ret
+
+.globl prog_winbad_size
+prog_winbad_size:
+    mov $(p_winbad_end - p_winbad), %rax
+    ret
 
 .globl prog_hello_addr
 prog_hello_addr:

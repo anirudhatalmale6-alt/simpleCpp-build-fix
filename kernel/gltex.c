@@ -629,6 +629,32 @@ void test_modulate() {
            (tinted >> 16) & 255, (plain >> 16) & 255);
     expect("...and removes its green", (tinted >> 8) & 255, 0);
 
+    // And the other way round, which is what actually pins the red channel's
+    // modulation. "Keeps its red" is also true of a renderer that ignores the
+    // primary colour in red entirely -- the sabotage matrix showed exactly
+    // that slipping past, caught only by an unrelated lighting check.
+    gl_clear(&g_gl);
+    gl_state_init(&g_gls, &g_gl);
+    glColor3ub(&g_gls, 0, 255, 255);
+    glDisable(&g_gls, GL_LIGHTING);
+    glEnable(&g_gls, GL_TEXTURE_2D);
+    glBindTexture(&g_gls, GL_TEXTURE_2D, g_coord_name);
+    glMatrixMode(&g_gls, GL_MODELVIEW);
+    glLoadIdentity(&g_gls);
+    glBegin(&g_gls, GL_QUADS);
+    glTexCoord2x(&g_gls, 0, 0);           glVertex3x(&g_gls, 0 - GL_ONE, 0 - GL_ONE, 3 * GL_ONE);
+    glTexCoord2x(&g_gls, 0, GL_ONE);      glVertex3x(&g_gls, 0 - GL_ONE, GL_ONE, 3 * GL_ONE);
+    glTexCoord2x(&g_gls, GL_ONE, GL_ONE); glVertex3x(&g_gls, GL_ONE, GL_ONE, 3 * GL_ONE);
+    glTexCoord2x(&g_gls, GL_ONE, 0);      glVertex3x(&g_gls, GL_ONE, 0 - GL_ONE, 3 * GL_ONE);
+    glEnd(&g_gls);
+    {
+        long cyan;
+        cyan = vp_pixel(VPW / 2, VPH / 2);
+        expect("a primary colour with no red removes the texel's red",
+               (cyan >> 16) & 255, 0);
+        expect("...and keeps its green", (cyan >> 8) & 255, (plain >> 8) & 255);
+    }
+
     // Lighting on. The default light points straight down the view axis, and
     // this quad faces straight down the view axis, so it is fully lit and
     // NOTHING IS DARKENED -- my first version of this check asserted a
