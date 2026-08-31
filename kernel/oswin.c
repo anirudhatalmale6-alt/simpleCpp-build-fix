@@ -54,6 +54,12 @@ extern long prog_as_addr();
 extern long prog_as_size();
 extern long prog_wingl_addr();
 extern long prog_wingl_size();
+extern long prog_ugears_addr();
+extern long prog_ugears_size();
+extern long prog_hgl_addr();
+extern long prog_hgl_size();
+extern long prog_hglapi_addr();
+extern long prog_hglapi_size();
 extern long prog_winbad_addr();
 extern long prog_winbad_size();
 
@@ -239,7 +245,11 @@ long client_hash(long hnd) {
     return h;
 }
 
-#define MAX_SEEN 16
+// Raised from 16 for the gears. A saturating counter answers "at least this
+// many", and 16 was low enough that a flat-shaded scene and a wireframe gave
+// the same answer -- the tell was that the number came back EXACTLY at the
+// cap. wingl's own check wants 3, so nothing below is affected.
+#define MAX_SEEN 64
 
 long g_seen[MAX_SEEN];
 
@@ -382,6 +392,10 @@ void main_thread(long unused) {
     install("/bin/as", prog_as_addr(), prog_as_size());
     install("/src/wingl.c", prog_wingl_addr(), prog_wingl_size());
     install("/src/winbad.c", prog_winbad_addr(), prog_winbad_size());
+    // The renderer itself, so the compiler inside the machine can include it.
+    install("/src/gears.c", prog_ugears_addr(), prog_ugears_size());
+    install("/src/nano-gl.h", prog_hgl_addr(), prog_hgl_size());
+    install("/src/nano-glapi.h", prog_hglapi_addr(), prog_hglapi_size());
 
     build_desktop();
     g_kwin_hash_before = kwin_hash();
@@ -452,7 +466,7 @@ void main_thread(long unused) {
         printf("winbad exited with %d\n", code);
         // Every bit of the exit code is one check that FAILED, so 0 is the
         // only passing value and the number says which ones if it is not.
-        expect("every one of winbad's twelve checks held", code, 0);
+        expect("every one of winbad's twenty-two checks held", code, 0);
     }
 
     // The kernel's own window must be untouched, pixel for pixel, after a
@@ -460,6 +474,63 @@ void main_thread(long unused) {
     g_kwin_hash_after = kwin_hash();
     expect_true("the kernel's window is bit-for-bit unchanged",
                 g_kwin_hash_after == g_kwin_hash_before);
+
+    // ============================================================
+    // 3b. the renderer, compiled INTO a program
+    // ============================================================
+    //
+    // This is the one the milestone is about. src/gears.c includes nano-gl.h
+    // and nano-glapi.h -- the same two files these kernel images compile
+    // against -- and the compiler inside the machine compiles all 2,500 lines
+    // of it into a process. The process gets its pixels and its depth buffer
+    // from sbrk, renders into them with a real GL, and blits the result
+    // through the window syscalls.
+    //
+    // Nothing about the boundary changes: what crosses it is still a handle
+    // and a copy. The renderer is simply on the other side of it now.
+    puts("\n== 3b. cc gears.c -- the whole renderer, into a process ==\n");
+    {
+        long t0;
+        long t1;
+        long ino;
+
+        t0 = g_ticks;
+        ok = build("gears.c", "gears.asm", "/bin/gears");
+        t1 = g_ticks;
+        expect_true("gears was built inside the machine, renderer and all", ok);
+        printf("that took %d ticks\n", t1 - t0);
+
+        if (ok) {
+            ino = fs_lookup("/bin/gears");
+            printf("/bin/gears is %d bytes, the loader's limit is %d\n",
+                   fs_size(ino), ELF_MAX);
+            expect_true("...and it fits under the loader's limit",
+                        fs_size(ino) < ELF_MAX);
+
+            // Freeing the intermediate: gears.asm is about 600 KB and the RAM
+            // disk is 2 MB. Leaving it there is what makes the NEXT thing to
+            // be compiled fail with a disk-full error that looks like a
+            // compiler bug.
+            fs_unlink("/src/gears.asm");
+
+            puts("\n== 3c. run it ==\n");
+            code = run_and_watch("/bin/gears", 0);
+            printf("gears exited with %d\n", code);
+            expect("every one of the program's own checks held", code, 0);
+            expect_true("it got a window", g_saw_window >= 0);
+            // "at least", not "at most": client_colours stops counting at
+            // MAX_SEEN and returns, so a number equal to the cap means the
+            // real one is somewhere above it.
+            printf("%d distinct frames, at least %d colours\n",
+                   g_frames_seen, g_max_colours);
+            expect_true("...and drew more than one frame in it", g_frames_seen > 4);
+            // Flat shading on three materials: the background, three gear
+            // colours and a shade per face orientation. A wireframe or a
+            // failed render would be far below this.
+            expect_true("...lit, with a shade per face orientation",
+                        g_max_colours > 20);
+        }
+    }
 
     // ============================================================
     // 4. more programs than the table has room for

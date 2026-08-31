@@ -83,7 +83,56 @@ p_winbad:
     .incbin "src/winbad.c"
 p_winbad_end:
 
+/* src/gears.c and the two renderer headers it includes. This is the whole of
+ * nano-gl.h and nano-glapi.h going onto the RAM disk so that the compiler
+ * INSIDE the machine can #include them -- the same two files the kernel
+ * images compile against, not a copy and not a subset. */
+.align 16
+p_ugears:
+    .incbin "src/gears.c"
+p_ugears_end:
+
+.align 16
+p_hgl:
+    .incbin "nano-gl.h"
+p_hgl_end:
+
+.align 16
+p_hglapi:
+    .incbin "nano-glapi.h"
+p_hglapi_end:
+
 .section .text
+
+.globl prog_ugears_addr
+prog_ugears_addr:
+    lea p_ugears(%rip), %rax
+    ret
+
+.globl prog_ugears_size
+prog_ugears_size:
+    mov $(p_ugears_end - p_ugears), %rax
+    ret
+
+.globl prog_hgl_addr
+prog_hgl_addr:
+    lea p_hgl(%rip), %rax
+    ret
+
+.globl prog_hgl_size
+prog_hgl_size:
+    mov $(p_hgl_end - p_hgl), %rax
+    ret
+
+.globl prog_hglapi_addr
+prog_hglapi_addr:
+    lea p_hglapi(%rip), %rax
+    ret
+
+.globl prog_hglapi_size
+prog_hglapi_size:
+    mov $(p_hglapi_end - p_hglapi), %rax
+    ret
 
 .globl prog_wingl_addr
 prog_wingl_addr:

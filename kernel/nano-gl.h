@@ -371,6 +371,20 @@ struct GLCtx {
     // glEnable/glDisable state. Kept on the context rather than in a global
     // because two viewports in two windows are two independent renderers, and
     // OpenGL's one-big-global-state is the part of the design nobody defends.
+    // The surface being drawn into, rather than a window handle.
+    //
+    // The renderer used to write straight into g_win[c->win].pix, which meant
+    // it could only ever run in the kernel: a process cannot call a kernel
+    // function and cannot see that array. Naming the surface instead is what
+    // lets the SAME renderer be linked into a user program, which draws into
+    // memory it got from sbrk and blits the result through a syscall -- the
+    // wingl.c arrangement, with a real GL behind it.
+    long *pix;             // the pixels
+    long stride;           // pixels per row
+    long surfh;            // rows
+    long owns_win;         // 1 = pix belongs to a window, so damage is the
+                           // compositor's business; 0 = the caller's buffer
+
     long cull;             // GL_CULL_FACE
     // Which winding faces the camera. This renderer looks along +z where
     // standard GL looks along -z, so a model written for GL -- gears.c, an
@@ -473,11 +487,10 @@ void gl_perspective_pixels(struct GLCtx *c) {
     gl_frustum(c, 0 - r, r, 0 - t, t);
 }
 
-long gl_bind(struct GLCtx *c, long win, long x, long y, long w, long h) {
-    if (w <= 0 || h <= 0 || w > GL_MAXW || h > GL_MAXH) return 0;
-    if (!g_win[win].used) return 0;
-    c->win = win;
-    c->vx = x; c->vy = y; c->vw = w; c->vh = h;
+// Everything gl_bind sets that is not about WHERE the pixels are. Split out
+// so the window path and the buffer path cannot drift apart -- two copies of
+// "the default near plane is a quarter of a unit" is how they would.
+void gl_defaults(struct GLCtx *c, long w) {
     c->focal = w;                       // ~53 degree horizontal field of view
     c->near = GL_ONE / 4;
     // 64 units, not a million. The far plane's coefficient in the extracted
@@ -498,12 +511,54 @@ long gl_bind(struct GLCtx *c, long win, long x, long y, long w, long h) {
     c->wire = 0;
     c->bg = rgb(12, 14, 22);
     c->light.x = 0; c->light.y = 0; c->light.z = 0 - GL_ONE;
-    c->zbuf = (long *)kmalloc(w * h * 8);
-    if (!c->zbuf) return 0;
     c->dx0 = 0; c->dy0 = 0; c->dx1 = -1; c->dy1 = -1;
     gl_perspective_pixels(c);
+}
+
+// Render into memory the caller owns, with no window and no kernel behind it.
+//
+// This is the entry point a user program uses: it allocates the pixels and the
+// depth buffer from sbrk, renders, and blits the result through SYS_WINBLIT.
+// Six arguments, which is nano_cc's ceiling exactly -- so the viewport is the
+// whole buffer rather than a rectangle inside it, which is what a program
+// that owns its own pixels wants anyway.
+//
+// The depth buffer is the caller's too: w*h longs, and there is no kmalloc on
+// that side of the boundary.
+long gl_bind_buf(struct GLCtx *c, long *pix, long w, long h, long *zbuf) {
+    if (w <= 0 || h <= 0 || w > GL_MAXW || h > GL_MAXH) return 0;
+    if (!pix || !zbuf) return 0;
+    c->win = -1;
+    c->pix = pix;
+    c->stride = w;
+    c->surfh = h;
+    c->owns_win = 0;
+    c->vx = 0; c->vy = 0; c->vw = w; c->vh = h;
+    c->zbuf = zbuf;
+    gl_defaults(c, w);
     return 1;
 }
+
+// The window path. Guarded because it is the ONLY thing in this header that
+// needs the window manager and the kernel heap -- three references, all in
+// here and in gl_flush. A user program defines GL_NO_WM, supplies its own
+// pixels and depth buffer through gl_bind_buf, and gets the same renderer.
+#ifndef GL_NO_WM
+long gl_bind(struct GLCtx *c, long win, long x, long y, long w, long h) {
+    if (w <= 0 || h <= 0 || w > GL_MAXW || h > GL_MAXH) return 0;
+    if (!g_win[win].used) return 0;
+    c->win = win;
+    c->pix = g_win[win].pix;
+    c->stride = g_win[win].w;
+    c->surfh = g_win[win].h;
+    c->owns_win = 1;
+    c->vx = x; c->vy = y; c->vw = w; c->vh = h;
+    c->zbuf = (long *)kmalloc(w * h * 8);
+    if (!c->zbuf) return 0;
+    gl_defaults(c, w);
+    return 1;
+}
+#endif
 
 void gl_mark(struct GLCtx *c, long x, long y) {
     if (c->dx1 < c->dx0) { c->dx0 = x; c->dx1 = x; c->dy0 = y; c->dy1 = y; return; }
@@ -521,8 +576,8 @@ void gl_put(struct GLCtx *c, long x, long y, long colour) {
     if (x < 0 || y < 0 || x >= c->vw || y >= c->vh) return;
     wx = c->vx + x;
     wy = c->vy + y;
-    if (wx < 0 || wy < 0 || wx >= g_win[c->win].w || wy >= g_win[c->win].h) return;
-    g_win[c->win].pix[wy * g_win[c->win].w + wx] = colour;
+    if (wx < 0 || wy < 0 || wx >= c->stride || wy >= c->surfh) return;
+    c->pix[wy * c->stride + wx] = colour;
     c->pixels = c->pixels + 1;
     gl_mark(c, x, y);
 }
@@ -533,7 +588,18 @@ void gl_clear(struct GLCtx *c) {
     n = c->vw * c->vh;
     i = 0;
     while (i < n) { c->zbuf[i] = 0; i = i + 1; }   // 1/z of 0 = infinitely far
-    wm_win_fill(c->win, c->vx, c->vy, c->vw, c->vh, c->bg);
+    {
+        long j;
+        j = 0;
+        while (j < c->vh) {
+            long k;
+            long row;
+            row = (c->vy + j) * c->stride + c->vx;
+            k = 0;
+            while (k < c->vw) { c->pix[row + k] = c->bg; k = k + 1; }
+            j = j + 1;
+        }
+    }
     c->pixels = c->pixels + n;
     gl_mark(c, 0, 0);
     gl_mark(c, c->vw - 1, c->vh - 1);
@@ -545,8 +611,13 @@ void gl_clear(struct GLCtx *c) {
 // compositor decides what that costs.
 void gl_flush(struct GLCtx *c) {
     if (c->dx1 < c->dx0) return;                  // nothing was drawn
+    // A caller-supplied buffer has no compositor behind it. The damage box is
+    // still maintained, because the caller wants it for its own blit.
+    if (!c->owns_win) { c->dx0 = 0; c->dy0 = 0; c->dx1 = -1; c->dy1 = -1; return; }
+#ifndef GL_NO_WM
     wm_invalidate(c->win, c->vx + c->dx0, c->vy + c->dy0,
                   c->dx1 - c->dx0 + 1, c->dy1 - c->dy0 + 1);
+#endif
     c->dx0 = 0; c->dy0 = 0; c->dx1 = -1; c->dy1 = -1;
 }
 
@@ -654,8 +725,8 @@ void gl_line(struct GLCtx *c, long x0, long y0, long x1, long y1, long colour) {
     gl_mark(c, x0, y0);
     gl_mark(c, x1, y1);
 
-    pix = g_win[c->win].pix;
-    stride = g_win[c->win].w;
+    pix = c->pix;
+    stride = c->stride;
     ox = c->vx;
     oy = c->vy;
 

@@ -134,6 +134,77 @@ int main(int argc, char **argv) {
     if (sys3(SYS_WINPOLL, hnd, (long)poll, 0) != 0) { say("polled a closed window\n"); bad = bad + 1024; }
     if (sys5(SYS_WINBLIT, hnd, (long)fb, W, H, 0) != -1) { say("blitted into a closed window\n"); bad = bad + 2048; }
 
+    // 8. THE POINTER, which is the part clipping says nothing about. Every
+    //    call above hands the kernel a buffer this process owns; these hand
+    //    it addresses this process has no business naming. All of them must
+    //    be refused BEFORE the kernel dereferences anything.
+    //
+    //    The kernel runs on this process's page tables -- the identity map is
+    //    in PML4 entry 0 and is present in every address space -- so a kernel
+    //    address supplied from here RESOLVES. Nothing about the hardware
+    //    stops these; only a check does.
+    {
+        long hnd2;
+        long kaddr;
+
+        kaddr = 0x100000;               // somewhere in the kernel image
+
+        hnd2 = sys5(SYS_WINOPEN, 620, 320, 120, 90, (long)title);
+        if (hnd2 < 0) { say("no second window\n"); return bad + 16777216; }
+
+        // Read: a blit whose source is kernel memory would paint the kernel
+        // into a window this program can then look at.
+        if (sys5(SYS_WINBLIT, hnd2, kaddr, W, H, 0) != -1) {
+            say("blitted FROM a kernel address\n"); bad = bad + 8192;
+        }
+        if (sys5(SYS_WINBLIT, hnd2, 8, W, H, 0) != -1) {
+            say("blitted from near null\n"); bad = bad + 16384;
+        }
+        // A user-space address this process never mapped.
+        if (sys5(SYS_WINBLIT, hnd2, 0x807F000000, W, H, 0) != -1) {
+            say("blitted from an unmapped user address\n"); bad = bad + 32768;
+        }
+        // A buffer that starts inside our own memory and runs off the end of
+        // it. The start being valid is exactly what makes this the
+        // interesting case.
+        if (sys5(SYS_WINBLIT, hnd2, (long)fb, W, H * 4096, 0) != -1) {
+            say("blitted past the end of our own buffer\n"); bad = bad + 65536;
+        }
+        // Size arithmetic that overflows if it is done in the obvious way.
+        if (sys5(SYS_WINBLIT, hnd2, (long)fb, 0x7FFFFFFF, 0x7FFFFFFF, 0) != -1) {
+            say("an overflowing blit size was accepted\n"); bad = bad + 131072;
+        }
+
+        // Write: WINPOLL puts six longs wherever it is told.
+        if (sys3(SYS_WINPOLL, hnd2, kaddr, 0) != 0) {
+            say("polled INTO a kernel address\n"); bad = bad + 262144;
+        }
+        if (sys3(SYS_WINPOLL, hnd2, 0x807F000000, 0) != 0) {
+            say("polled into an unmapped user address\n"); bad = bad + 524288;
+        }
+
+        // ...and the console write, which is the one that would print the
+        // kernel's own memory to the serial line.
+        if (sys3(SYS_WRITE, 1, kaddr, 64) != -1) {
+            say("\nwrote kernel memory to the console\n"); bad = bad + 1048576;
+        }
+        if (sys3(SYS_WRITE, 1, (long)title, 0 - 1) != -1) {
+            say("a negative length write was accepted\n"); bad = bad + 2097152;
+        }
+
+        // The control. If the checks above were refusing everything, these
+        // would fail too -- and then "the boundary held" would mean "the
+        // syscall does nothing", which is not the same thing at all.
+        if (sys5(SYS_WINBLIT, hnd2, (long)fb, W, H, 0) != W * H) {
+            say("a legitimate blit was refused\n"); bad = bad + 4194304;
+        }
+        if (sys3(SYS_WINPOLL, hnd2, (long)poll, 0) != 1) {
+            say("a legitimate poll was refused\n"); bad = bad + 8388608;
+        }
+
+        sys3(SYS_WINCLOSE, hnd2, 0, 0);
+    }
+
     if (bad == 0) say("winbad: the boundary held\n");
     return bad;
 }

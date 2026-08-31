@@ -131,6 +131,65 @@ struct GlState {
 
 struct GlState g_gls;
 
+// ---------- display lists ----------
+
+long g_list_used[GL_MAXLIST];
+long g_list_n[GL_MAXLIST];
+long g_list_op[GL_MAXLIST * GL_LISTCAP];
+long g_list_a[GL_MAXLIST * GL_LISTCAP];
+long g_list_b[GL_MAXLIST * GL_LISTCAP];
+long g_list_c[GL_MAXLIST * GL_LISTCAP];
+long g_list_over;              // commands dropped because a list filled up
+
+// glGenLists(1). Names are 1-based so that 0 can mean "no list", which is
+// what GL does and what lets st->list double as the compiling flag.
+long glGenList() {
+    long i;
+    i = 0;
+    while (i < GL_MAXLIST) {
+        if (!g_list_used[i]) {
+            g_list_used[i] = 1;
+            g_list_n[i] = 0;
+            return i + 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+void glNewList(struct GlState *st, long list, long mode) {
+    if (list < 1 || list > GL_MAXLIST) { st->overflow = st->overflow + 1; return; }
+    if (st->list) { st->overflow = st->overflow + 1; return; }   // no nesting
+    g_list_used[list - 1] = 1;
+    g_list_n[list - 1] = 0;
+    st->list = list;
+}
+
+void glEndList(struct GlState *st) {
+    st->list = 0;
+}
+
+long glListSize(long list) {
+    if (list < 1 || list > GL_MAXLIST) return 0;
+    return g_list_n[list - 1];
+}
+
+// Append one command. A full list is COUNTED, not silently truncated: a
+// display list that quietly loses its last hundred vertices renders a gear
+// with a bite out of it, and that reads as a geometry bug.
+void gl_list_add(struct GlState *st, long op, long a, long b, long c) {
+    long i;
+    long base;
+    i = st->list - 1;
+    if (g_list_n[i] >= GL_LISTCAP) { g_list_over = g_list_over + 1; return; }
+    base = i * GL_LISTCAP + g_list_n[i];
+    g_list_op[base] = op;
+    g_list_a[base] = a;
+    g_list_b[base] = b;
+    g_list_c[base] = c;
+    g_list_n[i] = g_list_n[i] + 1;
+}
+
 // ---------- matrix stack ----------
 
 struct M4 *gl_top(struct GlState *st) {
@@ -812,63 +871,5 @@ void gl_state_init(struct GlState *st, struct GLCtx *c) {
     st->shade = GL_FLAT;
 }
 
-// ---------- display lists ----------
-
-long g_list_used[GL_MAXLIST];
-long g_list_n[GL_MAXLIST];
-long g_list_op[GL_MAXLIST * GL_LISTCAP];
-long g_list_a[GL_MAXLIST * GL_LISTCAP];
-long g_list_b[GL_MAXLIST * GL_LISTCAP];
-long g_list_c[GL_MAXLIST * GL_LISTCAP];
-long g_list_over;              // commands dropped because a list filled up
-
-// glGenLists(1). Names are 1-based so that 0 can mean "no list", which is
-// what GL does and what lets st->list double as the compiling flag.
-long glGenList() {
-    long i;
-    i = 0;
-    while (i < GL_MAXLIST) {
-        if (!g_list_used[i]) {
-            g_list_used[i] = 1;
-            g_list_n[i] = 0;
-            return i + 1;
-        }
-        i = i + 1;
-    }
-    return 0;
-}
-
-void glNewList(struct GlState *st, long list, long mode) {
-    if (list < 1 || list > GL_MAXLIST) { st->overflow = st->overflow + 1; return; }
-    if (st->list) { st->overflow = st->overflow + 1; return; }   // no nesting
-    g_list_used[list - 1] = 1;
-    g_list_n[list - 1] = 0;
-    st->list = list;
-}
-
-void glEndList(struct GlState *st) {
-    st->list = 0;
-}
-
-long glListSize(long list) {
-    if (list < 1 || list > GL_MAXLIST) return 0;
-    return g_list_n[list - 1];
-}
-
-// Append one command. A full list is COUNTED, not silently truncated: a
-// display list that quietly loses its last hundred vertices renders a gear
-// with a bite out of it, and that reads as a geometry bug.
-void gl_list_add(struct GlState *st, long op, long a, long b, long c) {
-    long i;
-    long base;
-    i = st->list - 1;
-    if (g_list_n[i] >= GL_LISTCAP) { g_list_over = g_list_over + 1; return; }
-    base = i * GL_LISTCAP + g_list_n[i];
-    g_list_op[base] = op;
-    g_list_a[base] = a;
-    g_list_b[base] = b;
-    g_list_c[base] = c;
-    g_list_n[i] = g_list_n[i] + 1;
-}
 
 #endif

@@ -203,6 +203,20 @@ long as_touch(long root, long virt, long flags) {
     return phys;
 }
 
+// Is this page present AND reachable by the process itself?
+//
+// PTE_USER is the part that matters. A page that is present but has the user
+// bit clear is a KERNEL page that happens to be mapped in this address space
+// -- which is every page of the identity map, in every process. Checking only
+// for presence would accept all of them and validate nothing.
+long as_user_page(long root, long virt) {
+    long f;
+    f = vmm_flags_in(root, virt);
+    if (!(f & PTE_PRESENT)) return 0;
+    if (!(f & PTE_USER)) return 0;
+    return 1;
+}
+
 // Write one aligned word into another address space, through the identity map.
 //
 // Legal only because every frame is below 4 GiB and the bottom 4 GiB is mapped
@@ -793,6 +807,67 @@ long proc_wait(long pid) {
 #define SYS_WINPOLL    16
 #define SYS_WINCLOSE   17
 
+// ---------- validating a pointer that came from a process ----------
+//
+// Every syscall below that takes a pointer used to dereference it as given.
+// That is a hole the size of the machine: SYS_WRITE on fd 1 does putc(p[i]),
+// so a process could hand it a kernel address and have the kernel print its
+// own memory to the console, and SYS_WINPOLL writes six longs to wherever it
+// is told. The kernel runs on the process's page tables -- the identity map
+// is in PML4 entry 0 and is present in every address space -- so a kernel
+// address supplied by a process resolves and the access succeeds.
+//
+// K18 tested the window blit's CLIPPING from inside a process and was right
+// to; what it did not test was the pointer. Clipping decides how much gets
+// copied, and says nothing about where it is copied FROM.
+//
+// The range must lie inside user space AND every page of it must be present
+// and USER-accessible in that process's own tables. Checking the bounds alone
+// would not be enough: a user-space address that the process never mapped
+// would fault in the kernel, which is a crash rather than an exploit but is
+// still the kernel dying for a caller's mistake.
+long user_range_ok(long slot, long ptr, long bytes) {
+    long va;
+    long end;
+
+    if (slot < 0) return 0;
+    if (bytes <= 0) return 0;
+    if (ptr < USER_BASE) return 0;
+    if (ptr >= USER_TOP) return 0;
+
+    end = ptr + bytes;
+    if (end < ptr) return 0;                 // wrapped
+    if (end > USER_TOP) return 0;
+
+    va = ptr & ~(PAGE_SIZE - 1);
+    while (va < end) {
+        if (!as_user_page(g_procs[slot].root, va)) return 0;
+        va = va + PAGE_SIZE;
+    }
+
+    return 1;
+}
+
+// A NUL-terminated string from a process. The length is not known in advance,
+// so the pages are checked as the string is walked -- and it must terminate
+// inside user space rather than running off the end of the last mapped page.
+long user_string_ok(long slot, long ptr, long max) {
+    long i;
+
+    if (slot < 0 || ptr < USER_BASE || ptr >= USER_TOP) return 0;
+
+    i = 0;
+    while (i < max) {
+        char *c;
+        if (!user_range_ok(slot, ptr + i, 1)) return 0;
+        c = (char *)(ptr + i);
+        if (c[0] == 0) return 1;
+        i = i + 1;
+    }
+
+    return 0;
+}
+
 // Set by a syscall that must not simply return to its caller. The dispatcher
 // in nano-int.h checks it and reschedules instead.
 long g_syscall_resched;
@@ -973,6 +1048,8 @@ long syscall_dispatch(long nr, long a, long b, long c, long d, long e) {
     if (nr == SYS_WRITE) {
         char *p;
         long i;
+        if (c < 0) return -1;
+        if (!user_range_ok(slot, b, c)) return -1;
         if (a == 1 || a == 2) {
             p = (char *)b;
             i = 0;
@@ -995,6 +1072,8 @@ long syscall_dispatch(long nr, long a, long b, long c, long d, long e) {
         // means end-of-file, which is at least a truthful answer.
         if (a == 0) return 0;
         if (slot < 0 || a < 3 || a >= MAX_FDS || !g_procs[slot].fd_ino[a]) return -1;
+        if (c < 0) return -1;
+        if (!user_range_ok(slot, b, c)) return -1;
         {
             long n;
             n = fs_read(g_procs[slot].fd_ino[a], g_procs[slot].fd_pos[a], (char *)b, c);
@@ -1003,7 +1082,10 @@ long syscall_dispatch(long nr, long a, long b, long c, long d, long e) {
         }
     }
 
-    if (nr == SYS_OPEN)  return sys_open(slot, (char *)a, b);
+    if (nr == SYS_OPEN) {
+        if (!user_string_ok(slot, a, 256)) return -1;
+        return sys_open(slot, (char *)a, b);
+    }
 
     if (nr == SYS_CLOSE) {
         if (slot < 0 || a < 3 || a >= MAX_FDS) return -1;
@@ -1100,6 +1182,11 @@ long syscall_dispatch(long nr, long a, long b, long c, long d, long e) {
         long oy;
         if (slot < 0 || !win_owned_by(a, g_procs[slot].pid)) return -1;
         if (b == 0 || c <= 0 || d <= 0) return -1;
+        // c*d longs are about to be READ from the caller's buffer. The
+        // clipping below decides how much lands in the window; it says
+        // nothing about where it comes from.
+        if (c > 1 << 20 || d > 1 << 20) return -1;
+        if (!user_range_ok(slot, b, c * d * 8)) return -1;
         cw = wm_client_w(a);
         ch = wm_client_h(a);
         if (cw <= 0 || ch <= 0) return -1;
@@ -1155,7 +1242,8 @@ long syscall_dispatch(long nr, long a, long b, long c, long d, long e) {
 
     // (handle, ptr to six longs) -> 1 while the window exists, 0 once it does
     // not. The six are the pointer x and y in CLIENT coordinates, the button
-    // state, one keystroke, and the CLIENT SIZE.
+    // state, one keystroke (0 if none, and only when this window has focus),
+    // and the CLIENT SIZE.
     //
     // The size is in there because a program has no other way to learn it. It
     // asked for a window of a given outside size; how much of that is border
@@ -1170,12 +1258,21 @@ long syscall_dispatch(long nr, long a, long b, long c, long d, long e) {
         long *out;
         if (slot < 0) return 0;
         if (!win_owned_by(a, g_procs[slot].pid)) return 0;
+        if (b && !user_range_ok(slot, b, 6 * 8)) return 0;
         out = (long *)b;
         if (out) {
             out[0] = g_mouse_x - g_win[a].x - wm_client_x();
             out[1] = g_mouse_y - g_win[a].y - wm_client_y();
             out[2] = g_mouse_btn;
+
+            // One keystroke, and ONLY to the focused window. The slot was
+            // here from the start and always returned zero; wiring it to the
+            // global ring without the focus test is what would let a
+            // background program eat the keys meant for whatever the user is
+            // actually looking at. Same reason SYS_READ on fd 0 returns
+            // end-of-file rather than the shell's keyboard.
             out[3] = 0;
+            if (g_focus == a && kbd_available()) out[3] = kbd_getchar_nb();
             out[4] = wm_client_w(a);
             out[5] = wm_client_h(a);
         }

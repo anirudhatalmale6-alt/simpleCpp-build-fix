@@ -1214,7 +1214,7 @@ oswin.s: oswin.c nano-kernel.h nano-mouse.h nano-int.h nano-fb.h nano-font.h \
       nano-term.h $(NANO)
 	$(NANO) --kernel oswin.c oswin.s
 
-oswin64.bin: boot64.s isr.s oswin.s progs.s $(UPROGS) src/wingl.c src/winbad.c kernel64.ld
+oswin64.bin: boot64.s isr.s oswin.s progs.s $(UPROGS) src/wingl.c src/winbad.c src/gears.c nano-gl.h nano-glapi.h kernel64.ld
 	as --64 boot64.s -o boot64.o
 	as --64 isr.s    -o isr.o
 	as --64 oswin.s  -o oswink.o
