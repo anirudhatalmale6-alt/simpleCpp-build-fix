@@ -179,3 +179,8 @@ linebench64.elf
 linebench64.bin
 linebench.elf
 linebenchk.o
+gears.s
+blob-gears.s
+gears64.elf
+gears64.bin
+gears.elf

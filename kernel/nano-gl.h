@@ -372,6 +372,14 @@ struct GLCtx {
     // because two viewports in two windows are two independent renderers, and
     // OpenGL's one-big-global-state is the part of the design nobody defends.
     long cull;             // GL_CULL_FACE
+    // Which winding faces the camera. This renderer looks along +z where
+    // standard GL looks along -z, so a model written for GL -- gears.c, an
+    // OBJ file, anything exported by a modeller -- arrives with every
+    // triangle wound the other way. Without a way to say so, the only fix is
+    // to reverse the vertex order at every call site, which is how a model
+    // ends up rendered inside-out by someone who then "fixes" it by turning
+    // culling off.
+    long frontcw;          // 1 = clockwise is front, which is GL's default here
     long depth;            // GL_DEPTH_TEST
     long lighting;         // GL_LIGHTING
     long texturing;        // GL_TEXTURE_2D
@@ -480,6 +488,7 @@ long gl_bind(struct GLCtx *c, long win, long x, long y, long w, long h) {
     c->far = fx_from_int(64);
     c->nvalid = 0;
     c->cull = 1;
+    c->frontcw = 0;
     c->depth = 1;
     c->lighting = 1;
     c->texturing = 0;
@@ -879,8 +888,11 @@ void gl_tri_view(struct GLCtx *c, struct V3 *a, struct V3 *b, struct V3 *v, long
     v3_cross(&n, &e0, &e1);
     if (c->cull) {
         struct V3 toeye;
+        long f;
         toeye.x = 0 - a->x; toeye.y = 0 - a->y; toeye.z = 0 - a->z;
-        if (v3_dot(&n, &toeye) <= 0) { c->tris_culled = c->tris_culled + 1; return; }
+        f = v3_dot(&n, &toeye);
+        if (c->frontcw) f = 0 - f;
+        if (f <= 0) { c->tris_culled = c->tris_culled + 1; return; }
     }
 
     // Cull with the geometric normal always -- which way a triangle faces is a

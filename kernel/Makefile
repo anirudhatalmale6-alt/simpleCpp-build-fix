@@ -32,6 +32,7 @@ QFLAGS := -kernel kernel.elf -no-reboot
         ui uirun uitest uishot uilive \
         gl glrun gltest glshot gllive \
         glapi glapirun glapitest glapishot glapilive \
+        gears gearsrun gearstest gearsshot \
         gltex gltexrun gltextest gltexshot gltexlive \
         oswin oswinrun oswintest oswinshot \
         linebench linebenchrun linebenchtest linebenchshot clean
@@ -1002,6 +1003,54 @@ chaintest: chaink.elf $(NANO) user/as.elf user/as/hostas
 	   || { echo "FAIL"; exit 1; }
 
 # ---------------------------------------------------------------------------
+# gears -- Brian Paul's gears, ported to fixed point and this API. Display
+# lists, per-face normals inside a quad strip, backface culling and a depth
+# buffer, all at once, on a program written long before any of this existed.
+gears.s: gears.c nano-kernel.h nano-mouse.h nano-int.h nano-fb.h nano-font.h \
+      nano-mm.h nano-wm.h nano-wmin.h nano-term.h nano-ui.h nano-gl.h \
+      nano-glapi.h $(NANO)
+	$(NANO) --kernel gears.c gears.s
+
+gears64.bin: boot64.s isr.s gears.s kernel64.ld
+	as --64 boot64.s -o boot64.o
+	as --64 isr.s    -o isr.o
+	as --64 gears.s  -o gearsk.o
+	ld -T kernel64.ld -o gears64.elf boot64.o isr.o gearsk.o
+	objcopy -O binary gears64.elf gears64.bin
+
+blob-gears.s:
+	@printf '.section .blob, "a"\n.incbin "gears64.bin"\n' > $@
+
+gears.elf: boot32.s blob-gears.s gears64.bin final.ld
+	as --32 boot32.s     -o boot32.o
+	as --32 blob-gears.s -o blob-gears.o
+	ld -m elf_i386 -T final.ld -o gears.elf boot32.o blob-gears.o
+
+gears: gears.elf
+
+gearsrun: gears.elf
+	$(QEMU) -kernel gears.elf -no-reboot
+
+gearstest: gears.elf
+	@rm -f gears-serial.log
+	@( sleep 150; echo quit ) | \
+	 timeout 220 $(QEMU) -kernel gears.elf -no-reboot -display none \
+	   -serial file:gears-serial.log -monitor stdio >/dev/null 2>&1; \
+	 echo "---- serial output ----"; cat gears-serial.log; echo "-----------------------"; \
+	 tr -d '\r' < gears-serial.log > gears-serial.clean; \
+	 grep -q "GEARSTEST DONE" gears-serial.clean \
+	   && ! grep -q "FAIL" gears-serial.clean \
+	   && grep -q "PASS: gears, in fixed point, from display lists" gears-serial.clean \
+	   && echo "PASS: gears -- lists, culling, depth, per-face normals" \
+	   || { echo "FAIL"; exit 1; }
+
+gearsshot: gears.elf
+	@rm -f gears.ppm gears.png
+	@( sleep 158; echo "screendump gears.ppm"; sleep 2; echo quit ) | \
+	 timeout 230 $(QEMU) -kernel gears.elf -no-reboot -display none \
+	   -serial file:gears-serial.log -monitor stdio >/dev/null 2>&1
+	@convert gears.ppm gears.png && echo "wrote gears.png"
+
 # glapi -- the OpenGL-shaped layer: glBegin/glEnd with strips, fans, quads and
 # quad strips, a matrix stack, gluLookAtx, six frustum planes pulled out of the
 # live projection * modelview matrix, and a 3D viewport that is a widget.

@@ -56,6 +56,37 @@
 #define GL_LIGHTING       0x0B50
 #define GL_DEPTH_TEST     0x0B71
 #define GL_TEXTURE_2D     0x0DE1
+#define GL_LIGHT0         0x4000
+#define GL_NORMALIZE      0x0BA1
+
+#define GL_CW             0x0900
+#define GL_CCW            0x0901
+
+#define GL_FLAT           0x1D00
+#define GL_SMOOTH         0x1D01
+
+#define GL_FRONT          0x0404
+#define GL_BACK           0x0405
+#define GL_FRONT_AND_BACK 0x0408
+#define GL_AMBIENT_AND_DIFFUSE 0x1602
+#define GL_DIFFUSE        0x1201
+#define GL_POSITION       0x1203
+
+#define GL_COMPILE        0x1300
+
+// A display list is a recorded command stream replayed through a switch --
+// no function pointers, which nano_cc does not have. gears.c is the reason:
+// it builds each gear once and calls it every frame, and without this the
+// trigonometry for some 1300 vertices would be redone on every frame.
+#define GL_MAXLIST  4
+#define GL_LISTCAP  1024
+
+#define GLC_BEGIN     1
+#define GLC_END       2
+#define GLC_VERTEX    3
+#define GLC_NORMAL    4
+#define GLC_COLOUR    5
+#define GLC_TEXCOORD  6
 
 // GL guarantees at least 32 modelview and 2 projection. A scenegraph walk
 // pushes once per level, so the modelview depth is the one that has to be
@@ -93,6 +124,9 @@ struct GlState {
     long lines;
     long points;
     long overflow;             // glBegin nested, or a matrix stack overrun
+
+    long list;                 // display list being compiled, or 0
+    long shade;                // GL_FLAT or GL_SMOOTH; recorded, see below
 };
 
 struct GlState g_gls;
@@ -378,6 +412,7 @@ void gl_point_view(struct GLCtx *c, struct V3 *a, long colour) {
 // ---------- glBegin / glVertex / glEnd ----------
 
 void glColor3ub(struct GlState *st, long r, long g, long b) {
+    if (st->list) { gl_list_add(st, GLC_COLOUR, r, g, b); return; }
     st->colour = rgb(r, g, b);
 }
 
@@ -389,6 +424,7 @@ void glColor4x(struct GlState *st, long r, long g, long b, long a) {
 }
 
 void glNormal3x(struct GlState *st, long x, long y, long z) {
+    if (st->list) { gl_list_add(st, GLC_NORMAL, x, y, z); return; }
     st->nrm.x = x; st->nrm.y = y; st->nrm.z = z;
     st->nvalid = 1;
 }
@@ -400,11 +436,13 @@ void glNormal3x(struct GlState *st, long x, long y, long z) {
 // than read again when the triangle completes -- by then the caller has moved
 // on and set the next one.
 void glTexCoord2x(struct GlState *st, long s, long t) {
+    if (st->list) { gl_list_add(st, GLC_TEXCOORD, s, t, 0); return; }
     st->cs = s;
     st->ct = t;
 }
 
 void glBegin(struct GlState *st, long mode) {
+    if (st->list) { gl_list_add(st, GLC_BEGIN, mode, 0, 0); return; }
     if (st->prim >= 0) { st->overflow = st->overflow + 1; return; }
     st->prim = mode;
     st->total = 0;
@@ -448,6 +486,7 @@ void glVertex3x(struct GlState *st, long x, long y, long z) {
     struct V3 m;
     struct Vtx p;
 
+    if (st->list) { gl_list_add(st, GLC_VERTEX, x, y, z); return; }
     if (st->prim < 0 || !st->c) return;
     m.x = x; m.y = y; m.z = z;
     // Model space to view space, once, here -- exactly where OpenGL does it.
@@ -558,6 +597,7 @@ void glVertex3x(struct GlState *st, long x, long y, long z) {
 }
 
 void glEnd(struct GlState *st) {
+    if (st->list) { gl_list_add(st, GLC_END, 0, 0, 0); return; }
     if (st->prim == GL_LINE_LOOP && st->total > 2 && st->c) {
         gl_seg_view(st->c, &st->vbuf[0].p, &st->first.p, st->colour);
         st->lines = st->lines + 1;
@@ -565,6 +605,92 @@ void glEnd(struct GlState *st) {
     st->prim = -1;
     st->nvalid = 0;
     if (st->c) st->c->nvalid = 0;
+}
+
+// Replay a recorded list. The modelview in force at the call is the one the
+// vertices go through, which is what makes one recorded gear usable at three
+// positions and three rotations -- the list holds MODEL space, not view space.
+void glCallList(struct GlState *st, long list) {
+    long i;
+    long k;
+    long n;
+    long base;
+    long saved;
+
+    if (list < 1 || list > GL_MAXLIST) { st->overflow = st->overflow + 1; return; }
+    if (st->list) { st->overflow = st->overflow + 1; return; }   // no nesting
+
+    i = list - 1;
+    n = g_list_n[i];
+    base = i * GL_LISTCAP;
+
+    saved = st->list;
+    st->list = 0;
+
+    k = 0;
+    while (k < n) {
+        long op;
+        op = g_list_op[base + k];
+
+        if (op == GLC_VERTEX) {
+            glVertex3x(st, g_list_a[base + k], g_list_b[base + k], g_list_c[base + k]);
+        } else if (op == GLC_NORMAL) {
+            glNormal3x(st, g_list_a[base + k], g_list_b[base + k], g_list_c[base + k]);
+        } else if (op == GLC_BEGIN) {
+            glBegin(st, g_list_a[base + k]);
+        } else if (op == GLC_END) {
+            glEnd(st);
+        } else if (op == GLC_COLOUR) {
+            glColor3ub(st, g_list_a[base + k], g_list_b[base + k], g_list_c[base + k]);
+        } else if (op == GLC_TEXCOORD) {
+            glTexCoord2x(st, g_list_a[base + k], g_list_b[base + k]);
+        }
+
+        k = k + 1;
+    }
+
+    st->list = saved;
+}
+
+// ---------- material, light, shading ----------
+
+// glMaterialfv, for the one case this renderer can honour. There is a single
+// colour per surface here, so ambient and diffuse cannot be set apart: the
+// call sets the current colour, and gl_shade's ambient floor is the ambient
+// term. Saying so is better than accepting four channels and dropping three.
+void glMaterialx(struct GlState *st, long face, long pname, long r, long g, long b) {
+    if (pname != GL_AMBIENT_AND_DIFFUSE && pname != GL_DIFFUSE) return;
+    glColor3ub(st, fx_to_int(r * 255), fx_to_int(g * 255), fx_to_int(b * 255));
+}
+
+// glLightfv(GL_LIGHT0, GL_POSITION, ...) with w = 0, which is a DIRECTIONAL
+// light -- the only kind here. The vector is normalised and taken as being in
+// view space; a positional light would need the modelview applied and a
+// per-vertex direction, which flat shading has nowhere to put.
+void glLightDirx(struct GlState *st, long x, long y, long z) {
+    struct V3 d;
+    struct V3 u;
+    if (!st->c) return;
+    d.x = x; d.y = y; d.z = z;
+    v3_norm(&u, &d);
+    if (u.x == 0 && u.y == 0 && u.z == 0) return;
+    st->c->light = u;
+}
+
+// glShadeModel. This rasteriser is flat-shaded: one colour per triangle, from
+// one normal. GL_SMOOTH is accepted and RECORDED rather than ignored, so a
+// caller can ask what happened to it, and so the day Gouraud arrives the call
+// site does not have to change.
+// glFrontFace. The default here is the winding this renderer's own demos
+// use; GL_CW selects the other one, which is what a model authored against
+// standard GL's -z-forward convention needs.
+void glFrontFace(struct GlState *st, long mode) {
+    if (!st->c) return;
+    st->c->frontcw = (mode == GL_CW);
+}
+
+void glShadeModel(struct GlState *st, long m) {
+    st->shade = m;
 }
 
 // ---------- the frustum, from the live matrices ----------
@@ -682,6 +808,67 @@ void gl_state_init(struct GlState *st, struct GLCtx *c) {
     st->lines = 0;
     st->points = 0;
     st->overflow = 0;
+    st->list = 0;
+    st->shade = GL_FLAT;
+}
+
+// ---------- display lists ----------
+
+long g_list_used[GL_MAXLIST];
+long g_list_n[GL_MAXLIST];
+long g_list_op[GL_MAXLIST * GL_LISTCAP];
+long g_list_a[GL_MAXLIST * GL_LISTCAP];
+long g_list_b[GL_MAXLIST * GL_LISTCAP];
+long g_list_c[GL_MAXLIST * GL_LISTCAP];
+long g_list_over;              // commands dropped because a list filled up
+
+// glGenLists(1). Names are 1-based so that 0 can mean "no list", which is
+// what GL does and what lets st->list double as the compiling flag.
+long glGenList() {
+    long i;
+    i = 0;
+    while (i < GL_MAXLIST) {
+        if (!g_list_used[i]) {
+            g_list_used[i] = 1;
+            g_list_n[i] = 0;
+            return i + 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+void glNewList(struct GlState *st, long list, long mode) {
+    if (list < 1 || list > GL_MAXLIST) { st->overflow = st->overflow + 1; return; }
+    if (st->list) { st->overflow = st->overflow + 1; return; }   // no nesting
+    g_list_used[list - 1] = 1;
+    g_list_n[list - 1] = 0;
+    st->list = list;
+}
+
+void glEndList(struct GlState *st) {
+    st->list = 0;
+}
+
+long glListSize(long list) {
+    if (list < 1 || list > GL_MAXLIST) return 0;
+    return g_list_n[list - 1];
+}
+
+// Append one command. A full list is COUNTED, not silently truncated: a
+// display list that quietly loses its last hundred vertices renders a gear
+// with a bite out of it, and that reads as a geometry bug.
+void gl_list_add(struct GlState *st, long op, long a, long b, long c) {
+    long i;
+    long base;
+    i = st->list - 1;
+    if (g_list_n[i] >= GL_LISTCAP) { g_list_over = g_list_over + 1; return; }
+    base = i * GL_LISTCAP + g_list_n[i];
+    g_list_op[base] = op;
+    g_list_a[base] = a;
+    g_list_b[base] = b;
+    g_list_c[base] = c;
+    g_list_n[i] = g_list_n[i] + 1;
 }
 
 #endif
