@@ -1046,17 +1046,46 @@ void main_thread(long unused) {
     // Which is also the first thing on this machine that behaves like a
     // desktop rather than a test: a process ends, its window goes with it, and
     // something starts another one.
+    //
+    // THREE THINGS WERE WRONG WITH THE LOOP THAT DID THAT, and all three were
+    // visible from the other side of the screen:
+    //
+    //   It called wm_present() with nothing but a thread_yield() between one
+    //   call and the next, which is not a frame rate, it is a spin. Every
+    //   present lifted the pointer and put it back, so the pointer was
+    //   flickering at whatever rate this loop happened to achieve.
+    //
+    //   It had no business presenting at all. The compositor thread owns the
+    //   screen and does its work with interrupts masked; this loop was
+    //   painting the same framebuffer from a second thread that did not, so a
+    //   tick landing inside wm_present let the two of them interleave.
+    //
+    //   It restarted wingl unconditionally -- including when the user had just
+    //   closed its window. The close worked perfectly: the window was
+    //   destroyed, wingl noticed through SYS_WINPOLL and exited, and then this
+    //   put it straight back. Reported, reasonably, as a close button that
+    //   does nothing.
+    //
+    // So: sleep instead of spinning, leave the screen to the thread that owns
+    // it, and restart wingl only when it finished by itself.
     puts("\nrunning wingl on a loop, for the screenshot\n");
     {
         char *av[2];
         long pid;
+        long closed_by_hand;
         av[0] = "/bin/wingl";
         pid = 0;
+        closed_by_hand = 0;
         for (;;) {
             proc_poll();
-            if (!proc_alive()) pid = proc_spawn("/bin/wingl", 1, av, "/bin/wingl", "/");
-            wm_present();
-            thread_yield();
+            // A window closed by its button, that a process owned, is the user
+            // saying they are done with it. g_win_owner survives the destroy,
+            // so it still says whose it was.
+            if (g_wmin_closed >= 0 && g_win_owner[g_wmin_closed] != 0)
+                closed_by_hand = 1;
+            if (!proc_alive() && !closed_by_hand)
+                pid = proc_spawn("/bin/wingl", 1, av, "/bin/wingl", "/");
+            thread_sleep_ms(50);
         }
     }
     cpu_halt_forever();

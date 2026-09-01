@@ -386,6 +386,35 @@ void test_queue() {
     while (mouse_pop(&e)) { n = n + 1; }
     expect("40 button changes all survive", n, 40);
     expect("still nothing dropped", g_mev_dropped, 0);
+
+    // A CLICK WITH A HAND ON THE END OF IT.
+    //
+    // The press and the movement just after it carry the same button mask, so
+    // the coalescing rule above was entitled to merge them -- and merging them
+    // delivers the press at the position the mouse ENDED UP. The event was
+    // never lost; it was moved. Nobody holds a mouse still while clicking it,
+    // so this is not an edge case, it is every click.
+    mouse_state_reset();
+    mouse_bounds(1024, 768);
+    mouse_warp(400, 300);
+    while (mouse_pop(&e)) { }
+    inject(0, 0, 1);                                    // press at (400, 300)
+    i = 0;
+    while (i < 6) { inject(5, 0, 1); i = i + 1; }       // and drift 30 right
+    {
+        long px;
+        long py;
+        long seen;
+        px = 0 - 1; py = 0 - 1; seen = 0;
+        n = 0;
+        while (mouse_pop(&e)) {
+            n = n + 1;
+            if (e.btn == 1 && !seen) { px = e.x; py = e.y; seen = 1; }
+        }
+        expect("the press is delivered where the button went down", px, 400);
+        expect("...and at the y it went down at", py, 300);
+        expect("...with the drift after it as a second event", n, 2);
+    }
 }
 
 // ============================================================
@@ -469,11 +498,56 @@ void test_cursor() {
     wm_present();
     check_matches_full("window dragged out from under the pointer");
 
+    // A POINTER THAT HAS NOT MOVED MUST NOT BE REDRAWN.
+    //
+    // wm_present used to lift the pointer and put it back on every single
+    // call, whether or not anything had changed. That is invisible in a test
+    // and extremely visible on a monitor: the desktop loop at the end of
+    // oswin.c presents as fast as the CPU will go, so the pointer was being
+    // taken off the screen and put back thousands of times a second, and a
+    // 60Hz display caught it absent about as often as it caught it there.
+    // Reported as "the mouse was flickering bad", and it was.
+    puts("\n  presenting with a still pointer:\n");
+    wm_cursor_move(600, 400);
+    wm_present();
+    wm_reset_counters();
+    {
+        long i;
+        i = 0;
+        while (i < 50) { wm_present(); i = i + 1; }
+    }
+    printf("  50 idle presents cost %d pixels, %d of them the pointer\n",
+           wm_pixels, g_cur_pixels);
+    // One redraw of the glyph is about 110 pixels, so the old version scored
+    // 5,500 here. Anything above zero is the flicker.
+    if (g_cur_pixels != 0)
+        fail("an idle present repainted a pointer that had not moved");
+
+    // And the control, which is the half that matters: the saving must not be
+    // a pointer that has quietly stopped being drawn at all. Repaint the
+    // ground underneath it and it MUST come back on top.
+    wm_reset_counters();
+    wm_damage(600 - 4, 400 - 4, CUR_W + 8, CUR_H + 8);
+    wm_present();
+    printf("  repainting the ground under it redrew %d pointer pixels\n",
+           g_cur_pixels);
+    if (g_cur_pixels == 0)
+        fail("the pointer was painted over and never put back");
+    check_matches_full("pointer back on top after the ground was repainted");
+
     wm_cursor_show(0);
     wm_present();
     check_matches_full("pointer hidden");
     wm_cursor_show(1);
     wm_present();
+    // Named, rather than left for a later section to trip over. Hiding the
+    // pointer damages the rectangle it was in, so it is no longer on screen --
+    // and the first version of the "do not redraw a pointer that has not
+    // moved" rule read the stale "it is already painted" flag, decided there
+    // was nothing to do, and left the desktop with no pointer at all. The only
+    // thing that caught it was a checksum mismatch sixty lines later, in the
+    // console test, which is not where anybody would look.
+    check_matches_full("pointer shown again");
 }
 
 // ============================================================
@@ -631,6 +705,45 @@ void test_interaction() {
     // keystroke would be delivered into a freed slot.
     if (g_focus == b) fail("focus stayed on the closed window");
     else printf("  ok  focus moved off the closed window (now %d)\n", g_focus);
+
+    // THE SAME CLICK, DONE THE WAY A PERSON DOES IT.
+    //
+    // click_at pumps the queue between the press and the release. A hand does
+    // not: the press, the drift and the release all arrive between two of the
+    // compositor's twenty-millisecond drains. Every close test above was
+    // written the convenient way, which is exactly why they were all green
+    // while the close button did not work on the desktop -- the harness was
+    // draining the queue at a moment no real click ever offers.
+    //
+    // Twelve pixels of drift is a hand, not a drag. Before the queue kept the
+    // position a button went down at, this reported the press on the title bar
+    // beside the close box: the window was raised and started dragging instead
+    // of closing, which is the reported symptom exactly.
+    puts("\n  the close button, clicked by a hand that is not perfectly still:\n");
+    {
+        long c;
+        long drags;
+        long cx;
+        long cy;
+        release();
+        c = wm_create(300, 400, 200, 120, "shaky");
+        wm_decorate(c);
+        drags = g_wmin_drags;
+        cx = g_win[c].x + wm_close_x(c) + 3;
+        cy = g_win[c].y + wm_close_y() + 3;
+        mouse_warp(cx, cy);
+        wm_pump_mouse();
+        inject(0, 0, 1);            // press, on the close box
+        inject(0 - 12, 0, 1);       // the hand moves while the button is down
+        inject(0, 0, 0);            // release
+        wm_pump_mouse();            // ONE drain, which is all the desktop does
+        expect("the window closed anyway", g_win[c].used, 0);
+        expect("...and nothing was dragged instead", g_wmin_drags, drags);
+        if (g_win[c].used) wm_destroy(c);
+        release();
+    }
+    wm_present();
+    check_matches_full("after a shaky close");
 }
 
 // ============================================================
