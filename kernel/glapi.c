@@ -1574,6 +1574,36 @@ void test_fill() {
     else
         puts("    not reproduced by this sweep\n");
 
+    // WHERE THE FLOOR IS. An empty frame is not free, and the reason is not
+    // the geometry -- there is none. gl_clear writes the whole viewport and
+    // the whole depth buffer whatever the frame turns out to contain.
+    {
+        long a;
+        long b;
+        long clr;
+        long empty;
+        long r;
+
+        bench_at(0, 2 * GL_ONE, 0 - 7 * GL_ONE, 180, 0 - 8);   // facing away
+        bench_frame();
+
+        a = pm_timer_read();
+        r = 0;
+        while (r < 20) { gl_clear(&g_gl); r = r + 1; }
+        b = pm_timer_read();
+        clr = ((pm_timer_delta(a, b) * 1000000) / PM_TMR_HZ) / 20;
+
+        empty = bench_us();
+
+        puts("\n  the floor, with the camera facing away and nothing in view:\n");
+        printf("    a whole empty frame:      %d us\n", empty);
+        printf("    gl_clear on its own:      %d us\n", clr);
+        printf("    so the clear is %d%% of a frame that draws nothing\n",
+               empty ? (clr * 100) / empty : 0);
+        printf("    at %d Hz that is %d%% of a core, with an empty screen\n",
+               g_hz, (empty * g_hz) / 10000);
+    }
+
     printf("\n  totals over every pose: span %d us, ref %d us\n",
            g_bench_span_us, g_bench_ref_us);
     printf("  iterations walked:      span %d, ref %d\n",
