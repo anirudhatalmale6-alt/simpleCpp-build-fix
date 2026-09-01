@@ -800,11 +800,17 @@ void event_loop() {
             ui_end(&g_ui);
         }
 
-        // The animation is driven by the timer, not by how fast the loop runs,
-        // so the cube turns at the same rate whatever else is going on.
+        // The animation is driven by the timer, not by how fast the loop
+        // runs, so the cube turns at the same rate whatever else is going on.
+        //
+        // That was the intent and the code did not have it: one step per
+        // ITERATION THAT SAW A NEW TICK is one step per frame, so a frame
+        // costing five ticks advanced the angle once in five, and the cube
+        // slowed down exactly when the renderer did. Multiply by the ticks
+        // that actually passed and the comment becomes true.
         if (g_ticks != last_tick) {
+            g_angle = (g_angle + (g_ticks - last_tick) * (g_speed / 10 + 1)) % 360;
             last_tick = g_ticks;
-            g_angle = (g_angle + g_speed / 10 + 1) % 360;
             render_frame();
         }
 

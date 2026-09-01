@@ -435,6 +435,22 @@ struct GLCtx {
     long tris_clipped;     // met the near plane
     long tris_drawn;
     long pixels;           // buffer pixels written
+
+    // What the rasteriser walked over, as opposed to what it wrote. A
+    // triangle is at most half of its bounding box and usually far less, so
+    // these two numbers are never equal -- but the ratio between them is the
+    // whole cost of a scanline loop that finds the span by looking for it.
+    // Kept as counters and not as an assumption, because "the sliver in the
+    // corner is cheap" is exactly the sort of thing that is true right up
+    // until the camera turns.
+    long boxpix;           // sum of the clipped bounding boxes, in pixels
+    long steps;            // inner-loop iterations actually executed
+    long covered;          // of those, the ones actually inside a triangle
+
+    // Draw through the old walking rasteriser instead of the span one. Only
+    // has an effect where GL_RASTER_REF was defined; it exists so a test can
+    // render the same scene both ways and compare the buffers.
+    long refraster;
 };
 
 // Build the projection matrix for an off-centre frustum, exactly as
@@ -512,6 +528,8 @@ void gl_defaults(struct GLCtx *c, long w) {
     c->bg = rgb(12, 14, 22);
     c->light.x = 0; c->light.y = 0; c->light.z = 0 - GL_ONE;
     c->dx0 = 0; c->dy0 = 0; c->dx1 = -1; c->dy1 = -1;
+    c->boxpix = 0; c->steps = 0; c->covered = 0;
+    c->refraster = 0;
     gl_perspective_pixels(c);
 }
 
@@ -604,6 +622,7 @@ void gl_clear(struct GLCtx *c) {
     gl_mark(c, 0, 0);
     gl_mark(c, c->vw - 1, c->vh - 1);
     c->tris_in = 0; c->tris_culled = 0; c->tris_clipped = 0; c->tris_drawn = 0;
+    c->boxpix = 0; c->steps = 0; c->covered = 0;
 }
 
 // Hand the damage to the compositor. The whole reason the renderer takes a
@@ -780,7 +799,33 @@ void gl_line(struct GLCtx *c, long x0, long y0, long x1, long y1, long colour) {
 // reproduces the products bit for bit, so every pixel this writes is the pixel
 // the multiplying version wrote -- which is a property the tests check rather
 // than something to take on trust.
-void gl_tri_raster(struct GLCtx *c, long *sx, long *sy, long *iz, long colour) {
+// Floor division by a POSITIVE divisor. C's / truncates towards zero, which
+// is the wrong direction on the negative side -- and the negative side is
+// exactly where a span starts when the triangle's left edge is off the left
+// of the bounding box. Getting this wrong puts the span one pixel out on
+// some rows and not others, which looks like a jagged edge and is not.
+long gl_floordiv(long a, long b) {
+    long q;
+    q = a / b;
+    if (a % b != 0 && a < 0) q = q - 1;
+    return q;
+}
+
+// THE REFERENCE RASTERISER -- the one this file had until K24, kept so the
+// replacement can be checked against it rather than against an opinion. It
+// finds the covered run on each row by walking into it from the left edge of
+// the bounding box, one pixel at a time, testing three edge functions at each.
+//
+// That prefix is invisible in a screenshot and it is most of the work in a
+// frame full of long thin triangles -- which is what a ground plane seen at a
+// grazing angle is. Measured on the demo scene: 439,507 inner-loop iterations
+// to write 96,070 pixels.
+//
+// Compiled only where something asks for it, by defining GL_RASTER_REF before
+// including this header. wingl.c does not: the compiler INSIDE the OS has to
+// lex every token of this file and it has a size ceiling.
+#ifdef GL_RASTER_REF
+void gl_tri_raster_ref(struct GLCtx *c, long *sx, long *sy, long *iz, long colour) {
     long minx; long miny; long maxx; long maxy;
     long area;
     long y;
@@ -844,6 +889,8 @@ void gl_tri_raster(struct GLCtx *c, long *sx, long *sy, long *iz, long colour) {
     if (c->vy + maxy > c->surfh - 1) maxy = c->surfh - 1 - c->vy;
     if (minx > maxx || miny > maxy) return;
 
+    c->boxpix = c->boxpix + (maxx - minx + 1) * (maxy - miny + 1);
+
     area = (sx[1] - sx[0]) * (sy[2] - sy[0]) - (sy[1] - sy[0]) * (sx[2] - sx[0]);
     if (area == 0) return;                     // degenerate, zero pixels
 
@@ -887,6 +934,7 @@ void gl_tri_raster(struct GLCtx *c, long *sx, long *sy, long *iz, long colour) {
         long rowbase;
         long zrow;
         long inside;
+        long xend;
 
         inside = 0;
         w0 = w0r; w1 = w1r; w2 = w2r;
@@ -897,12 +945,14 @@ void gl_tri_raster(struct GLCtx *c, long *sx, long *sy, long *iz, long colour) {
         zrow = y * c->vw;
 
         x = minx;
-        while (x <= maxx) {
+        xend = maxx;
+        while (x <= xend) {
             if ((area > 0 && w0 >= 0 && w1 >= 0 && w2 >= 0) ||
                 (area < 0 && w0 <= 0 && w1 <= 0 && w2 <= 0)) {
                 long d;
                 long idx;
                 inside = 1;
+                c->covered = c->covered + 1;
                 d = nn / area;
                 idx = zrow + x;
                 // Larger 1/z is nearer, so a fragment beyond the far plane has
@@ -963,13 +1013,282 @@ void gl_tri_raster(struct GLCtx *c, long *sx, long *sy, long *iz, long colour) {
                 //
                 // Exact, not an approximation: convexity is a property of the
                 // shape, not of the arithmetic.
-                x = maxx;
+                //
+                // Moving the END of the row rather than x itself, so that x is
+                // left holding where the walk actually stopped and the row's
+                // cost can be counted without a per-pixel increment.
+                xend = x;
             }
             w0 = w0 - b0; w1 = w1 - b1; w2 = w2 - b2;
             nn = nn + ndx;
             nuu = nuu + nux; nvv = nvv + nvx;
             x = x + 1;
         }
+        c->steps = c->steps + (x - minx);
+        w0r = w0r + a0; w1r = w1r + a1; w2r = w2r + a2;
+        nd = nd + ndy;
+        nu = nu + nuy; nv = nv + nvy;
+        y = y + 1;
+    }
+
+    // ty0 is the first row that wrote anything and rows are walked in order, so
+    // it needs no minimum test inside the loop -- only ty1 grows.
+    if (hit) { gl_mark(c, tx0, ty0); gl_mark(c, tx1, ty1); }
+}
+#endif  // GL_RASTER_REF
+
+// THE SPAN RASTERISER.
+//
+// Same arithmetic, same pixels, one less thing to search for. On each row the
+// covered run is SOLVED rather than found: an edge function is
+//
+//     w_i(minx + k) = w_ir - k * b_i
+//
+// which is linear in k, so "inside" -- w_i >= 0 -- is one inequality in k per
+// edge. Whether an edge bounds the run on the left or on the right is the
+// sign of b_i and nothing else. Three inequalities, intersected, give [lo,hi]
+// directly, and the pixel loop then runs over exactly the covered pixels with
+// no edge functions in it at all.
+//
+// Two savings, and the second is the bigger one on a normal frame:
+//
+//   1. the walk from the left edge of the bounding box into the triangle is
+//      gone -- it was never in the picture
+//   2. the three subtractions and up to six comparisons per pixel are gone
+//      from the pixels that ARE in the picture
+//
+// It is the same set of pixels, bit for bit. The proof is not the argument
+// above: gl_tri_raster_ref is still here and glapi.c renders the whole demo
+// scene through both and compares the buffers.
+void gl_tri_raster(struct GLCtx *c, long *sx, long *sy, long *iz, long colour) {
+    long minx; long miny; long maxx; long maxy;
+    long area;
+    long y;
+    long textured;
+    long cr; long cg; long cb;
+    struct Texture *tx;
+    // Edge coefficients. w_i steps by -B_i across x and +A_i down y.
+    long a0; long a1; long a2;
+    long b0; long b1; long b2;
+    // The three edge functions at the top-left corner of the clipped box.
+    long w0r; long w1r; long w2r;
+    // Interpolation numerators at the same corner, and their steps.
+    long nd; long ndx; long ndy;
+    long nu; long nux; long nuy;
+    long nv; long nvx; long nvy;
+    // The far test, premultiplied by the area so it can be applied to the
+    // numerator directly -- see the note in the pixel loop.
+    long farnum;
+    // Written-pixel extent, so the damage box is updated twice per triangle
+    // instead of once per pixel.
+    long hit; long tx0; long ty0; long tx1; long ty1;
+
+    // The texture, and the colour it is modulated by, hoisted out of the loop.
+    // GL's default texture environment is GL_MODULATE: the fragment is the
+    // texel times the primary colour, which here already carries the lighting
+    // term.
+    textured = 0;
+    tx = &g_tex[0];
+    // `pix` and not just `used`. glGenTexture marks a name used before
+    // anything has been uploaded to it, which is exactly what GL does, so a
+    // program that binds a name and draws before calling glTexImage2D is
+    // doing something ordinary and slightly wrong. Without this test it reads
+    // through a null pointer and takes the machine down.
+    if (c->texturing && c->tex >= 0 && c->tex < GL_MAXTEX &&
+        g_tex[c->tex].used && g_tex[c->tex].pix) {
+        textured = 1;
+        tx = &g_tex[c->tex];
+    }
+    cr = (colour >> 16) & 255;
+    cg = (colour >> 8) & 255;
+    cb = colour & 255;
+
+    minx = sx[0]; if (sx[1] < minx) minx = sx[1]; if (sx[2] < minx) minx = sx[2];
+    maxx = sx[0]; if (sx[1] > maxx) maxx = sx[1]; if (sx[2] > maxx) maxx = sx[2];
+    miny = sy[0]; if (sy[1] < miny) miny = sy[1]; if (sy[2] < miny) miny = sy[2];
+    maxy = sy[0]; if (sy[1] > maxy) maxy = sy[1]; if (sy[2] > maxy) maxy = sy[2];
+
+    if (minx < 0) minx = 0;
+    if (miny < 0) miny = 0;
+    if (maxx > c->vw - 1) maxx = c->vw - 1;
+    if (maxy > c->vh - 1) maxy = c->vh - 1;
+
+    // Clip to the SURFACE as well as the viewport, once, here.
+    if (c->vx + minx < 0) minx = 0 - c->vx;
+    if (c->vy + miny < 0) miny = 0 - c->vy;
+    if (c->vx + maxx > c->stride - 1) maxx = c->stride - 1 - c->vx;
+    if (c->vy + maxy > c->surfh - 1) maxy = c->surfh - 1 - c->vy;
+    if (minx > maxx || miny > maxy) return;
+
+    c->boxpix = c->boxpix + (maxx - minx + 1) * (maxy - miny + 1);
+
+    area = (sx[1] - sx[0]) * (sy[2] - sy[0]) - (sy[1] - sy[0]) * (sx[2] - sx[0]);
+    if (area == 0) return;                     // degenerate, zero pixels
+
+    a0 = sx[2] - sx[1]; b0 = sy[2] - sy[1];
+    a1 = sx[0] - sx[2]; b1 = sy[0] - sy[2];
+    a2 = sx[1] - sx[0]; b2 = sy[1] - sy[0];
+
+    // Normalise the winding away, which is what lets the span be solved with
+    // one set of inequalities instead of two. Negating the edge coefficients
+    // AND the area together leaves every quotient downstream unchanged --
+    // nn/area and the two texture ones are each a ratio of two things that
+    // both changed sign -- so a clockwise triangle still produces the byte-
+    // for-byte pixels it did before. That is the whole reason it is safe.
+    if (area < 0) {
+        a0 = 0 - a0; a1 = 0 - a1; a2 = 0 - a2;
+        b0 = 0 - b0; b1 = 0 - b1; b2 = 0 - b2;
+        area = 0 - area;
+    }
+
+    // The one place the edge functions are evaluated the expensive way. They
+    // come out already negated when the winding was, because a and b are.
+    w0r = a0 * (miny - sy[1]) - b0 * (minx - sx[1]);
+    w1r = a1 * (miny - sy[2]) - b1 * (minx - sx[2]);
+    w2r = a2 * (miny - sy[0]) - b2 * (minx - sx[0]);
+
+    nd  = w0r * iz[0] + w1r * iz[1] + w2r * iz[2];
+    ndx = 0 - (b0 * iz[0] + b1 * iz[1] + b2 * iz[2]);
+    ndy = a0 * iz[0] + a1 * iz[1] + a2 * iz[2];
+
+    // The texture numerators are only stepped when there is a texture, so an
+    // untextured triangle does not pay for them at all.
+    nu = 0; nux = 0; nuy = 0;
+    nv = 0; nvx = 0; nvy = 0;
+    if (textured) {
+        nu  = w0r * c->rs[0] + w1r * c->rs[1] + w2r * c->rs[2];
+        nux = 0 - (b0 * c->rs[0] + b1 * c->rs[1] + b2 * c->rs[2]);
+        nuy = a0 * c->rs[0] + a1 * c->rs[1] + a2 * c->rs[2];
+        nv  = w0r * c->rt[0] + w1r * c->rt[1] + w2r * c->rt[2];
+        nvx = 0 - (b0 * c->rt[0] + b1 * c->rt[1] + b2 * c->rt[2]);
+        nvy = a0 * c->rt[0] + a1 * c->rt[1] + a2 * c->rt[2];
+    }
+
+    // `d >= izfar` is `nn / area >= izfar`, and inside the span nn is a sum of
+    // non-negative products and area is positive, so it is exactly
+    // `nn >= izfar * area` with no division. Hoisted, because it is the same
+    // number for every pixel of the triangle.
+    farnum = c->izfar * area;
+
+    hit = 0; tx0 = 0; ty0 = 0; tx1 = 0; ty1 = 0;
+
+    y = miny;
+    while (y <= maxy) {
+        long lo;
+        long hi;
+        long q;
+        long x;
+        long xe;
+        long nn;
+        long nuu;
+        long nvv;
+        long rowbase;
+        long zrow;
+
+        // The covered run, as three inequalities in k where x = minx + k.
+        //   b_i > 0 : w_ir - k*b_i >= 0  =>  k <= floor(w_ir / b_i)
+        //   b_i < 0 : w_ir - k*b_i >= 0  =>  k >= -floor(w_ir / -b_i)
+        //   b_i = 0 : the edge is horizontal and decides the whole row at once
+        lo = 0;
+        hi = maxx - minx;
+
+        if (b0 > 0)       { q = gl_floordiv(w0r, b0);         if (q < hi) hi = q; }
+        else if (b0 < 0)  { q = 0 - gl_floordiv(w0r, 0 - b0); if (q > lo) lo = q; }
+        else if (w0r < 0) lo = hi + 1;
+
+        if (b1 > 0)       { q = gl_floordiv(w1r, b1);         if (q < hi) hi = q; }
+        else if (b1 < 0)  { q = 0 - gl_floordiv(w1r, 0 - b1); if (q > lo) lo = q; }
+        else if (w1r < 0) lo = hi + 1;
+
+        if (b2 > 0)       { q = gl_floordiv(w2r, b2);         if (q < hi) hi = q; }
+        else if (b2 < 0)  { q = 0 - gl_floordiv(w2r, 0 - b2); if (q > lo) lo = q; }
+        else if (w2r < 0) lo = hi + 1;
+
+        if (lo <= hi) {
+            c->steps = c->steps + (hi - lo + 1);
+            c->covered = c->covered + (hi - lo + 1);
+
+            // Jump the numerators to the start of the run in one step each,
+            // rather than stepping them across a prefix that draws nothing.
+            nn = nd + ndx * lo;
+            nuu = nu + nux * lo;
+            nvv = nv + nvx * lo;
+            // The row's two base offsets, one multiply each, per row rather
+            // than per pixel.
+            rowbase = (c->vy + y) * c->stride + c->vx;
+            zrow = y * c->vw;
+
+            x = minx + lo;
+            xe = minx + hi;
+            while (x <= xe) {
+                long idx;
+                idx = zrow + x;
+                // Every pixel here is inside the triangle by construction, so
+                // the only tests left are the two that are about depth. The
+                // far one is done on the numerator; the z-buffer one needs the
+                // actual reciprocal, so it pays for the divide -- but only
+                // once the far test has let it through.
+                if (nn >= farnum) {
+                    long d;
+                    // Larger 1/z is nearer, so a fragment beyond the far plane
+                    // has the SMALLER reciprocal. `>` and not `>=` on the
+                    // depth test, so that coplanar surfaces drawn later do not
+                    // fight for the same pixel.
+                    d = nn / area;
+                    if (!c->depth || d > c->zbuf[idx]) {
+                        c->zbuf[idx] = d;
+                        if (textured) {
+                            long uoz;
+                            long voz;
+                            long texel;
+                            // PERSPECTIVE CORRECTION, and the whole reason it
+                            // is done this way. s and t are not linear in
+                            // screen space; s/z and t/z are, and so is 1/z. So
+                            // interpolate those three and divide at the end.
+                            //
+                            // Interpolating s directly is the cheap way and it
+                            // is what gave the PlayStation 1 its swimming
+                            // floors: a quad split along one diagonal renders
+                            // differently from the same quad split along the
+                            // other. There is a test for exactly that, because
+                            // it is an invariant rather than something to
+                            // judge from a screenshot.
+                            uoz = nuu / area;
+                            voz = nvv / area;
+                            // rs is the full 32.32 product of s and 1/z, and d
+                            // is 1/z in 16.16, so this quotient is s in 16.16
+                            // with no shift. Shifting the product down to
+                            // 16.16 first would throw away exactly the bits
+                            // that matter for a distant surface, where 1/z is
+                            // small.
+                            if (d != 0) {
+                                texel = gl_texel(tx, uoz / d, voz / d);
+                                c->pix[rowbase + x] =
+                                       rgb(((texel >> 16) & 255) * cr / 255,
+                                           ((texel >> 8) & 255) * cg / 255,
+                                           (texel & 255) * cb / 255);
+                                c->pixels = c->pixels + 1;
+                                if (!hit) { hit = 1; tx0 = x; tx1 = x; ty0 = y; ty1 = y; }
+                                if (x < tx0) tx0 = x;
+                                if (x > tx1) tx1 = x;
+                                if (y > ty1) ty1 = y;
+                            }
+                        } else {
+                            c->pix[rowbase + x] = colour;
+                            c->pixels = c->pixels + 1;
+                            if (!hit) { hit = 1; tx0 = x; tx1 = x; ty0 = y; ty1 = y; }
+                            if (x < tx0) tx0 = x;
+                            if (x > tx1) tx1 = x;
+                            if (y > ty1) ty1 = y;
+                        }
+                    }
+                }
+                nn = nn + ndx;
+                nuu = nuu + nux; nvv = nvv + nvx;
+                x = x + 1;
+            }
+        }
+
         w0r = w0r + a0; w1r = w1r + a1; w2r = w2r + a2;
         nd = nd + ndy;
         nu = nu + nuy; nv = nv + nvy;
@@ -1054,6 +1373,9 @@ void gl_tri_project(struct GLCtx *c, struct Vtx *a, struct Vtx *b, struct Vtx *v
     c->rs[1] = b->s * iz[1]; c->rt[1] = b->t * iz[1];
     c->rs[2] = v->s * iz[2]; c->rt[2] = v->t * iz[2];
 
+#ifdef GL_RASTER_REF
+    if (c->refraster) { gl_tri_raster_ref(c, sx, sy, iz, colour); return; }
+#endif
     gl_tri_raster(c, sx, sy, iz, colour);
 }
 

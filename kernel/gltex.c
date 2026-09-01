@@ -39,6 +39,10 @@
 #include "nano-wmin.h"
 #include "nano-term.h"
 #include "nano-ui.h"
+// The old walking rasteriser, so section 6 can draw every picture in this
+// file twice and compare. Textures and a backwards-wound triangle are the two
+// things glapi.c's copy of that check cannot reach.
+#define GL_RASTER_REF
 #include "nano-gl.h"
 #include "nano-glapi.h"
 
@@ -1117,9 +1121,12 @@ void event_loop() {
         }
         ui_end(&g_ui);
 
+        // Ticks elapsed, not one per frame -- see the note in glapi.c's
+        // event loop. A step of one per frame makes the spin rate a function
+        // of how expensive the frame was.
         if (g_ticks != last_tick) {
+            g_spin = (g_spin + (g_ticks - last_tick)) % 360;
             last_tick = g_ticks;
-            g_spin = (g_spin + 1) % 360;
             redraw = 1;
         } else if (!g_view.dx && !g_view.dy && !g_view.key) {
             redraw = 0;
@@ -1128,6 +1135,119 @@ void event_loop() {
         wm_present();
         cpu_idle();
     }
+}
+
+// ============================================================
+// 6. the span rasteriser against the one it replaced
+// ============================================================
+//
+// K24 replaced the scanline loop. It used to walk into each row from the left
+// edge of the bounding box, testing three edge functions per pixel until they
+// all turned positive; now the covered run is solved from those same three
+// functions directly. The claim is that it is the same pixels, and a claim
+// like that is worth nothing without a second opinion -- so the old
+// rasteriser is still compiled in and every picture below is drawn twice.
+//
+// Here as well as in glapi.c, and for two reasons this file is the only place
+// that can supply:
+//
+//   - the TEXTURED path, with two more interpolants and two more divides in
+//     the pixel loop. glapi.c's demo scene has no textures in it at all.
+//   - a triangle with a NEGATIVE screen-space area. Every model in either
+//     file is wound consistently and backface culling removes the rest, so
+//     the branch the span solver normalises away is otherwise never taken.
+//     Case 5 exists solely to take it.
+
+// The flat quad, wound the other way round. With culling off it reaches the
+// rasteriser back-to-front, which is the negative-area case and nothing else
+// here produces one.
+void draw_flat_quad_rev(long z, long srep) {
+    gl_clear(&g_gl);
+    gl_state_init(&g_gls, &g_gl);
+    glColor3ub(&g_gls, 255, 255, 255);
+    glDisable(&g_gls, GL_LIGHTING);
+    glEnable(&g_gls, GL_TEXTURE_2D);
+    glBindTexture(&g_gls, GL_TEXTURE_2D, g_coord_name);
+    glMatrixMode(&g_gls, GL_MODELVIEW);
+    glLoadIdentity(&g_gls);
+
+    glBegin(&g_gls, GL_QUADS);
+    glTexCoord2x(&g_gls, srep, 0);
+    glVertex3x(&g_gls, GL_ONE, 0 - GL_ONE, z);
+    glTexCoord2x(&g_gls, srep, srep);
+    glVertex3x(&g_gls, GL_ONE, GL_ONE, z);
+    glTexCoord2x(&g_gls, 0, srep);
+    glVertex3x(&g_gls, 0 - GL_ONE, GL_ONE, z);
+    glTexCoord2x(&g_gls, 0, 0);
+    glVertex3x(&g_gls, 0 - GL_ONE, 0 - GL_ONE, z);
+    glEnd(&g_gls);
+}
+
+// Selected by number rather than by pointer: nano_cc has no function
+// pointers, and the alternative is writing the pair of calls out six times.
+void draw_case(long k) {
+    if (k == 0)      draw_flat_quad(4 * GL_ONE, GL_ONE);
+    else if (k == 1) draw_flat_quad(2 * GL_ONE, 4 * GL_ONE);
+    else if (k == 2) draw_floor(0);
+    else if (k == 3) draw_floor(1);
+    else if (k == 4) draw_floor_clipped();
+    else             draw_flat_quad_rev(3 * GL_ONE, 2 * GL_ONE);
+}
+
+void raster_pair(long k, char *what) {
+    long a;
+    long b;
+    long ca;
+    long cb;
+    long wa;
+    long wb;
+
+    g_gl.refraster = 0;
+    draw_case(k);
+    a = win_hash(0, 0, VPW, VPH);
+    ca = g_gl.covered;
+    wa = g_gl.steps;
+
+    g_gl.refraster = 1;
+    draw_case(k);
+    b = win_hash(0, 0, VPW, VPH);
+    cb = g_gl.covered;
+    wb = g_gl.steps;
+    g_gl.refraster = 0;
+
+    // Two independent equalities, because they can fail apart. The hash says
+    // the picture is the same; the coverage count says the same SET of pixels
+    // was considered, which a hash would not notice if two errors happened to
+    // land on background.
+    if (a != b) {
+        printf("  hash %d vs %d\n", a, b);
+        fail(what);
+        return;
+    }
+    if (ca != cb) {
+        printf("  covered %d vs %d\n", ca, cb);
+        fail(what);
+        return;
+    }
+    printf("  ok  %s: identical, %d pixels covered", what, ca);
+    printf(", walked %d vs %d\n", wa, wb);
+}
+
+void test_raster_agrees() {
+    long save;
+
+    puts("\n-- 6. the span rasteriser draws the reference's pixels --\n");
+
+    raster_pair(0, "a flat textured quad");
+    raster_pair(1, "the same quad, closer, texture repeated");
+    raster_pair(2, "a perspective floor");
+    raster_pair(3, "the same floor, split along the other diagonal");
+    raster_pair(4, "a floor that crosses the near plane");
+
+    save = g_gl.cull;
+    g_gl.cull = 0;
+    raster_pair(5, "a quad wound backwards, so its area is negative");
+    g_gl.cull = save;
 }
 
 void run_tests() {
@@ -1156,6 +1276,7 @@ void run_tests() {
     test_clipped_texture();
     test_modulate();
     test_depth_and_cost();
+    test_raster_agrees();
 
     printf("\nheap: %d pages mapped, %d bytes free\n", heap_pages, heap_bytes_free());
 

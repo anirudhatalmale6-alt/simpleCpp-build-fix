@@ -30,6 +30,9 @@
 // must not, because this image reads the framebuffer back and hashes it.
 #include "nano-kernel.h"
 #include "nano-fb.h"
+// For the PM timer only. A frame here is a few milliseconds and the PIT tick
+// is ten, so timing a renderer on g_ticks would be measuring the clock.
+#include "nano-acpi.h"
 #include "nano-mouse.h"
 #include "nano-int.h"
 #include "nano-mm.h"
@@ -37,6 +40,9 @@
 #include "nano-wmin.h"
 #include "nano-term.h"
 #include "nano-ui.h"
+// The old walking rasteriser, kept compiled in HERE and nowhere else, so
+// section 12 can render the same scene both ways and compare the buffers.
+#define GL_RASTER_REF
 #include "nano-gl.h"
 #include "nano-glapi.h"
 
@@ -1312,6 +1318,276 @@ void test_cost() {
 }
 
 // ============================================================
+// 12. where the time in a frame actually goes
+// ============================================================
+//
+// Reported from the demo: "if i make it so only one cube is in the camera it
+// draws them slower than having more in view". Less on screen, more time,
+// which is backwards, so something is being charged for that is not being
+// seen.
+//
+// This section renders the demo's own frame -- the ground and then the
+// objects, with the frustum deciding which of them are submitted -- from a
+// fixed set of camera poses, and prints four numbers for each:
+//
+//   obj      objects that survived the frustum test
+//   tri      triangles that reached the rasteriser
+//   px       pixels actually written, not counting the clear
+//   walked   inner-loop iterations executed
+//
+// px and walked are the pair that matters. They answer two different
+// questions -- how much of the picture is this, and how much work was done to
+// find out -- and a frame where they diverge is a frame paying for geometry
+// it is not showing.
+
+long g_bench_objs;
+
+// The demo's frame with the animation taken out of it, so two poses differ by
+// the camera and by nothing else. Same ground, same culling test, same
+// bounding sphere.
+void bench_frame() {
+    struct M4 clip;
+    long i;
+
+    gl_clear(&g_gl);
+    gl_state_init(&g_gls, &g_gl);
+    glMatrixMode(&g_gls, GL_PROJECTION);
+    glLoadIdentity(&g_gls);
+    gluPerspectivex(&g_gls, 60 << GL_FRAC,
+                    fx_div(fx_from_int(VPW), fx_from_int(VPH)), GL_ONE / 4);
+    glMatrixMode(&g_gls, GL_MODELVIEW);
+    glLoadIdentity(&g_gls);
+    cam_apply(&g_gls, &g_cam);
+
+    gl_clip_matrix(&g_gls, &clip);
+    gl_frustum_extract(&g_frustum, &clip);
+
+    g_gls.colour = rgb(52, 62, 78);
+    gl_ground(&g_gls, 12, 0 - 4, 20);
+
+    g_bench_objs = 0;
+    i = 0;
+    while (i < NOBJ) {
+        if (gl_frustum_sphere(&g_frustum, &g_obj[i], 113512) != GL_OUTSIDE) {
+            g_bench_objs = g_bench_objs + 1;
+            glPushMatrix(&g_gls);
+            glTranslatex(&g_gls, g_obj[i].x, g_obj[i].y, g_obj[i].z);
+            glRotatex(&g_gls, 20 << GL_FRAC, 0, GL_ONE, 0);
+            gl_cube(&g_gls);
+            glPopMatrix(&g_gls);
+        }
+        i = i + 1;
+    }
+}
+
+#define BENCH_ROUNDS 3
+#define BENCH_BEST   2
+
+// Best of two, because a preempted run is slow for a reason that has nothing
+// to do with the renderer -- the same rule linebench.c uses.
+long bench_us() {
+    long best;
+    long q;
+    best = 0;
+    q = 0;
+    while (q < BENCH_BEST) {
+        long a;
+        long b;
+        long t;
+        long r;
+        a = pm_timer_read();
+        r = 0;
+        while (r < BENCH_ROUNDS) { bench_frame(); r = r + 1; }
+        b = pm_timer_read();
+        t = pm_timer_delta(a, b);
+        if (best == 0 || t < best) best = t;
+        q = q + 1;
+    }
+    return ((best * 1000000) / PM_TMR_HZ) / BENCH_ROUNDS;
+}
+
+void bench_at(long ex, long ey, long ez, long yaw, long pitch) {
+    cam_init(&g_cam);
+    g_cam.eye.x = ex; g_cam.eye.y = ey; g_cam.eye.z = ez;
+    g_cam.yaw = yaw << GL_FRAC;
+    g_cam.pitch = pitch << GL_FRAC;
+}
+
+// Totals, so the summary is taken from the measurements rather than from
+// whichever line looked worst.
+long g_bench_span_us;
+long g_bench_ref_us;
+long g_bench_span_walk;
+long g_bench_ref_walk;
+long g_bench_disagree;
+
+// The last row's numbers, so a sweep can quote its own two ends.
+long g_row_obj;
+long g_row_us;
+
+// Columns padded by hand: this printf has %d and %s and nothing else, by
+// design -- see the note above it in nano-kernel.h. Six arguments including
+// the format string is nano_cc's ceiling, which is why this is two calls.
+void bench_row(char *what) {
+    long p0;
+    long px;
+    long cov;
+    long span_walk;
+    long ref_walk;
+    long span_us;
+    long ref_us;
+    long ref_cov;
+    long span_hash;
+    long ref_hash;
+
+    g_gl.refraster = 0;
+    p0 = g_gl.pixels;
+    bench_frame();
+    px = g_gl.pixels - p0 - VPW * VPH;
+    cov = g_gl.covered;
+    span_walk = g_gl.steps;
+    span_hash = win_hash(g_win3d, VPX, VPY, VPW, VPH);
+    span_us = bench_us();
+
+    g_gl.refraster = 1;
+    bench_frame();
+    ref_walk = g_gl.steps;
+    ref_cov = g_gl.covered;
+    ref_hash = win_hash(g_win3d, VPX, VPY, VPW, VPH);
+    ref_us = bench_us();
+    g_gl.refraster = 0;
+
+    // The check this whole section rests on. A rasteriser that is faster and
+    // draws something slightly different is not a faster rasteriser.
+    //
+    // Two equalities, because they fail apart. The hash says the picture came
+    // out the same. The coverage count says the same SET of pixels was
+    // considered on the way there -- which a hash cannot see if a difference
+    // happens to land on background or lose the depth test.
+    if (span_hash != ref_hash) {
+        g_bench_disagree = g_bench_disagree + 1;
+        fail("the span rasteriser drew the reference's pixels");
+    } else if (cov != ref_cov) {
+        g_bench_disagree = g_bench_disagree + 1;
+        printf("  covered %d vs %d\n", cov, ref_cov);
+        fail("the span rasteriser covered the reference's pixels");
+    }
+
+    printf("  %s obj %d  px %d  covered %d\n", what, g_bench_objs, px, cov);
+    printf("        span %d walked %d us   ref %d walked %d us\n",
+           span_walk, span_us, ref_walk, ref_us);
+
+    g_bench_span_us = g_bench_span_us + span_us;
+    g_bench_ref_us = g_bench_ref_us + ref_us;
+    g_bench_span_walk = g_bench_span_walk + span_walk;
+    g_bench_ref_walk = g_bench_ref_walk + ref_walk;
+    g_row_obj = g_bench_objs;
+    g_row_us = ref_us;
+}
+
+void test_fill() {
+    long far_obj;
+    long far_us;
+    long near_obj;
+    long near_us;
+
+    puts("\n-- 12. where the time in a frame actually goes --\n");
+    printf("  viewport %d x %d = %d pixels; the clear alone writes all of them\n",
+           VPW, VPH, VPW * VPH);
+    puts("  px = written, covered = inside a triangle, walked = iterations run\n");
+    puts("  every pose is rendered by BOTH rasterisers and the buffers hashed\n\n");
+
+    g_bench_span_us = 0; g_bench_ref_us = 0;
+    g_bench_span_walk = 0; g_bench_ref_walk = 0;
+    g_bench_disagree = 0;
+    far_obj = 0; far_us = 0; near_obj = 0; near_us = 0;
+
+    puts("  turning on the spot, from where the demo starts:\n");
+    {
+        long yaw;
+        yaw = 0;
+        while (yaw < 360) {
+            bench_at(0, 2 * GL_ONE, 0 - 7 * GL_ONE, yaw, 0 - 8);
+            printf("    yaw %d:\n", yaw);
+            bench_row("     ");
+            yaw = yaw + 45;
+        }
+    }
+
+    // THE REPORTED CASE. Flying in on one cube takes objects OUT of the
+    // frustum and puts pixels ON the screen at the same time, and it is the
+    // pixels that cost.
+    puts("\n  flying in on the cube at the origin, yaw 0:\n");
+    {
+        long d;
+        d = 7;
+        while (d >= 2) {
+            bench_at(0, 0, 0 - d * GL_ONE, 0, 0);
+            printf("    %d units back:\n", d);
+            bench_row("     ");
+            if (d == 7) { far_obj = g_row_obj; far_us = g_row_us; }
+            if (d == 2) { near_obj = g_row_obj; near_us = g_row_us; }
+            d = d - 1;
+        }
+    }
+
+    puts("\n  pitching down onto the ground, from where the demo starts:\n");
+    {
+        long p;
+        p = 0;
+        while (p >= 0 - 80) {
+            bench_at(0, 2 * GL_ONE, 0 - 7 * GL_ONE, 0, p);
+            printf("    pitch %d:\n", p);
+            bench_row("     ");
+            p = p - 20;
+        }
+    }
+
+    // Every model in this file is wound consistently and backface culling
+    // removes the rest, so the negative-area branch -- the one the span solver
+    // normalises away -- is never taken by any pose above. These two take it.
+    puts("\n  the same pose with the winding rules changed:\n");
+    {
+        long save_cull;
+        long save_front;
+        save_cull = g_gl.cull;
+        save_front = g_gl.frontcw;
+
+        bench_at(0, 2 * GL_ONE, 0 - 7 * GL_ONE, 0, 0 - 8);
+        g_gl.cull = 0;
+        puts("    culling off, so back faces rasterise too:\n");
+        bench_row("     ");
+        g_gl.cull = save_cull;
+
+        bench_at(0, 2 * GL_ONE, 0 - 7 * GL_ONE, 0, 0 - 8);
+        g_gl.frontcw = 1;
+        puts("    front face reversed, so the OTHER half is drawn:\n");
+        bench_row("     ");
+        g_gl.frontcw = save_front;
+    }
+
+    puts("\n  what the client saw, on the old rasteriser:\n");
+    printf("    7 units back: %d objects in view, %d us\n", far_obj, far_us);
+    printf("    2 units back: %d objects in view, %d us\n", near_obj, near_us);
+    if (near_obj < far_obj && near_us > far_us)
+        puts("    REPRODUCED: fewer objects in view, and the frame takes longer\n");
+    else
+        puts("    not reproduced by this sweep\n");
+
+    printf("\n  totals over every pose: span %d us, ref %d us\n",
+           g_bench_span_us, g_bench_ref_us);
+    printf("  iterations walked:      span %d, ref %d\n",
+           g_bench_span_walk, g_bench_ref_walk);
+    if (g_bench_ref_us > 0)
+        printf("  the span rasteriser is at %d%% of the old one's time\n",
+               (g_bench_span_us * 100) / g_bench_ref_us);
+    if (g_bench_disagree == 0)
+        puts("  ok  every pose: the two rasterisers produced identical buffers\n");
+    else
+        printf("  %d poses DISAGREED\n", g_bench_disagree);
+}
+
+// ============================================================
 // the interactive demo
 // ============================================================
 
@@ -1552,9 +1828,15 @@ void event_loop() {
         }
         ui_end(&g_ui);
 
+        // By the number of ticks that PASSED, not by one per frame that got
+        // as far as here. A step of one per frame ties the rotation rate to
+        // the frame rate, so a heavy frame does not just take longer to draw,
+        // it makes the cubes turn more slowly -- which is what "it draws them
+        // slower" describes from the other side of the screen. The wall clock
+        // is right here and always was; it just was not being read.
         if (g_ticks != last_tick) {
+            g_spin = (g_spin + (g_ticks - last_tick)) % 360;
             last_tick = g_ticks;
-            g_spin = (g_spin + 1) % 360;
             redraw = 1;
         } else if (!g_view.dx && !g_view.dy && !g_view.key) {
             redraw = 0;
@@ -1592,6 +1874,8 @@ void run_tests() {
     test_overlay();
     test_hud_input();
     test_cost();
+    if (acpi_pm_tmr) test_fill();
+    else puts("\n-- 12. skipped: no ACPI PM timer, nothing to time on --\n");
 
     printf("\nheap: %d pages mapped, %d bytes free\n", heap_pages, heap_bytes_free());
 
@@ -1609,6 +1893,12 @@ int main() {
 
     if (!fb_init(1024, 768)) { puts("fb_init failed\n"); for (;;) { } }
     if (!mm_init())          { puts("mm_init failed\n"); for (;;) { } }
+
+    // acpi_init BEFORE mm_protect_null: the pointer to the EBDA, where the
+    // RSDP is looked for, lives at physical 0x40E -- inside the page
+    // mm_protect_null unmaps. The same note is in linebench.c and it was
+    // written after hitting the fault.
+    if (!acpi_init()) puts("acpi_init found nothing -- section 12 cannot time\n");
     mm_protect_null();
 
     kbd_init();
