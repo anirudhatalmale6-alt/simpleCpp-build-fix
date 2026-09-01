@@ -164,21 +164,19 @@ void wm_damage(long x, long y, long w, long h) {
 // counter cannot drift away from the truth.
 
 void wm_row_fill(long fx, long fy, long n, long colour) {
-    long addr; long i;
+    long addr;
     if (n <= 0) return;
     addr = fb_base + fy * fb_pitch + fx * 4;
-    i = 0;
-    while (i < n) { mmio_write32(addr + i * 4, colour); i = i + 1; }
+    fb_fill32(addr, colour, n);
     wm_pixels = wm_pixels + n;
     wm_blits = wm_blits + 1;
 }
 
 void wm_row_copy(long fx, long fy, long *src, long n) {
-    long addr; long i;
+    long addr;
     if (n <= 0) return;
     addr = fb_base + fy * fb_pitch + fx * 4;
-    i = 0;
-    while (i < n) { mmio_write32(addr + i * 4, src[i]); i = i + 1; }
+    fb_blit32(addr, src, n);
     wm_pixels = wm_pixels + n;
     wm_blits = wm_blits + 1;
 }

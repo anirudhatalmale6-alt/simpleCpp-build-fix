@@ -856,6 +856,116 @@ void test_console() {
 }
 
 // ============================================================
+// 7. what a drag costs
+// ============================================================
+//
+// "dragging a window uses all the CPU" is a rate, not something you can see in
+// a frame. The mouse reports about a hundred times a second, the event loop
+// presents one frame per report, and if a frame costs a whole tick then a drag
+// is the entire machine with nothing left over.
+//
+// Two numbers, because they have two different causes and two different fixes:
+//
+//   PIXELS PER FRAME is the damage tracker's answer to "how much work does
+//   moving a window ask for". Moving a window by one pixel dirties the union
+//   of where it was and where it is, so the floor is one window's area and
+//   there is not much to win here.
+//
+//   TICKS PER FRAME is the blitter's answer to "how long does that work take".
+//   This is the one that decides whether a drag is free or fatal, and it is
+//   measured, not reasoned about, because the pixel count says nothing about
+//   the cost of a pixel.
+void test_drag_cost() {
+    long a;
+    long b;
+    long i;
+    long t0;
+    long t1;
+    long px;
+    long frames;
+    long load;
+    long full0;
+    long full1;
+
+    puts("\n-- 7. what a drag costs --\n");
+
+    wm_init(rgb(24, 28, 38));
+    wmin_init();
+    mouse_state_reset();
+    mouse_bounds(fb_width, fb_height);
+    a = wm_create(60, 70, 340, 230, "picture viewer");
+    b = wm_create(330, 190, 300, 180, "files");
+    paint_content(a, 3);
+    paint_content(b, 6);
+    wm_cursor_show(1);
+    wm_present();
+
+    frames = 400;
+
+    // Grab the title bar and then move one pixel at a time, doing exactly what
+    // the event loop does per mouse report: pump the queue, present once.
+    // Alternating direction keeps the window in the same place over 400 frames,
+    // so this measures a drag and not a journey off the edge of the screen.
+    press_at(g_win[a].x + 120, g_win[a].y + WM_TITLE_H / 2);
+    expect("the drag started", g_drag_win, a);
+
+    wm_reset_counters();
+    t0 = g_ticks;
+    i = 0;
+    while (i < frames) {
+        inject(((i & 1) ? -1 : 1), 0, 1);
+        wm_pump_mouse();
+        wm_present();
+        i = i + 1;
+    }
+    t1 = g_ticks;
+    px = wm_pixels;
+    release();
+    expect("releasing ended the drag", g_drag_win, -1);
+
+    printf("  %d drag frames: %d pixels, %d per frame, %d blits\n",
+           frames, px, px / frames, wm_blits);
+    printf("  the window itself is %d pixels, a full screen is %d\n",
+           g_win[a].w * g_win[a].h, wm_screen_pixels());
+    printf("  %d drag frames took %d ticks at %d Hz\n", frames, t1 - t0, g_hz);
+
+    // A PS/2 mouse reports at 100 samples a second, so a drag that costs
+    // (t1-t0) ticks for `frames` frames occupies this share of the machine.
+    load = (100 * (t1 - t0) * 100) / (frames * g_hz);
+    printf("  => a real drag would use %d%% of the CPU\n", load);
+    // Ten per cent, and the bound is chosen so that the version of this that
+    // wrote a pixel at a time -- measured at 30% here, and at "all of it" on
+    // the client's machine -- fails it.
+    if (load > 10) fail("dragging a window costs more than 10% of the CPU");
+    else printf("  ok  a drag leaves the machine usable\n");
+
+    check_matches_full("after 400 drag frames");
+
+    // And the blitter on its own, with the damage tracker taken out of the
+    // picture entirely: how long does it take to write the whole screen? The
+    // drag number above is a consequence of this one, and separating them is
+    // what says whether to fix the damage tracker or the pixel loop.
+    wm_no_damage = 1;
+    wm_reset_counters();
+    full0 = g_ticks;
+    i = 0;
+    while (i < 10) { wm_present(); i = i + 1; }
+    full1 = g_ticks;
+    wm_no_damage = 0;
+    {
+        long ticks;
+        long perscreen;
+        ticks = full1 - full0;
+        printf("  10 full repaints (%d pixels) took %d ticks\n", wm_pixels, ticks);
+        perscreen = (ticks * 1000) / 10;
+        printf("  = %d.%d ticks, or %d ms, per full screen\n",
+               perscreen / 1000, (perscreen % 1000) / 100,
+               (perscreen * 1000) / (g_hz * 1000));
+    }
+    wm_present();
+}
+
+// ============================================================
 // the desktop that is left on screen
 // ============================================================
 long g_shell_term;
@@ -929,6 +1039,7 @@ void run_tests() {
     test_hit();
     test_interaction();
     test_console();
+    test_drag_cost();
 
     printf("\nheap: %d pages mapped, %d bytes free\n", heap_pages, heap_bytes_free());
     printf("mouse: %d packets, %d resyncs, %d dropped events, %d spurious IRQs\n",
