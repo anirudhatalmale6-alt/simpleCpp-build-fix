@@ -769,6 +769,26 @@ void test_animation() {
     printf("  %d frames, %d distinct, %d ticks\n", n, distinct, t1 - t0);
     printf("  %d triangles per frame\n", g_gl.tris_in);
 
+    // One number over all 24 frames, printed so that a change to the
+    // rasteriser can be checked against the build before it rather than
+    // against a description of what it should do.
+    //
+    // The incremental edge functions are supposed to be the same arithmetic,
+    // not an approximation of it. "The pixel counts still match" is much
+    // weaker than it sounds -- a shifted picture has the same count -- so this
+    // hashes every pixel of every frame and the two builds have to agree
+    // digit for digit.
+    {
+        long sig;
+        sig = 5381;
+        i = 0;
+        while (i < n) {
+            sig = ((sig * 33) + hashes[i]) & 0xFFFFFFFF;
+            i = i + 1;
+        }
+        printf("  frame signature over all %d frames: %d\n", n, sig);
+    }
+
     expect("every frame differs from every other", distinct, n);
 }
 

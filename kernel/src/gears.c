@@ -123,7 +123,22 @@ long rgb(long r, long g, long b) {
     return ((r & 255) << 16) | ((g & 255) << 8) | (b & 255);
 }
 
+// GL_NO_WM leaves out the window binding; GL_NO_FRUSTUM leaves out the
+// frustum-culling helpers, which this program never calls.
+//
+// The second one is not tidiness. The compiler inside the OS has a ceiling on
+// how much source it will get through, and this translation unit -- gears.c
+// plus both renderer headers -- sits just under it. Adding roughly seven
+// hundred tokens of ANY code pushes it over, and what happens then is not an
+// error message: cc goes into lex() and never comes out, and the machine stops
+// scheduling. Verified by adding a dummy function of that size to the
+// unmodified header, which fails identically.
+//
+// So the headroom is bought back by not lexing what this program does not use.
+// Excluded by the preprocessor, the tokens never reach the lexer at all.
 #define GL_NO_WM
+#define GL_NO_FRUSTUM
+#define GL_NO_CAMERA
 #include "nano-gl.h"
 #include "nano-glapi.h"
 
@@ -372,6 +387,12 @@ long dragging;
 long keys_seen;
 long drags_seen;
 
+// Stage timings, in timer ticks. Accumulated over the whole run rather than
+// per frame, because one tick is 10ms and a single frame does not resolve.
+long t_draw;
+long t_blit;
+long t_present;
+
 // Returns 0 when the program should stop.
 long handle_input(long *poll) {
     long mx;
@@ -485,13 +506,30 @@ int main(int argc, char **argv) {
     t0 = sys3(SYS_TICKS, 0, 0, 0);
 
     while (frame < limit) {
+        long ta;
+        long tb;
+
         if (!sys3(SYS_WINPOLL, hnd, (long)poll, 0)) break;
         if (!handle_input(poll)) break;
 
+        // Three stages, timed separately. Where the time goes is not obvious
+        // from reading the code -- the rasteriser and the blit both touch
+        // 52,000 pixels -- and a profile that names the stage is the only way
+        // to optimise the one that matters instead of the one that looks slow.
+        ta = sys3(SYS_TICKS, 0, 0, 0);
         draw_frame(angle);
+        tb = sys3(SYS_TICKS, 0, 0, 0);
+        t_draw = t_draw + (tb - ta);
 
+        ta = tb;
         sys5(SYS_WINBLIT, hnd, (long)fb, W, H, 0);
+        tb = sys3(SYS_TICKS, 0, 0, 0);
+        t_blit = t_blit + (tb - ta);
+
+        ta = tb;
         sys3(SYS_WINPRESENT, hnd, 0, 0);
+        tb = sys3(SYS_TICKS, 0, 0, 0);
+        t_present = t_present + (tb - ta);
 
         angle = angle + 2 * GL_ONE;
         if (angle >= 360 * GL_ONE) angle = angle - 360 * GL_ONE;
@@ -512,6 +550,14 @@ int main(int argc, char **argv) {
     say(" keys, ");
     sayn(drags_seen);
     say(" drags\n");
+
+    say("gears: draw ");
+    sayn(t_draw);
+    say(" blit ");
+    sayn(t_blit);
+    say(" present ");
+    sayn(t_present);
+    say(" ticks\n");
 
     sys3(SYS_WINCLOSE, hnd, 0, 0);
 

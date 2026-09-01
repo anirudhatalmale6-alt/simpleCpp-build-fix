@@ -761,11 +761,20 @@ void gl_clip_matrix(struct GlState *st, struct M4 *o) {
     m4_mul(o, &st->pr[st->prsp], &st->mv[st->mvsp]);
 }
 
+// Guarded for the same reason the block it calls is: a build with
+// GL_NO_FRUSTUM has no struct Frustum to take a pointer to.
+#ifndef GL_NO_FRUSTUM
 void gl_cull_setup(struct GlState *st, struct Frustum *f) {
     struct M4 clip;
     gl_clip_matrix(st, &clip);
     gl_frustum_extract(f, &clip);
 }
+#endif
+
+// GL_NO_CAMERA leaves the flyable camera out. Same reason as GL_NO_FRUSTUM:
+// a program that never flies a camera should not spend the in-OS compiler's
+// budget on lexing one.
+#ifndef GL_NO_CAMERA
 
 // ---------- a camera you can fly ----------
 //
@@ -840,6 +849,8 @@ void cam_look(struct Camera *cam, long dyaw, long dpitch) {
     while (cam->yaw >= 360 << GL_FRAC) cam->yaw = cam->yaw - (360 << GL_FRAC);
     while (cam->yaw < 0) cam->yaw = cam->yaw + (360 << GL_FRAC);
 }
+
+#endif  // GL_NO_CAMERA
 
 // ---------- setup ----------
 

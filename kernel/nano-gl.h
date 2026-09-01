@@ -755,6 +755,31 @@ void gl_line(struct GLCtx *c, long x0, long y0, long x1, long y1, long colour) {
 // out of the same numbers as the inside test and costs nothing extra.
 //
 // Screen coordinates are integers here; the fixed point ended at projection.
+//
+// EVERY MULTIPLY IS OUT OF THE PIXEL LOOP, and that is the whole performance
+// story of this function. Each edge function is affine in x and y:
+//
+//     w0(x, y) = A0*(y - sy1) - B0*(x - sx1),   A0 = sx2-sx1, B0 = sy2-sy1
+//
+// so stepping x by one subtracts B0 and stepping y by one adds A0. Computing it
+// from scratch per pixel -- which is what this did -- is six multiplies and six
+// subtractions to rediscover a number that three additions already had.
+//
+// The same holds for everything interpolated across the triangle. The depth
+// numerator w0*iz0 + w1*iz1 + w2*iz2 is a sum of affine functions and is
+// therefore affine itself, as are the two perspective-corrected texture
+// numerators, so all three are carried along by addition too.
+//
+// This matters far more here than it would in a compiler with an imul. Programs
+// this OS builds are compiled by `cc --minimal`, whose target assembler has no
+// multiply instruction at all: every `*` becomes a shift-add loop over the bits
+// of the multiplier, and every `/` a 64-step restoring division. A multiply in
+// the pixel loop is not one instruction, it is around seventy.
+//
+// It is exactly the same arithmetic, not an approximation. Integer addition
+// reproduces the products bit for bit, so every pixel this writes is the pixel
+// the multiplying version wrote -- which is a property the tests check rather
+// than something to take on trust.
 void gl_tri_raster(struct GLCtx *c, long *sx, long *sy, long *iz, long colour) {
     long minx; long miny; long maxx; long maxy;
     long area;
@@ -762,6 +787,19 @@ void gl_tri_raster(struct GLCtx *c, long *sx, long *sy, long *iz, long colour) {
     long textured;
     long cr; long cg; long cb;
     struct Texture *tx;
+    // Edge coefficients. w_i steps by -B_i across x and +A_i down y.
+    long a0; long a1; long a2;
+    long b0; long b1; long b2;
+    // The three edge functions at the top-left corner of the clipped box.
+    long w0r; long w1r; long w2r;
+    // Interpolation numerators at the same corner, and their steps.
+    long nd; long ndx; long ndy;
+    long nu; long nux; long nuy;
+    long nv; long nvx; long nvy;
+    // Written-pixel extent, so the damage box is updated twice per triangle
+    // instead of once per pixel. gl_mark takes a box union, so recording the
+    // extremes of what was written gives the identical box.
+    long hit; long tx0; long ty0; long tx1; long ty1;
 
     // The texture, and the colour it is modulated by, hoisted out of the loop.
     // GL's default texture environment is GL_MODULATE: the fragment is the
@@ -795,28 +833,78 @@ void gl_tri_raster(struct GLCtx *c, long *sx, long *sy, long *iz, long colour) {
     if (miny < 0) miny = 0;
     if (maxx > c->vw - 1) maxx = c->vw - 1;
     if (maxy > c->vh - 1) maxy = c->vh - 1;
+
+    // Clip to the SURFACE as well as the viewport, once, here. gl_put tested
+    // this per pixel; doing it per triangle is what lets the inner loop write
+    // through the buffer directly, and it is the same test -- a viewport
+    // hanging off the edge of its surface is caught either way.
+    if (c->vx + minx < 0) minx = 0 - c->vx;
+    if (c->vy + miny < 0) miny = 0 - c->vy;
+    if (c->vx + maxx > c->stride - 1) maxx = c->stride - 1 - c->vx;
+    if (c->vy + maxy > c->surfh - 1) maxy = c->surfh - 1 - c->vy;
     if (minx > maxx || miny > maxy) return;
 
     area = (sx[1] - sx[0]) * (sy[2] - sy[0]) - (sy[1] - sy[0]) * (sx[2] - sx[0]);
     if (area == 0) return;                     // degenerate, zero pixels
 
+    a0 = sx[2] - sx[1]; b0 = sy[2] - sy[1];
+    a1 = sx[0] - sx[2]; b1 = sy[0] - sy[2];
+    a2 = sx[1] - sx[0]; b2 = sy[1] - sy[0];
+
+    // The one place the edge functions are evaluated the expensive way.
+    w0r = a0 * (miny - sy[1]) - b0 * (minx - sx[1]);
+    w1r = a1 * (miny - sy[2]) - b1 * (minx - sx[2]);
+    w2r = a2 * (miny - sy[0]) - b2 * (minx - sx[0]);
+
+    nd  = w0r * iz[0] + w1r * iz[1] + w2r * iz[2];
+    ndx = 0 - (b0 * iz[0] + b1 * iz[1] + b2 * iz[2]);
+    ndy = a0 * iz[0] + a1 * iz[1] + a2 * iz[2];
+
+    // The texture numerators are only stepped when there is a texture, so an
+    // untextured triangle does not pay for them at all.
+    nu = 0; nux = 0; nuy = 0;
+    nv = 0; nvx = 0; nvy = 0;
+    if (textured) {
+        nu  = w0r * c->rs[0] + w1r * c->rs[1] + w2r * c->rs[2];
+        nux = 0 - (b0 * c->rs[0] + b1 * c->rs[1] + b2 * c->rs[2]);
+        nuy = a0 * c->rs[0] + a1 * c->rs[1] + a2 * c->rs[2];
+        nv  = w0r * c->rt[0] + w1r * c->rt[1] + w2r * c->rt[2];
+        nvx = 0 - (b0 * c->rt[0] + b1 * c->rt[1] + b2 * c->rt[2]);
+        nvy = a0 * c->rt[0] + a1 * c->rt[1] + a2 * c->rt[2];
+    }
+
+    hit = 0; tx0 = 0; ty0 = 0; tx1 = 0; ty1 = 0;
+
     y = miny;
     while (y <= maxy) {
         long x;
+        long w0;
+        long w1;
+        long w2;
+        long nn;
+        long nuu;
+        long nvv;
+        long rowbase;
+        long zrow;
+        long inside;
+
+        inside = 0;
+        w0 = w0r; w1 = w1r; w2 = w2r;
+        nn = nd; nuu = nu; nvv = nv;
+        // The row's two base offsets, one multiply each, per row rather than
+        // per pixel. gl_put recomputed the first of these 52,000 times a frame.
+        rowbase = (c->vy + y) * c->stride + c->vx;
+        zrow = y * c->vw;
+
         x = minx;
         while (x <= maxx) {
-            long w0;
-            long w1;
-            long w2;
-            w0 = (sx[2] - sx[1]) * (y - sy[1]) - (sy[2] - sy[1]) * (x - sx[1]);
-            w1 = (sx[0] - sx[2]) * (y - sy[2]) - (sy[0] - sy[2]) * (x - sx[2]);
-            w2 = (sx[1] - sx[0]) * (y - sy[0]) - (sy[1] - sy[0]) * (x - sx[0]);
             if ((area > 0 && w0 >= 0 && w1 >= 0 && w2 >= 0) ||
                 (area < 0 && w0 <= 0 && w1 <= 0 && w2 <= 0)) {
                 long d;
                 long idx;
-                d = (w0 * iz[0] + w1 * iz[1] + w2 * iz[2]) / area;
-                idx = y * c->vw + x;
+                inside = 1;
+                d = nn / area;
+                idx = zrow + x;
                 // Larger 1/z is nearer, so a fragment beyond the far plane has
                 // the SMALLER reciprocal. `>` and not `>=` on the depth test,
                 // so that coplanar surfaces drawn later do not fight for the
@@ -838,8 +926,8 @@ void gl_tri_raster(struct GLCtx *c, long *sx, long *sy, long *iz, long colour) {
                         // from the same quad split along the other. There is a
                         // test for exactly that, because it is an invariant
                         // rather than something to judge from a screenshot.
-                        uoz = (w0 * c->rs[0] + w1 * c->rs[1] + w2 * c->rs[2]) / area;
-                        voz = (w0 * c->rt[0] + w1 * c->rt[1] + w2 * c->rt[2]) / area;
+                        uoz = nuu / area;
+                        voz = nvv / area;
                         // rs is the full 32.32 product of s and 1/z, and d is
                         // 1/z in 16.16, so this quotient is s in 16.16 with no
                         // shift. Shifting the product down to 16.16 first
@@ -847,20 +935,50 @@ void gl_tri_raster(struct GLCtx *c, long *sx, long *sy, long *iz, long colour) {
                         // distant surface, where 1/z is small.
                         if (d != 0) {
                             texel = gl_texel(tx, uoz / d, voz / d);
-                            gl_put(c, x, y,
+                            c->pix[rowbase + x] =
                                    rgb(((texel >> 16) & 255) * cr / 255,
                                        ((texel >> 8) & 255) * cg / 255,
-                                       (texel & 255) * cb / 255));
+                                       (texel & 255) * cb / 255);
+                            c->pixels = c->pixels + 1;
+                            if (!hit) { hit = 1; tx0 = x; tx1 = x; ty0 = y; ty1 = y; }
+                            if (x < tx0) tx0 = x;
+                            if (x > tx1) tx1 = x;
+                            if (y > ty1) ty1 = y;
                         }
                     } else {
-                        gl_put(c, x, y, colour);
+                        c->pix[rowbase + x] = colour;
+                        c->pixels = c->pixels + 1;
+                        if (!hit) { hit = 1; tx0 = x; tx1 = x; ty0 = y; ty1 = y; }
+                        if (x < tx0) tx0 = x;
+                        if (x > tx1) tx1 = x;
+                        if (y > ty1) ty1 = y;
                     }
                 }
+            } else if (inside) {
+                // A triangle is the intersection of three half-planes, so it
+                // is convex, so the covered pixels in a row are one unbroken
+                // run. Having been inside it and come out again, there is
+                // nothing further along this row -- and on a tall thin
+                // triangle that is most of the bounding box.
+                //
+                // Exact, not an approximation: convexity is a property of the
+                // shape, not of the arithmetic.
+                x = maxx;
             }
+            w0 = w0 - b0; w1 = w1 - b1; w2 = w2 - b2;
+            nn = nn + ndx;
+            nuu = nuu + nux; nvv = nvv + nvx;
             x = x + 1;
         }
+        w0r = w0r + a0; w1r = w1r + a1; w2r = w2r + a2;
+        nd = nd + ndy;
+        nu = nu + nuy; nv = nv + nvy;
         y = y + 1;
     }
+
+    // ty0 is the first row that wrote anything and rows are walked in order, so
+    // it needs no minimum test inside the loop -- only ty1 grows.
+    if (hit) { gl_mark(c, tx0, ty0); gl_mark(c, tx1, ty1); }
 }
 
 // Shade a face by its normal in view space. Returns a colour.
@@ -1045,6 +1163,13 @@ void gl_tri_view(struct GLCtx *c, struct V3 *a, struct V3 *b, struct V3 *v, long
 // comparing the frustum's verdict against whether the rasteriser actually
 // puts any pixels on the screen.
 
+// GL_NO_FRUSTUM leaves the culling helpers out. A program that never calls
+// them pays for them anyway when the compiler INSIDE the OS has to lex them,
+// and that compiler has a size ceiling this file is close to -- see the note
+// at the top of src/gears.c. Excluded by the preprocessor, so the tokens never
+// reach the lexer at all.
+#ifndef GL_NO_FRUSTUM
+
 #define GL_OUTSIDE   0
 #define GL_INTERSECT 1
 #define GL_INSIDE    2
@@ -1148,6 +1273,8 @@ long gl_frustum_box(struct Frustum *f, struct V3 *v, struct V3 *half) {
     }
     return partial ? GL_INTERSECT : GL_INSIDE;
 }
+
+#endif  // GL_NO_FRUSTUM
 
 // A triangle in MODEL space, transformed by the current modelview.
 void gl_tri(struct GLCtx *c, struct M4 *mv, struct V3 *a, struct V3 *b,

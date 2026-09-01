@@ -763,6 +763,15 @@ long proc_alive() {
 }
 
 // Wait for a pid, yielding meanwhile. Returns its exit code, or -1.
+// A heartbeat while waiting, because the longest thing this OS does is compile
+// something, and a compile that prints nothing until it finishes is
+// indistinguishable from a machine that has stopped. When the in-OS build of a
+// 2,500-line file stalled, the serial log's last line was the one saying the
+// compile had started -- and that told me nothing about whether anything was
+// still running.
+//
+// Every 200 ticks, which is far apart enough not to be noise and close enough
+// that a stall is obvious within seconds of watching.
 long proc_wait(long pid) {
     long i;
     for (;;) {
@@ -795,6 +804,17 @@ long proc_wait(long pid) {
 #define SYS_TICKS  10
 #define SYS_UNLINK 11
 #define SYS_BRK    12
+// Sleep for n milliseconds. SYS_YIELD gives up the rest of a slice and is
+// immediately runnable again, which is the wrong thing for a program that has
+// nothing to do until the next frame: round-robin keeps handing it the CPU and
+// it keeps handing it back. This takes the process out of the ready set until
+// the timer puts it back, so a GUI program idling at 20 frames a second costs
+// the machine nothing between frames.
+//
+// Answered in nano-int.h rather than here, for the same reason SYS_TICKS is:
+// it needs the clock, and the clock is defined in the file that includes this
+// one.
+#define SYS_NAP    18
 
 // The window calls. Numbers exist whether or not a window manager was
 // compiled in; the IMPLEMENTATIONS are behind #ifdef NANO_WM_H and every one

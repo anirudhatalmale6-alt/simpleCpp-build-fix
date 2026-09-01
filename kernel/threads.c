@@ -16,6 +16,14 @@
 // Forward declaration: `(long)spinner` needs the name registered before use,
 // and a prototype is enough -- fnsig_add runs for prototypes too.
 void spinner(long unused);
+void sleeper(long ticks);
+void yielder(long ticks);
+
+// How many times each of the two sleep-test threads was handed the CPU, and how
+// long the sleeping one was actually away for.
+long g_sleeper_slices;
+long g_yielder_slices;
+long g_sleeper_woke;
 
 long g_counter;
 long g_expected;
@@ -218,8 +226,84 @@ void main_thread(long unused) {
         g_threads[a].state = T_DONE;
     }
 
-    printf("\n%d switches, %d stack overflows detected\n",
-           g_switches, g_stack_smashed);
+    // --- 6. a sleep that is really a sleep ---
+    //
+    // thread_sleep_ms used to be `while (not yet) thread_yield();`. That gives
+    // the CPU up, but the thread stays in the ready set, so round-robin hands
+    // it back on every rotation and it hands it straight back -- a full context
+    // switch each time, for the whole sleep.
+    //
+    // The two threads below sleep for the same wall-clock time by the two
+    // different methods, and the number that matters is how many times each was
+    // SCHEDULED. The yielder is not a straw man: it is exactly what this kernel
+    // did until now, which makes it the control that proves the new number
+    // means something.
+    {
+        long s;
+        long y;
+        long t;
+        g_sleeper_slices = 0;
+        g_yielder_slices = 0;
+        g_sleeper_woke = 0;
+        s = thread_create((long)sleeper, 40, "sleeper");
+        y = thread_create((long)yielder, 40, "yielder");
+        t = g_ticks;
+        thread_join(s);
+        thread_join(y);
+        printf("over %d ticks: sleeping thread scheduled %d times, "
+               "yielding thread %d times\n",
+               g_ticks - t, g_sleeper_slices, g_yielder_slices);
+        if (g_sleeper_slices * 10 < g_yielder_slices)
+            puts("sleep ok: a sleeping thread leaves the ready set\n");
+        else
+            puts("SLEEP IS STILL A SPIN -- the sleeper is being scheduled\n");
+
+        // It has to WAKE as well as stop running. A sleep that never returns
+        // would score perfectly on the count above.
+        if (g_sleeper_woke >= 40 && g_sleeper_woke <= 46)
+            printf("wake ok: 40 ticks of sleep took %d ticks\n", g_sleeper_woke);
+        else
+            printf("SLEEP MISTIMED: 40 ticks of sleep took %d ticks\n",
+                   g_sleeper_woke);
+    }
+
+    // --- 7. the idle thread runs only when nothing else can ---
+    //
+    // It has to exist, or "everything is asleep" has no answer but to resume a
+    // sleeping thread. It also must not be in the rotation: on two threads that
+    // would be half the machine spent in hlt.
+    {
+        long busy;
+        long i0;
+        long i1;
+        long t;
+
+        // While a spinner is runnable, idle should get nothing at all.
+        g_done = 0;
+        busy = thread_create((long)spinner, 0, "busy");
+        i0 = g_idle_slices;
+        t = g_ticks;
+        while (g_ticks < t + 20) thread_yield();
+        i1 = g_idle_slices;
+        g_threads[busy].state = T_DONE;
+        printf("20 ticks with a spinner runnable: idle scheduled %d times\n",
+               i1 - i0);
+        if (i1 - i0 == 0) puts("idle ok: it is not in the rotation\n");
+        else puts("IDLE IS STEALING SLICES from a runnable thread\n");
+
+        // And with nothing runnable, it must be what runs -- otherwise the
+        // sleep above only worked because something else happened to be busy.
+        i0 = g_idle_slices;
+        thread_sleep_ms(150);
+        i1 = g_idle_slices;
+        printf("150ms with everything asleep: idle scheduled %d times\n",
+               i1 - i0);
+        if (i1 - i0 > 0) puts("idle ok: it caught the empty machine\n");
+        else puts("NOTHING RAN while everything slept\n");
+    }
+
+    printf("\n%d switches, %d stack overflows detected, %d sleep wakes\n",
+           g_switches, g_stack_smashed, g_sleep_wakes);
     puts("thread bring-up complete\n");
     cpu_halt_forever();
 }
@@ -229,6 +313,29 @@ void spinner(long unused) {
     long i;
     i = 0;
     for (;;) { i = i + 1; }
+}
+
+// The two halves of the sleep test. Each records how many times the scheduler
+// handed it the CPU, which is the whole difference between them.
+void sleeper(long ticks) {
+    long t;
+    long s0;
+    t = g_ticks;
+    s0 = g_threads[g_current].slices;
+    thread_sleep_ms(ticks * 10);          // 100Hz, so ticks*10 ms is ticks ticks
+    g_sleeper_woke = g_ticks - t;
+    g_sleeper_slices = g_threads[g_current].slices - s0;
+    thread_exit(0);
+}
+
+void yielder(long ticks) {
+    long t;
+    long s0;
+    t = g_ticks;
+    s0 = g_threads[g_current].slices;
+    while (g_ticks < t + ticks) thread_yield();
+    g_yielder_slices = g_threads[g_current].slices - s0;
+    thread_exit(0);
 }
 
 int main() {

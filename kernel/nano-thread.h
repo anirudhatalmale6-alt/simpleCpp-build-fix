@@ -27,6 +27,10 @@
 extern long irq_save();
 extern void irq_restore(long were_enabled);
 extern void switch_to_first(long rsp);
+// sti+hlt, from isr.s. Declared again here rather than taken from nano-int.h,
+// because that file is included after this one -- it has to be, so that its
+// interrupt dispatcher can see the scheduler.
+extern void cpu_idle();
 
 #define MAX_THREADS   32
 #define THREAD_STACK  32768        // 8 pages each
@@ -38,6 +42,10 @@ extern void switch_to_first(long rsp);
 #define T_RUNNING  2
 #define T_BLOCKED  3
 #define T_DONE     4
+// Blocked on the clock rather than on another thread. Separate from T_BLOCKED
+// because the timer wakes these and nothing else does, so the wake scan only
+// has to look at this state.
+#define T_SLEEPING 5
 
 struct Thread {
     long rsp;                  // saved stack pointer while not running
@@ -52,6 +60,7 @@ struct Thread {
     long faulted;              // 1 if it died from a CPU exception
     long root;                 // page-table root this thread runs in
     long proc;                 // owning process id, or -1 for a kernel thread
+    long wake_at;              // tick to wake on, while T_SLEEPING
     char name[32];
 };
 
@@ -163,6 +172,7 @@ long thread_create(long entry, long arg, char *nm) {
     g_threads[slot].faulted = 0;
     g_threads[slot].root = g_kernel_root;
     g_threads[slot].proc = -1;
+    g_threads[slot].wake_at = 0;
     g_threads[slot].id = slot;
     thread_name(slot, nm);
     // 16-byte align the top, and leave a word spare: the ABI wants rsp+8
@@ -175,9 +185,16 @@ long thread_create(long entry, long arg, char *nm) {
     return slot;
 }
 
+// The idle thread's slot, or -1 before there is one. It is always runnable, so
+// without excluding it here round-robin would hand it a full slice every
+// rotation -- which on two threads is half the machine spent in hlt.
+long g_idle_thread;
+
 // Pick the next runnable thread, round-robin from the one after the current.
-// Returns -1 if nothing at all can run, which on this kernel means everything
-// is blocked and only an interrupt can change that.
+// The idle thread is skipped unless nothing else can run at all.
+//
+// Returns -1 only when there is no idle thread either, which on this kernel
+// means everything is blocked and only an interrupt can change that.
 long sched_pick() {
     long i;
     long n;
@@ -186,10 +203,34 @@ long sched_pick() {
     while (n < MAX_THREADS) {
         i = i + 1;
         if (i >= MAX_THREADS) i = 0;
+        if (i == g_idle_thread) { n = n + 1; continue; }
         if (g_threads[i].state == T_READY || g_threads[i].state == T_RUNNING) return i;
         n = n + 1;
     }
+    if (g_idle_thread >= 0 &&
+        (g_threads[g_idle_thread].state == T_READY ||
+         g_threads[g_idle_thread].state == T_RUNNING)) return g_idle_thread;
     return -1;
+}
+
+// Wake every sleeper whose deadline has passed. Called from the timer, which is
+// the only thing that can move the clock, and which is also the only context
+// where nothing else can be part-way through touching the table.
+//
+// `now` is passed in rather than read, because g_ticks lives in nano-int.h and
+// that file is included after this one.
+long g_sleep_wakes;
+
+void thread_wake_due(long now) {
+    long i;
+    i = 0;
+    while (i < MAX_THREADS) {
+        if (g_threads[i].state == T_SLEEPING && now >= g_threads[i].wake_at) {
+            g_threads[i].state = T_READY;
+            g_sleep_wakes = g_sleep_wakes + 1;
+        }
+        i = i + 1;
+    }
 }
 
 // Called from the timer interrupt with the current thread's saved stack.
@@ -254,6 +295,23 @@ void thread_yield() {
     yield_now();
 }
 
+// Block until the clock reaches `deadline`. The difference from a yield loop is
+// the whole point: a sleeping thread is not in the ready set at all, so it is
+// never handed a slice it has nothing to do with. The old thread_sleep_ms spun
+// on thread_yield, which on two threads gave a sleeper half the machine.
+//
+// The deadline is absolute so that the caller, which is the only place that can
+// see the clock, computes it once. Sleeping while the scheduler is off would
+// block forever with nothing able to wake it, so that degrades to a no-op and
+// the caller's own spin -- see thread_sleep_ms.
+long thread_sleep_until(long deadline) {
+    if (!g_sched_on) return 0;
+    g_threads[g_current].wake_at = deadline;
+    g_threads[g_current].state = T_SLEEPING;
+    yield_now();
+    return 1;
+}
+
 void thread_exit(long value) {
     long flags;
     flags = irq_save();
@@ -297,10 +355,37 @@ long thread_join(long id) {
     return r;
 }
 
+// The idle thread. It exists so that "everything is asleep" has an answer other
+// than "resume a sleeping thread anyway", which is what sched_switch had to do
+// before, and which made a real sleep impossible: with only one thread on the
+// machine there was nowhere else to go.
+//
+// hlt stops the core until the next interrupt, so an idle machine costs nothing
+// -- which is visible from outside as the emulator no longer pinning a host CPU
+// while the desktop sits there.
+long g_idle_slices;
+
+void idle_body(long arg) {
+    for (;;) {
+        g_idle_slices = g_idle_slices + 1;
+        cpu_idle();
+    }
+}
+
+// Create it. Called from sched_start, so no caller has to remember to.
+void idle_start() {
+    if (g_idle_thread >= 0) return;
+    // -1 while it is being built: thread_create runs sched_pick's exclusion
+    // rule against g_idle_thread, and pointing that at a half-built slot would
+    // hide the new thread from the scheduler.
+    g_idle_thread = thread_create((long)idle_body, 0, "idle");
+}
+
 // Turn the scheduler on and jump into the first thread. Does not return.
 void sched_start() {
     long first;
     cli_();
+    idle_start();
     first = sched_pick();
     if (first < 0) return;
     g_current = first;
@@ -322,6 +407,9 @@ void thread_init() {
     g_thread_faults = 0;
     g_switch_cr3 = 0;
     g_space_switches = 0;
+    g_idle_thread = -1;
+    g_idle_slices = 0;
+    g_sleep_wakes = 0;
     // Whatever boot32.s built is the kernel's address space, and every thread
     // starts in it. Reading it rather than naming a constant means this stays
     // right if the boot path ever moves the tables.
@@ -352,6 +440,7 @@ long thread_adopt(long rsp, long root, long proc, char *nm) {
     g_threads[slot].faulted = 0;
     g_threads[slot].root = root;
     g_threads[slot].proc = proc;
+    g_threads[slot].wake_at = 0;
     g_threads[slot].id = slot;
     thread_name(slot, nm);
     g_threads[slot].rsp = rsp;
@@ -378,13 +467,21 @@ long thread_fault_kill() {
 
     if (!g_sched_on) return 0;
 
-    // is there anything else to run?
+    // Is there anything else to run? The idle thread does not count: killing
+    // the faulting thread and then idling forever is not "the rest of the
+    // system continues", it is a hang with a cheerful message. Before the idle
+    // thread existed this loop was right without having to say so.
+    //
+    // A SLEEPER DOES count. It is not runnable this instant, but the timer will
+    // make it runnable, and a compositor that naps 20ms between frames is
+    // exactly the shape of thread that would otherwise be missed here.
     other = 0;
     n = 0;
     i = 0;
     while (i < MAX_THREADS) {
-        if (i != g_current &&
-            (g_threads[i].state == T_READY || g_threads[i].state == T_RUNNING))
+        if (i != g_current && i != g_idle_thread &&
+            (g_threads[i].state == T_READY || g_threads[i].state == T_RUNNING ||
+             g_threads[i].state == T_SLEEPING))
             other = 1;
         i = i + 1;
     }

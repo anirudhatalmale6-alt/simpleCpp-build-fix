@@ -15,7 +15,7 @@ FAIL=0
 
 ALLOWED="mov add or and sub xor cmp shl shr sar jmp je jz jne jnz jl jle jg jge jb jbe ja jae call ret syscall"
 
-for d in test features structs bitwise printf switch; do
+for d in test features structs bitwise printf switch arith; do
     ./nano_cc "$d.c" "$T/$d.s" >/dev/null || { echo "FAIL $d: normal compile"; FAIL=1; continue; }
     $CC -nostdlib -no-pie "$T/$d.s" -o "$T/${d}_n" || { echo "FAIL $d: normal link"; FAIL=1; continue; }
     A=$("$T/${d}_n" 2>&1; echo "rc=$?")

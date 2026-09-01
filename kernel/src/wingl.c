@@ -88,9 +88,28 @@ long sys5(long n, long a, long b, long c, long d, long e) {
 #define SYS_WINPRESENT 15
 #define SYS_WINPOLL    16
 #define SYS_WINCLOSE   17
+#define SYS_NAP        18
+
+// Twenty-five frames a second. Nothing here needs more, and the point of a
+// deadline is to have something left over to give away.
+#define FRAME_TICKS    4
 
 long slen(char *s) { long n; n = 0; while (s[n]) n = n + 1; return n; }
 void say(char *s) { sys3(SYS_WRITE, 1, (long)s, slen(s)); }
+
+void sayn(long v) {
+    char buf[24];
+    long i;
+    long neg;
+    neg = v < 0;
+    if (neg) v = 0 - v;
+    i = 23;
+    buf[i] = 0;
+    if (v == 0) { i = i - 1; buf[i] = '0'; }
+    while (v > 0) { i = i - 1; buf[i] = '0' + v % 10; v = v / 10; }
+    if (neg) { i = i - 1; buf[i] = '-'; }
+    say(&buf[i]);
+}
 
 // ---------- the program's own arithmetic ----------
 
@@ -238,6 +257,8 @@ int main(int argc, char **argv) {
     long frame;
     long poll[8];
     long spin;
+    long naps;
+    long napped;
 
     say("wingl: a program this machine compiled, asking for a window\n");
 
@@ -256,9 +277,14 @@ int main(int argc, char **argv) {
 
     frame = 0;
     spin = 0;
+    naps = 0;
+    napped = 0;
     while (frame < 60) {
         long i;
         long shade;
+        long tframe;
+
+        tframe = sys3(SYS_TICKS, 0, 0, 0);
 
         // Has somebody closed it? A program whose window has gone would
         // otherwise spin forever blitting into nothing.
@@ -293,12 +319,37 @@ int main(int argc, char **argv) {
         sys5(SYS_WINBLIT, hnd, (long)fb, W, H, 0);
         sys3(SYS_WINPRESENT, hnd, 0, 0);
 
+        // FRAME PACING. This cube is cheap enough to redraw hundreds of times
+        // a second, and doing so is pointless: the screen is not going to show
+        // it. SYS_YIELD gave the CPU up and took it straight back, because a
+        // yielding process is still in the ready set. SYS_NAP takes it out
+        // until the deadline, so the machine really is idle in between --
+        // which is what makes room for anything else that wants to run, and
+        // what stops the emulator pinning a host core to animate a wireframe.
+        //
+        // The remainder of the period, not a fixed sleep: a slow frame must not
+        // be followed by a sleep that makes it slower.
+        {
+            long used;
+            long left;
+            used = sys3(SYS_TICKS, 0, 0, 0) - tframe;
+            left = FRAME_TICKS - used;
+            if (left > 0) {
+                naps = naps + 1;
+                napped = napped + left;
+                sys3(SYS_NAP, left * 10, 0, 0);
+            }
+        }
+
         spin = (spin + 6) % 360;
         frame = frame + 1;
-        sys3(SYS_YIELD, 0, 0, 0);
     }
 
-    say("wingl: done, closing the window\n");
+    say("wingl: done, napped ");
+    sayn(napped);
+    say(" ticks over ");
+    sayn(naps);
+    say(" frames, closing the window\n");
     sys3(SYS_WINCLOSE, hnd, 0, 0);
     return 7;
 }

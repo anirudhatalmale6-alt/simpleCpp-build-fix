@@ -253,6 +253,11 @@ long isr_dispatch(struct Regs *r) {
         // again and the machine freezes with the scheduler apparently working.
         pic_eoi(0);
 #ifdef NANO_THREAD_H
+        // Sleepers become runnable here, before the pick, so a thread whose
+        // deadline is this tick is scheduled on this tick rather than the next.
+        // The timer is the only thing that moves the clock, so it is the only
+        // thing that can ever change a sleeper's answer.
+        thread_wake_due(g_ticks);
         return sched_switch((long)r);
 #else
         return (long)r;
@@ -278,6 +283,30 @@ long isr_dispatch(struct Regs *r) {
             // belongs to this file, and this file is included last so the
             // dispatcher above can see the scheduler and the process table.
             r->rax = g_ticks;
+        } else if (r->rax == SYS_NAP) {
+            // Here for the same reason, and it needs the scheduler too.
+            long ms;
+            long ticks;
+            ms = r->rdi;
+            r->rax = 0;
+            if (ms <= 0) {
+                // A zero nap is a yield. Saying so is better than sleeping for
+                // a tick, because a program that means "let someone else run"
+                // should not lose 10ms to a rounding decision.
+                g_syscall_resched = 1;
+            } else {
+                ticks = (ms * g_hz) / 1000;
+                if (ticks < 1) ticks = 1;
+                // A cap, because the only thing on the other side of this
+                // number is a program, and a process asleep for a year still
+                // owns its window. Ten seconds is far longer than any frame
+                // pacing and short enough that a mistake is visible rather
+                // than permanent.
+                if (ticks > 10 * g_hz) ticks = 10 * g_hz;
+                g_threads[g_current].wake_at = g_ticks + ticks;
+                g_threads[g_current].state = T_SLEEPING;
+                g_syscall_resched = 1;
+            }
         } else {
             r->rax = syscall_dispatch(r->rax, r->rdi, r->rsi, r->rdx,
                                       r->r10, r->r8);
@@ -435,10 +464,27 @@ char keyboard_getchar_irq() {
 // than halting the core. Lives here rather than in nano-thread.h because it
 // needs the timer, and nano-thread.h is included first so that the dispatcher
 // can see the scheduler.
+//
+// This used to spin on thread_yield, and calling that a sleep was generous. A
+// yielding thread stays in the ready set, so round-robin keeps handing it the
+// CPU and it keeps handing it straight back: with two threads a "sleeper" got
+// half of every rotation and cost a context switch each time round. Now it
+// leaves the ready set entirely and the timer puts it back.
+//
+// One tick is 10ms at 100Hz, so a sleep shorter than that rounds up to a tick
+// rather than down to nothing -- a zero-tick sleep would be a yield wearing a
+// different name, and a caller asking for 5ms wants to give the CPU away.
 void thread_sleep_ms(long ms) {
+    long ticks;
     long target;
-    target = g_ticks + (ms * g_hz) / 1000;
-    while (g_ticks < target) thread_yield();
+    if (ms <= 0) { thread_yield(); return; }
+    ticks = (ms * g_hz) / 1000;
+    if (ticks < 1) ticks = 1;
+    target = g_ticks + ticks;
+    if (thread_sleep_until(target)) return;
+    // No scheduler: there is nobody to hand the CPU to, so stop the core
+    // instead. Yielding in a loop here would be a busy wait on one thread.
+    while (g_ticks < target) cpu_idle();
 }
 #endif
 

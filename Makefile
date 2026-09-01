@@ -113,9 +113,15 @@ libcheck: $(BIN)
 casts: $(BIN)
 	@sh gcc-check.sh casts.c $(MINIASM)
 
+# Multiply, divide and modulo across both signs and the whole range of a long.
+# Matters most for --minimal, where neither imul nor idiv exists and both are
+# synthesised, so the answers come from code rather than from the CPU.
+arith: $(BIN)
+	@sh gcc-check.sh arith.c $(MINIASM)
+
 # Every gcc-checked suite in one go.
 checkall: $(BIN)
-	@for f in initializers typedefs gotos functions reserved libcheck casts; do \
+	@for f in initializers typedefs gotos functions reserved libcheck casts arith; do \
 	    echo "== $$f.c"; sh gcc-check.sh $$f.c $(MINIASM) || exit 1; \
 	done
 

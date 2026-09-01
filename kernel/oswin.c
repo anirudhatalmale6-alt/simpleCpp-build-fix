@@ -194,6 +194,90 @@ void build_desktop() {
     wm_present();
 }
 
+// ---------- the compositor ----------
+//
+// The pointer used to move only when something else happened to present. A
+// program rendering 900 triangles in software takes a third of a second per
+// frame, and it calls SYS_WINPRESENT once per frame, so the cursor updated
+// three times a second -- while the mouse driver had known where it was the
+// whole time. IRQ12 was updating g_mouse_x on every packet; nothing was putting
+// it on screen.
+//
+// So the pointer gets its own thread, and it is the one thing on the desktop
+// that does not wait for an application. Fifty times a second it asks whether
+// the mouse has moved, and repaints only if it has -- so a still pointer costs
+// two comparisons and a sleep, and a moving one costs the two small rectangles
+// the damage system already knew how to repaint.
+//
+// LOCKING. The thread runs its screen work with interrupts masked. On one CPU
+// that IS mutual exclusion: syscalls arrive through an interrupt gate and so
+// already run with interrupts off, which makes a process's SYS_WINBLIT atomic
+// with respect to this thread; masking here makes this thread atomic with
+// respect to them. Without it, a timer tick landing in the middle of
+// wm_present would let a process re-enter the compositor underneath it.
+//
+// The critical section is bounded by design, not by hope: only the cursor
+// rectangles are damaged on these passes, so it is a few hundred pixels.
+long g_comp_frames;
+long g_comp_ticks;
+long g_comp_last_x;
+long g_comp_last_y;
+long g_comp_stop;
+long g_comp_thread;
+
+// It pumps the mouse queue as well as moving the pointer, and that turns out to
+// be the larger half. wm_pump_mouse is what raises a window, focuses it, drags
+// it by its title bar and closes it by its button -- and NOTHING IN THIS IMAGE
+// HAD EVER CALLED IT. The window manager could do all of that; there was simply
+// no thread whose job it was to ask. So the desktop was not slow to respond, it
+// did not respond at all, and the pointer sliding along at the application's
+// frame rate was the visible half of the same missing piece.
+long compositor_pass() {
+    long n;
+    long moved;
+    long f;
+    long mx;
+    long my;
+
+    mx = g_mouse_x;
+    my = g_mouse_y;
+    moved = (mx != g_comp_last_x || my != g_comp_last_y);
+
+    f = irq_save();
+    // Drains every event queued since the last pass. wm_input_mouse works from
+    // the absolute position rather than accumulated deltas, so a burst of
+    // packets between two passes costs one move, not one per packet.
+    n = wm_pump_mouse();
+    if (n || moved) {
+        wm_cursor_move(g_mouse_x, g_mouse_y);
+        wm_present();
+    }
+    irq_restore(f);
+
+    g_comp_last_x = mx;
+    g_comp_last_y = my;
+    return n || moved;
+}
+
+void compositor(long unused) {
+    g_comp_last_x = 0 - 1;
+    g_comp_last_y = 0 - 1;
+    for (;;) {
+        if (g_comp_stop) thread_exit(0);
+        {
+            long t0;
+            t0 = g_ticks;
+            if (compositor_pass()) {
+                g_comp_ticks = g_comp_ticks + (g_ticks - t0);
+                g_comp_frames = g_comp_frames + 1;
+            }
+        }
+        // 20ms, as a real sleep. A yield loop here would take half the machine
+        // away from whatever is drawing, to do nothing with it.
+        thread_sleep_ms(20);
+    }
+}
+
 // How many windows a given pid currently owns.
 long windows_owned_by(long pid) {
     long i;
@@ -315,13 +399,100 @@ long kwin_hash() {
 // Spawn a program and watch it, rather than just waiting for it. proc_wait
 // would tell us the exit code and nothing about what happened on screen while
 // it ran -- and what happens on screen is the entire point of this milestone.
-long run_and_watch(char *path, long pid_out) {
-    char *av[2];
+// ---------- is the pointer usable while a program is drawing? ----------
+//
+// The client's actual complaint, turned into a number. While the program runs,
+// the mouse is warped to a spot on the bare desktop and the FRAMEBUFFER is then
+// read until the cursor's own black outline pixel appears there. The gap, in
+// ticks, is how long the pointer lagged the hand.
+//
+// Reading the framebuffer and not g_cur_px matters. g_cur_px is the window
+// manager's opinion about where it drew; the framebuffer is what is on screen.
+// A compositor that updated its bookkeeping and never painted would pass the
+// first test and fail the person using it.
+//
+// The spots are on the empty desktop below every window, checked before each
+// warp: if the pixel is already the cursor colour the measurement would be
+// vacuous, and it says so instead of scoring a zero.
+long g_probe_on;
+long g_probe_moves;
+long g_probe_hits;
+long g_probe_misses;
+long g_probe_worst;
+long g_probe_total;
+long g_probe_bad_spot;
+
+// How long to wait for the pointer before calling it a miss. It has to be
+// SHORTER than the run that contains it, or the control can never register a
+// failure -- which is exactly what happened the first time: a twelve-frame
+// control run lasted 86 ticks against a 200-tick timeout, attempted one move,
+// and reported "0 never arrived" because it had not finished waiting. A
+// control that cannot fail is not a control.
+//
+// 60 ticks is seven times the worst the compositor produces and well inside
+// even a short run.
+#define PROBE_TIMEOUT 60
+
+// A single synthesised click on the kernel window's title bar, part-way through
+// the run. Moving the pointer proves the screen is being repainted; this proves
+// the window manager is being DRIVEN -- that a press reaches wm_input_mouse,
+// raises and focuses a window, while a process is using the whole CPU.
+//
+// It is a press and a release at the same place, so the window is raised and
+// focused and the drag it starts ends where it began. Clicking the title bar
+// and not the close box, for the obvious reason.
+long g_click_armed;      // 0 off, 1 due, 2 waiting for the WM, 3 done
+long g_click_t0;
+long g_click_before;
+long g_click_lat;        // ticks until the WM acted, -1 if it never did
+long g_click_focus_ok;
+
+long probe_x(long i) {
+    long xs[4];
+    xs[0] = 90; xs[1] = 170; xs[2] = 250; xs[3] = 330;
+    return xs[i & 3];
+}
+
+long probe_y(long i) {
+    long ys[4];
+    ys[0] = 560; ys[1] = 600; ys[2] = 640; ys[3] = 680;
+    return ys[i & 3];
+}
+
+void probe_reset() {
+    g_probe_moves = 0;
+    g_probe_hits = 0;
+    g_probe_misses = 0;
+    g_probe_worst = 0;
+    g_probe_total = 0;
+    g_probe_bad_spot = 0;
+    g_click_armed = 0;
+    g_click_lat = 0;
+    g_click_focus_ok = 0;
+}
+
+// `arg`, if it is not zero, becomes argv[1]. gears reads it as a frame count,
+// which is how the control run below asks for a short one instead of paying for
+// forty frames twice.
+long run_and_watch(char *path, char *arg) {
+    char *av[3];
     long pid;
+    long nav;
     long last_ink;
+    long probe_wait;      // 0 = due to move, 1 = waiting for the pointer
+    long probe_t0;
+    long probe_px;
+    long probe_py;
+
+    probe_wait = 0;
+    probe_t0 = 0;
+    probe_px = 0;
+    probe_py = 0;
 
     av[0] = path;
-    pid = proc_spawn(path, 1, av, path, "/");
+    av[1] = arg;
+    nav = arg ? 2 : 1;
+    pid = proc_spawn(path, nav, av, path, "/");
     if (!pid) { printf("SPAWN FAILED %s: %s\n", path, proc_reject); return -2; }
 
     g_saw_window = -1;
@@ -358,8 +529,73 @@ long run_and_watch(char *path, long pid_out) {
             i = i + 1;
         }
 
+        // Move the pointer, then watch the screen for it.
+        if (g_probe_on) {
+            if (!probe_wait) {
+                if (g_click_armed == 1 && g_probe_moves >= 4) {
+                    // The click takes the pointer with it, so it goes between
+                    // two pointer measurements rather than during one.
+                    g_click_before = g_wmin_clicks;
+                    g_click_t0 = g_ticks;
+                    mouse_push(120, 40 + WM_TITLE_H / 2, 1);
+                    mouse_push(120, 40 + WM_TITLE_H / 2, 0);
+                    g_click_armed = 2;
+                    probe_wait = 2;
+                } else {
+                // Do not move it onto a spot that is already the colour we are
+                // going to look for -- that would be a test that cannot fail.
+                probe_px = probe_x(g_probe_moves);
+                probe_py = probe_y(g_probe_moves);
+                if (fb_get(probe_px, probe_py) == rgb(0, 0, 0)) {
+                    g_probe_bad_spot = g_probe_bad_spot + 1;
+                    g_probe_moves = g_probe_moves + 1;
+                } else {
+                    mouse_warp(probe_px, probe_py);
+                    probe_t0 = g_ticks;
+                    probe_wait = 1;
+                    g_probe_moves = g_probe_moves + 1;
+                }
+                }
+            } else if (probe_wait == 2) {
+                if (g_wmin_clicks > g_click_before) {
+                    g_click_lat = g_ticks - g_click_t0;
+                    g_click_focus_ok = (g_focus == g_kwin);
+                    g_click_armed = 3;
+                    probe_wait = 0;
+                } else if (g_ticks - g_click_t0 > 200) {
+                    g_click_lat = 0 - 1;
+                    g_click_armed = 3;
+                    probe_wait = 0;
+                }
+            } else {
+                long lat;
+                lat = g_ticks - probe_t0;
+                if (fb_get(probe_px, probe_py) == rgb(0, 0, 0)) {
+                    if (lat > g_probe_worst) g_probe_worst = lat;
+                    g_probe_total = g_probe_total + lat;
+                    g_probe_hits = g_probe_hits + 1;
+                    probe_wait = 0;
+                } else if (lat > PROBE_TIMEOUT) {
+                    g_probe_misses = g_probe_misses + 1;
+                    probe_wait = 0;
+                }
+            }
+        }
+
         if (done) break;
-        thread_yield();
+        // A TICK, not a yield. This loop hashes the whole client area of the
+        // window twice per pass -- 52,000 pixels for gears -- and a yield loop
+        // ran it as fast as the scheduler would allow. On two runnable threads
+        // that is half the machine spent watching the other half work, and it
+        // made the program under test look slower than it is.
+        //
+        // It also made the idle measurement above impossible: a harness that is
+        // always runnable means the idle thread is never picked, whatever the
+        // program does.
+        //
+        // One sample per tick is still several per frame at any frame rate this
+        // machine can reach.
+        thread_sleep_ms(10);
     }
 
     {
@@ -400,6 +636,13 @@ void main_thread(long unused) {
     build_desktop();
     g_kwin_hash_before = kwin_hash();
 
+    // The pointer gets its own thread before anything else is run, so every
+    // program below is measured on a desktop where the cursor is somebody
+    // else's job.
+    g_comp_stop = 0;
+    g_comp_thread = thread_create((long)compositor, 0, "cursor");
+    expect_true("the compositor has a thread of its own", g_comp_thread >= 0);
+
     // ============================================================
     // 1. the machine builds a graphical program
     // ============================================================
@@ -422,7 +665,25 @@ void main_thread(long unused) {
         }
         printf("windows on the desktop before: %d\n", before);
 
-        code = run_and_watch("/bin/wingl", 0);
+        {
+            long idle0;
+            long t0;
+            idle0 = g_idle_slices;
+            t0 = g_ticks;
+            code = run_and_watch("/bin/wingl", 0);
+            // wingl paces itself to 25 frames a second with SYS_NAP and has
+            // time to spare, so the machine should be genuinely idle in the
+            // gaps. With SYS_YIELD it never was: a yielding process is still
+            // runnable, so the scheduler had something to run at every instant
+            // and the idle thread was never picked.
+            //
+            // This is the number that distinguishes "gave the CPU up" from
+            // "gave the CPU up and something else could use it".
+            printf("wingl ran for %d ticks; the machine was idle for %d of "
+                   "them\n", g_ticks - t0, g_idle_slices - idle0);
+            expect_true("wingl's naps left the machine actually idle",
+                        g_idle_slices - idle0 > 0);
+        }
         printf("wingl exited with %d\n", code);
         printf("it owned window %d, put up to %d distinct colours in it, "
                "and we caught it at %d distinct frames\n",
@@ -514,7 +775,13 @@ void main_thread(long unused) {
             fs_unlink("/src/gears.asm");
 
             puts("\n== 3c. run it ==\n");
+            probe_reset();
+            g_probe_on = 1;
+            g_click_armed = 1;
+            g_comp_frames = 0;
+            g_comp_ticks = 0;
             code = run_and_watch("/bin/gears", 0);
+            g_probe_on = 0;
             printf("gears exited with %d\n", code);
             expect("every one of the program's own checks held", code, 0);
             expect_true("it got a window", g_saw_window >= 0);
@@ -529,7 +796,79 @@ void main_thread(long unused) {
             // failed render would be far below this.
             expect_true("...lit, with a shade per face orientation",
                         g_max_colours > 20);
+
+            // ---- the pointer, while all that was happening ----
+            {
+                long avg;
+                avg = 0;
+                if (g_probe_hits) avg = g_probe_total / g_probe_hits;
+                printf("pointer: %d moves, %d followed, %d never arrived, "
+                       "worst %d ticks, average %d\n",
+                       g_probe_moves, g_probe_hits, g_probe_misses,
+                       g_probe_worst, avg);
+                printf("the compositor presented %d times in %d ticks of its "
+                       "own; gears presented %d\n",
+                       g_comp_frames, g_comp_ticks, g_frames_seen);
+                expect_true("the pointer moved while the renderer was running",
+                            g_probe_hits > 8);
+                expect("...and never failed to arrive", g_probe_misses, 0);
+                // A gears frame is tens of ticks. Ten is comfortably inside
+                // that and comfortably above the compositor's own 2-tick
+                // period, so this fails if the pointer is riding on the
+                // application's frames again.
+                expect_true("...within ten ticks, not one gears frame",
+                            g_probe_worst <= 10);
+
+                printf("a click on the kernel window's title bar was acted on "
+                       "after %d ticks\n", g_click_lat);
+                expect_true("the window manager answered a click mid-render",
+                            g_click_lat >= 0);
+                expect_true("...and the click raised and focused that window",
+                            g_click_focus_ok);
+            }
         }
+    }
+
+    // ============================================================
+    // 3d. the control: the same measurement with no compositor
+    // ============================================================
+    //
+    // Everything above would read the same if the pointer had always been fine
+    // and the compositor were doing nothing. So: stop the compositor thread and
+    // run the same program with the same probe. If the numbers do not get
+    // worse, the numbers were not measuring the compositor.
+    //
+    // This is the second time on this project that an equality looked like
+    // evidence and was not, so it is checked rather than argued.
+    puts("\n== 3d. control: the same run with the compositor stopped ==\n");
+    {
+        long saved_worst;
+        long saved_hits;
+        saved_worst = g_probe_worst;
+        saved_hits = g_probe_hits;
+
+        g_comp_stop = 1;
+        thread_join(g_comp_thread);
+
+        probe_reset();
+        g_probe_on = 1;
+        code = run_and_watch("/bin/gears", 0);
+        g_probe_on = 0;
+        printf("without a compositor: %d moves, %d followed, %d never arrived, "
+               "worst %d ticks\n",
+               g_probe_moves, g_probe_hits, g_probe_misses, g_probe_worst);
+        printf("with one, the worst was %d ticks over %d moves\n",
+               saved_worst, saved_hits);
+        // The pointer is drawn by wm_present, and with nothing calling it on
+        // the pointer's behalf the only presents left are the ones gears makes
+        // for its own window -- so the lag becomes a gears frame, or the move
+        // is missed altogether.
+        expect_true("without the compositor the pointer lags or never arrives",
+                    g_probe_worst > saved_worst || g_probe_misses > 0);
+
+        // Put it back for the rest of the run.
+        g_comp_stop = 0;
+        g_comp_thread = thread_create((long)compositor, 0, "cursor");
     }
 
     // ============================================================

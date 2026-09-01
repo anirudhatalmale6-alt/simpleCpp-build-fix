@@ -73,7 +73,7 @@ void worker(long seed) {
 void main_thread(long unused) {
     puts("scheduler running\n");
 
-    if (!fs_format(2048, 128)) { puts("format failed\n"); cpu_halt_forever(); }
+    if (!fs_format(4000, 128)) { puts("format failed\n"); cpu_halt_forever(); }
     printf("formatted: %d blocks, %d inodes, data starts at %d\n",
            sb_nblocks, sb_ninodes, sb_data_start);
     printf("%d blocks free (%d KiB)\n", blocks_free(), blocks_free() / 2);
@@ -115,6 +115,77 @@ void main_thread(long unused) {
         n = fs_read(ino, 5990, g_buf2, 100);
         if (n == 10) puts("short read at EOF ok\n");
         else printf("EOF READ WRONG: got %d, wanted 10\n", n);
+    }
+
+    // --- 2b. a file past the DOUBLE indirect blocks ---
+    //
+    // 8 direct + 64 single-indirect blocks reach 36,864 bytes. Everything
+    // above that goes through a second level, and nothing had ever tested it:
+    // the case above stops at 6,000 bytes, which is one block into the first
+    // indirect and nowhere near the second.
+    //
+    // The size is not arbitrary. The compiler inside the OS writes about
+    // 660 KB of assembly when it builds gears.c, and that is the file that
+    // stopped working -- so this is written at the size that actually occurs,
+    // in the same 4 KB chunks fwrite uses. It cleared the filesystem as the
+    // suspect, which is worth a test on its own.
+    {
+        long ino;
+        long off;
+        long total;
+        long ok;
+        long free0;
+
+        total = 700000;
+        free0 = blocks_free();
+        ino = fs_create("/huge.bin");
+        if (!ino) puts("HUGE: could not create\n");
+
+        ok = 1;
+        off = 0;
+        while (off < total) {
+            long want;
+            long got;
+            want = 4096;
+            if (off + want > total) want = total - off;
+            // A pattern keyed to the OFFSET, so a block written to the wrong
+            // place is caught. A constant fill would read back correctly even
+            // if two logical blocks aliased one physical block -- which is
+            // exactly the failure a two-level index can have.
+            fill(g_buf, want, (off / 4096) & 255);
+            got = fs_write(ino, off, g_buf, want);
+            if (got != want) {
+                printf("HUGE: short write at %d: wanted %d got %d\n",
+                       off, want, got);
+                ok = 0;
+                off = total;
+            } else {
+                off = off + want;
+            }
+        }
+
+        if (ok) {
+            printf("huge file: %d bytes, %d blocks used, %d free\n",
+                   fs_size(ino), free0 - blocks_free(), blocks_free());
+            off = 0;
+            while (off < total) {
+                long want;
+                want = 4096;
+                if (off + want > total) want = total - off;
+                memset(g_buf2, 0, 8192);
+                fs_read(ino, off, g_buf2, want);
+                if (!check(g_buf2, want, (off / 4096) & 255)) {
+                    printf("HUGE: WRONG DATA at offset %d\n", off);
+                    ok = 0;
+                    off = total;
+                } else {
+                    off = off + want;
+                }
+            }
+        }
+
+        if (ok && fs_size(ino) == total) puts("double indirect ok\n");
+        else puts("DOUBLE INDIRECT BROKEN\n");
     }
 
     // --- 3. directories ---
