@@ -38,6 +38,11 @@ void fail(char *msg) {
     g_fail = g_fail + 1;
 }
 
+void expect_true(char *what, long got) {
+    if (got) printf("  ok  %s\n", what);
+    else fail(what);
+}
+
 void expect(char *what, long got, long want) {
     if (got == want) printf("  ok  %s = %d\n", what, got);
     else {
@@ -130,6 +135,47 @@ void frame_key(long sx, long sy, long down, long key) {
 }
 
 void frame(long sx, long sy, long down) { frame_key(sx, sy, down, 0); }
+
+// The same frame, but telling the interface that something else has painted
+// over one row of it since last time. This is what an application does after
+// rendering into a viewport with widgets on top of it.
+long g_over_y;
+long g_over_on;
+
+// A hash of one rectangle of a window's BACKING BUFFER -- not the screen.
+// check_matches_full cannot see the fault this is for: it repaints the screen
+// from the buffer and compares, so a widget that has been scribbled over in
+// the buffer and never redrawn agrees with itself perfectly. The only way to
+// catch it is to remember what the row looked like before.
+long win_rect_hash(long win, long x, long y, long w, long h) {
+    long hash;
+    long j;
+    hash = 5381;
+    j = 0;
+    while (j < h) {
+        long i;
+        i = 0;
+        while (i < w) {
+            hash = ((hash * 33) + g_win[win].pix[(y + j) * g_win[win].w + x + i])
+                   & 0xFFFFFFF;
+            i = i + 1;
+        }
+        j = j + 1;
+    }
+    return hash;
+}
+
+void frame_over(long sx, long sy) {
+    g_prev_down = 0;
+    mouse_warp(sx, sy);
+    wm_cursor_move(sx, sy);
+    ui_begin(&g_ui, g_w, PX, PY, PW);
+    if (g_over_on) ui_overpaint(&g_ui, g_w, PX, g_over_y, PW, UI_ROW_H);
+    ui_input(&g_ui, 0, 0, 0, 0);
+    panel();
+    ui_end(&g_ui);
+    wm_present();
+}
 
 // A frame with the edges stated outright rather than derived. Needed for the
 // cases a well-behaved mouse cannot produce but a real one does: a second
@@ -392,9 +438,46 @@ void test_damage() {
     printf("  an unchanged frame: %d widgets drawn into the buffer, "
            "%d invalidated, %d pixels to the screen\n",
            g_ui.drawn, g_ui.invalidations, idle);
-    expect("every widget was rebuilt", g_ui.drawn, 7);
+    // K24c: it used to rebuild all seven into the buffer and invalidate none
+    // of them, which was half the saving. The pixels were already right, so
+    // writing them again was work with no reader -- 600 us a frame in the
+    // textured demo. Now an unchanged widget does not draw either.
+    expect("no widget was redrawn", g_ui.drawn, 0);
+    expect("all seven were skipped", g_ui.skipped, 7);
     expect("none of them was invalidated", g_ui.invalidations, 0);
     expect("and nothing crossed the bus", idle, 0);
+
+    // ...which is only safe while nothing else writes into the same buffer.
+    // Scribble over one widget's row, say so, and it must come back -- and
+    // the screen must then match a full repaint, which is the check that
+    // would catch a widget wrongly deciding it was still intact.
+    {
+        long before;
+        long after;
+        g_over_y = PY + 2 * ROW;
+        before = win_rect_hash(g_w, PX, g_over_y, PW, UI_ROW_H);
+        wm_win_fill(g_w, PX, g_over_y, PW, UI_ROW_H, rgb(255, 0, 0));
+        wm_invalidate(g_w, PX, g_over_y, PW, UI_ROW_H);
+        expect_true("the scribble really did change the row",
+                    win_rect_hash(g_w, PX, g_over_y, PW, UI_ROW_H) != before);
+
+        g_over_on = 1;
+        wm_reset_counters();
+        frame_over(row_cx(), row_cy(0));
+        g_over_on = 0;
+        after = win_rect_hash(g_w, PX, g_over_y, PW, UI_ROW_H);
+
+        printf("  one row painted over: %d redrawn, %d skipped, %d invalidated\n",
+               g_ui.drawn, g_ui.skipped, g_ui.invalidations);
+        expect("the widget that was painted over redrew", g_ui.drawn, 1);
+        expect("...and the other six did not", g_ui.skipped, 6);
+        expect("...and it did not invalidate: the scribble already did",
+               g_ui.invalidations, 0);
+        // THE CHECK THAT MATTERS. The counters say a widget drew; this says
+        // the row is back to the pixels it had before the scribble.
+        expect_true("...and the row is pixel-for-pixel what it was", after == before);
+        check_matches_full("after something painted over a widget");
+    }
 
     // Now move the pointer onto one button. Exactly one widget changes
     // appearance, so exactly one rectangle should be pushed.
@@ -428,7 +511,7 @@ void test_damage() {
         while (i < 100) { frame(row_cx(), row_cy(0), 0); i = i + 1; }
     }
     printf("  100 idle frames: %d widgets rebuilt, %d pixels to the screen\n",
-           700, wm_pixels);
+           g_ui.drawn, wm_pixels);
     expect("a hundred idle frames cost nothing", wm_pixels, 0);
     printf("  (a full repaint each frame would have been %d)\n",
            wm_screen_pixels() * 100);

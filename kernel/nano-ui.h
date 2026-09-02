@@ -86,6 +86,23 @@ struct Ui {
 
     long invalidations;        // widgets that pushed damage this frame
     long drawn;                // widgets drawn into the buffer this frame
+    long skipped;              // ...and the ones that did not have to be
+
+    // THE RECTANGLE SOMETHING ELSE HAS PAINTED OVER since these widgets were
+    // last drawn, in the coordinates of window `ovwin`. A widget whose state
+    // is unchanged is already correct in the backing buffer and does not need
+    // redrawing -- unless a 3D viewport has just been rendered underneath it,
+    // which is exactly what a HUD sits on top of. The application says where
+    // that happened; ui_overpaint is the whole of the contract.
+    long ovwin;
+    long ovx0;
+    long ovy0;
+    long ovx1;
+    long ovy1;
+
+    // Draw every widget every frame whether or not it needs it -- the old
+    // behaviour, kept so a test can run a scene both ways and hash the window.
+    long always;
 
     long fg;
     long bg;
@@ -148,7 +165,26 @@ void ui_begin(struct Ui *ui, long win, long x, long y, long w) {
     ui->hot = -1;
     ui->invalidations = 0;
     ui->drawn = 0;
+    ui->skipped = 0;
+    // Nothing is known to have been painted over until the caller says so,
+    // and it must say so every frame: an overpaint rectangle that outlived
+    // its frame would be a widget redrawing forever for a reason that has
+    // already gone away.
+    ui->ovwin = -1;
+    ui->ovx0 = 0; ui->ovy0 = 0; ui->ovx1 = -1; ui->ovy1 = -1;
     ui_window(ui, win, x, y, w);
+}
+
+// "Something has drawn over this rectangle of this window since the last ui
+// pass." Called with the box a renderer just wrote -- gl_flush's damage box,
+// in window coordinates -- so the widgets standing on that ground know to
+// stand up again.
+void ui_overpaint(struct Ui *ui, long win, long x, long y, long w, long h) {
+    ui->ovwin = win;
+    ui->ovx0 = x;
+    ui->ovy0 = y;
+    ui->ovx1 = x + w - 1;
+    ui->ovy1 = y + h - 1;
 }
 
 // End the frame and consume the edges.
@@ -252,19 +288,59 @@ long ui_hit(struct Ui *ui, long x, long y, long w, long h) {
 // If it matches last frame, nothing is invalidated and nothing reaches the
 // screen -- the buffer was redrawn with identical pixels, so the screen is
 // already correct.
-long ui_track(struct Ui *ui, long id, long state) {
-    if (id < 0 || id >= UI_MAXID) {
-        // Untracked ids cannot be compared, so they must always be pushed.
-        // Failing the other way would leave a widget that never updates.
+// Does the widget currently being built overlap the rectangle something else
+// painted over? Its rect is ui->x, ui->y, ui->cw, ui->ch -- claimed by
+// ui_slot, which is why ui_paint is called after it and not before.
+long ui_over(struct Ui *ui) {
+    if (ui->ovwin != ui->win) return 0;
+    if (ui->ovx1 < ui->ovx0) return 0;
+    if (ui->x + ui->cw - 1 < ui->ovx0) return 0;
+    if (ui->ovx1 < ui->x) return 0;
+    if (ui->y + ui->ch - 1 < ui->ovy0) return 0;
+    if (ui->ovy1 < ui->y) return 0;
+    return 1;
+}
+
+// SHOULD THIS WIDGET DRAW AT ALL?
+//
+// Called BEFORE the widget draws, with the number that changes whenever it
+// would look different. It answers two separate questions in one place:
+//
+//   - has it changed? then draw it and tell the compositor.
+//   - has it not? then the buffer already holds the right pixels, so draw
+//     nothing at all -- unless something has painted over them, which only
+//     the application can know and only ui_overpaint can say.
+//
+// This used to be ui_track, called AFTER drawing, and it skipped only the
+// invalidation. The widget was redrawn every frame regardless, identically,
+// into a buffer nobody would read: about 600 us a frame for seven widgets in
+// the textured demo, which is 6% of a core at a hundred frames a second spent
+// writing pixels that were already there.
+long ui_paint(struct Ui *ui, long id, long state) {
+    long changed;
+    changed = 1;
+    if (id >= 0 && id < UI_MAXID) {
+        // An untracked id cannot be compared, so it must always be drawn and
+        // always pushed. Failing the other way would leave a widget that
+        // never updates.
+        changed = (g_ui_last[id] != state);
+        g_ui_last[id] = state;
+    }
+    if (changed) {
         wm_invalidate(ui->win, ui->x, ui->y, ui->cw, ui->ch);
         ui->invalidations = ui->invalidations + 1;
+        ui->drawn = ui->drawn + 1;
         return 1;
     }
-    if (g_ui_last[id] == state) return 0;
-    g_ui_last[id] = state;
-    wm_invalidate(ui->win, ui->x, ui->y, ui->cw, ui->ch);
-    ui->invalidations = ui->invalidations + 1;
-    return 1;
+    // Unchanged, but standing on ground that has just been repainted. Draw,
+    // and do NOT invalidate: whoever painted over it has already damaged this
+    // rectangle, which is how the widget came to need redrawing.
+    if (ui->always || ui_over(ui)) {
+        ui->drawn = ui->drawn + 1;
+        return 1;
+    }
+    ui->skipped = ui->skipped + 1;
+    return 0;
 }
 
 // ---------- drawing helpers ----------
@@ -312,9 +388,11 @@ long ui_hash_str(char *s) {
 // Left-aligned text, drawn one glyph at a time and STOPPED at `maxw` pixels.
 //
 // A widget that draws outside its own rectangle is a widget that lies to the
-// compositor. ui_track invalidates the widget's rect and nothing else, so
+// compositor. ui_paint invalidates the widget's rect and nothing else, so
 // anything painted beyond it lands in the backing buffer and is never pushed
-// to the screen -- the buffer and the screen then disagree forever.
+// to the screen -- the buffer and the screen then disagree forever. Since
+// K24c it is worse than that: the neighbour it spilled onto believes its own
+// pixels are still intact and will not redraw them.
 //
 // wm_win_text has no width limit; it clips to the WINDOW, which is far too
 // late. Thirty-one characters in a two-hundred-pixel field spilled over the
@@ -366,10 +444,10 @@ void ui_label(struct Ui *ui, char *s) {
     // A label has no state of its own, but it still has to be tracked: the
     // first frame must draw it, and after that it changes only when its text
     // does. Which means hashing the text, not the pointer -- see ui_hash_str.
-    wm_win_fill(ui->win, ui->x, ui->y, w, UI_ROW_H, ui->panel);
-    ui_text_clip(ui, ui->x + 2, ui->y, UI_ROW_H, s, w - 4);
-    ui->drawn = ui->drawn + 1;
-    ui_track(ui, ui_next_id(ui), ui_hash_str(s));
+    if (ui_paint(ui, ui_next_id(ui), ui_hash_str(s))) {
+        wm_win_fill(ui->win, ui->x, ui->y, w, UI_ROW_H, ui->panel);
+        ui_text_clip(ui, ui->x + 2, ui->y, UI_ROW_H, s, w - 4);
+    }
     ui_advance(ui, w);
 }
 
@@ -404,15 +482,14 @@ long ui_button(struct Ui *ui, char *s) {
     else if (hot)         fill = ui->edge;
     else                  fill = ui->bg;
 
-    ui_box(ui, ui->x, ui->y, w, UI_ROW_H, fill);
-    ui_text_mid(ui, s, (act && ui->mdown) ? rgb(255, 255, 255) : ui->fg);
-    ui->drawn = ui->drawn + 1;
-
     // The caption is part of the visual state. A button whose label is
     // swapped -- "Play" to "Pause" -- looks different and must repaint, and
     // hot/pressed alone cannot tell.
-    ui_track(ui, id, (ui_hash_str(s) << 2) + (hot ? 2 : 0) +
-                     ((act && ui->mdown) ? 1 : 0));
+    if (ui_paint(ui, id, (ui_hash_str(s) << 2) + (hot ? 2 : 0) +
+                         ((act && ui->mdown) ? 1 : 0))) {
+        ui_box(ui, ui->x, ui->y, w, UI_ROW_H, fill);
+        ui_text_mid(ui, s, (act && ui->mdown) ? rgb(255, 255, 255) : ui->fg);
+    }
     ui_advance(ui, w);
     return clicked;
 }
@@ -440,6 +517,7 @@ long ui_checkbox(struct Ui *ui, char *s, long *v) {
 
     bx = ui->x;
     by = ui->y + (UI_ROW_H - UI_BOX) / 2;
+    if (ui_paint(ui, id, (ui_hash_str(s) << 2) + (hot ? 2 : 0) + (*v ? 1 : 0))) {
     wm_win_fill(ui->win, ui->x, ui->y, w, UI_ROW_H, ui->panel);
     ui_box(ui, bx, by, UI_BOX, UI_BOX, hot ? ui->edge : ui->bg);
     if (*v) {
@@ -460,9 +538,7 @@ long ui_checkbox(struct Ui *ui, char *s, long *v) {
         }
     }
     ui_text_clip(ui, bx + UI_BOX + 6, ui->y, UI_ROW_H, s, w - UI_BOX - 8);
-    ui->drawn = ui->drawn + 1;
-
-    ui_track(ui, id, (ui_hash_str(s) << 2) + (hot ? 2 : 0) + (*v ? 1 : 0));
+    }
     ui_advance(ui, w);
     return changed;
 }
@@ -513,13 +589,13 @@ long ui_slider(struct Ui *ui, long *v, long lo, long hi) {
 
     hx = ui->x + ((*v - lo) * track) / (hi - lo);
 
-    wm_win_fill(ui->win, ui->x, ui->y, w, UI_ROW_H, ui->panel);
-    ui_box(ui, ui->x, ui->y + UI_ROW_H / 2 - 2, w, 4, ui->bg);
-    ui_box(ui, hx, ui->y + 2, UI_BOX, UI_ROW_H - 4,
-           (act && ui->mdown) ? ui->accent : (hot ? ui->edge : ui->bg));
-    ui->drawn = ui->drawn + 1;
-
-    ui_track(ui, id, (*v << 2) + (hot ? 2 : 0) + ((act && ui->mdown) ? 1 : 0));
+    if (ui_paint(ui, id, (*v << 2) + (hot ? 2 : 0) +
+                         ((act && ui->mdown) ? 1 : 0))) {
+        wm_win_fill(ui->win, ui->x, ui->y, w, UI_ROW_H, ui->panel);
+        ui_box(ui, ui->x, ui->y + UI_ROW_H / 2 - 2, w, 4, ui->bg);
+        ui_box(ui, hx, ui->y + 2, UI_BOX, UI_ROW_H - 4,
+               (act && ui->mdown) ? ui->accent : (hot ? ui->edge : ui->bg));
+    }
     ui_advance(ui, w);
     return changed;
 }
@@ -566,33 +642,33 @@ long ui_text(struct Ui *ui, char *buf, long cap) {
         }
     }
 
-    wm_win_fill(ui->win, ui->x, ui->y, w, UI_ROW_H,
-                focused ? rgb(255, 255, 255) : ui->bg);
-    wm_win_frame(ui->win, ui->x, ui->y, w, UI_ROW_H,
-                 focused ? ui->accent : ui->edge);
-    // Longer than the box: show the TAIL, because that is where the caret is
-    // and where the characters being typed appear. Showing the head instead
-    // gives a field that stops responding visibly once it is full.
-    {
-        long vis;
-        long off;
-        vis = (w - 6) / FONT_W;
-        if (vis < 0) vis = 0;
-        off = 0;
-        if (n > vis) off = n - vis;
-        ui_text_clip(ui, ui->x + 3, ui->y, UI_ROW_H, buf + off, w - 6);
-        if (focused)
-            wm_win_fill(ui->win, ui->x + 3 + (n - off) * FONT_W, ui->y + 3, 1,
-                        UI_ROW_H - 6, ui->fg);
-    }
-    ui->drawn = ui->drawn + 1;
-
     // The contents are part of the visual state, so they have to be in the
     // hash. Using only the length would miss a character being replaced.
     hash = 5381;
     i = 0;
     while (i < n) { hash = ((hash * 33) + (buf[i] & 255)) & 0xFFFFFFF; i = i + 1; }
-    ui_track(ui, id, (hash << 3) + (focused ? 4 : 0) + (hot ? 2 : 0));
+
+    if (ui_paint(ui, id, (hash << 3) + (focused ? 4 : 0) + (hot ? 2 : 0))) {
+        wm_win_fill(ui->win, ui->x, ui->y, w, UI_ROW_H,
+                    focused ? rgb(255, 255, 255) : ui->bg);
+        wm_win_frame(ui->win, ui->x, ui->y, w, UI_ROW_H,
+                     focused ? ui->accent : ui->edge);
+        // Longer than the box: show the TAIL, because that is where the caret
+        // is and where the characters being typed appear. Showing the head
+        // instead gives a field that stops responding visibly once it is full.
+        {
+            long vis;
+            long off;
+            vis = (w - 6) / FONT_W;
+            if (vis < 0) vis = 0;
+            off = 0;
+            if (n > vis) off = n - vis;
+            ui_text_clip(ui, ui->x + 3, ui->y, UI_ROW_H, buf + off, w - 6);
+            if (focused)
+                wm_win_fill(ui->win, ui->x + 3 + (n - off) * FONT_W, ui->y + 3,
+                            1, UI_ROW_H - 6, ui->fg);
+        }
+    }
     ui_advance(ui, w);
     return changed;
 }
@@ -611,11 +687,11 @@ void ui_progress(struct Ui *ui, long v, long lo, long hi) {
     if (v > hi) v = hi;
     fill = ((v - lo) * (w - 2)) / (hi - lo);
 
-    ui_box(ui, ui->x, ui->y, w, UI_ROW_H, ui->bg);
-    if (fill > 0) wm_win_fill(ui->win, ui->x + 1, ui->y + 1, fill, UI_ROW_H - 2,
-                              ui->accent);
-    ui->drawn = ui->drawn + 1;
-    ui_track(ui, id, v);
+    if (ui_paint(ui, id, v)) {
+        ui_box(ui, ui->x, ui->y, w, UI_ROW_H, ui->bg);
+        if (fill > 0) wm_win_fill(ui->win, ui->x + 1, ui->y + 1, fill,
+                                  UI_ROW_H - 2, ui->accent);
+    }
     ui_advance(ui, w);
 }
 
@@ -726,11 +802,16 @@ long ui_glview(struct Ui *ui, struct GlView *v, long h) {
 
     if (v->focused && ui->key) v->key = ui->key;
 
-    wm_win_frame(ui->win, ui->x, ui->y, w, h,
-                 v->focused ? ui->accent : (hot ? ui->fg : ui->edge));
-    ui->drawn = ui->drawn + 1;
-
-    ui_track(ui, id, (hot ? 2 : 0) + (v->focused ? 1 : 0));
+    // The border only; the interior belongs to whoever is rendering into it.
+    // Its own state is hover and focus, so it repaints when those change --
+    // and also whenever the scene has been rendered inside it, because a
+    // viewport that has just been repainted is exactly the rectangle
+    // ui_overpaint describes. That costs the outline, about a thousand
+    // pixels, and it is the honest answer: the widget's rect includes the
+    // interior, so it cannot claim the ground under it is untouched.
+    if (ui_paint(ui, id, (hot ? 2 : 0) + (v->focused ? 1 : 0)))
+        wm_win_frame(ui->win, ui->x, ui->y, w, h,
+                     v->focused ? ui->accent : (hot ? ui->fg : ui->edge));
     ui_advance_h(ui, w, h);
     return act && ui->mdown;
 }
@@ -738,6 +819,10 @@ long ui_glview(struct Ui *ui, struct GlView *v, long h) {
 // ---------- setup ----------
 
 void ui_init(struct Ui *ui) {
+    ui->always = 0;
+    ui->skipped = 0;
+    ui->ovwin = -1;
+    ui->ovx0 = 0; ui->ovy0 = 0; ui->ovx1 = -1; ui->ovy1 = -1;
     ui->hot = -1;
     ui->active = -1;
     ui->focus = -1;
