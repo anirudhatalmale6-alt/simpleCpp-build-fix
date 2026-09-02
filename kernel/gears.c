@@ -42,6 +42,10 @@
 // must not, because this image reads the framebuffer back.
 #include "nano-kernel.h"
 #include "nano-fb.h"
+// For the PM timer only, and only for the frame-cost report: a frame here is
+// a couple of milliseconds and the PIT tick is ten, so timing one on g_ticks
+// would be measuring the clock.
+#include "nano-acpi.h"
 #include "nano-mouse.h"
 #include "nano-int.h"
 #include "nano-mm.h"
@@ -869,6 +873,102 @@ void run_tests() {
     puts("\nGEARSTEST DONE\n");
 }
 
+// ============================================================
+// where a gears frame's time actually goes
+// ============================================================
+//
+// Reported: "gearsrun was high use too for what it is so its more than widget
+// issue". It is. This demo has one window, no HUD and no panel, so none of
+// the interface work K24c removed was ever in it -- and it still runs the
+// host at about seventy percent of a core.
+//
+// The three numbers below are what decide where to look next. gltex's frame
+// is dominated by the fill; this one may not be, because 892 triangles that
+// each cover forty-odd pixels is a very different shape of frame.
+#define GEARS_ROUNDS 10
+
+long gears_time_us(long what) {
+    long a;
+    long b;
+    long r;
+    a = pm_timer_read();
+    r = 0;
+    while (r < GEARS_ROUNDS) {
+        if (what == 0) draw_frame(r * 2 * GL_ONE);
+        else if (what == 1) gl_clear(&g_gl);
+        else if (what == 2) { gl_flush(&g_gl); wm_present(); }
+        else { draw_frame(r * 2 * GL_ONE); gl_flush(&g_gl); wm_present(); }
+        r = r + 1;
+    }
+    b = pm_timer_read();
+    return ((pm_timer_delta(a, b) * 1000000) / PM_TMR_HZ) / GEARS_ROUNDS;
+}
+
+void frame_cost_report() {
+    long frame;
+    long clear;
+    long flip;
+    long whole;
+    long unlit;
+    long wire;
+    long px;
+
+    draw_frame(0);
+    gl_flush(&g_gl);
+    wm_present();
+
+    px = g_gl.pixels;
+    draw_frame(0);
+    px = g_gl.pixels - px;
+
+    clear = gears_time_us(1);
+    frame = gears_time_us(0);
+    flip  = gears_time_us(2);
+    whole = gears_time_us(3);
+
+    // The same frame with the lighting turned off. Not a proposal to turn it
+    // off -- it is what makes a gear look like a gear -- but a measurement of
+    // what per-triangle work costs, because gl_shade normalises the face
+    // normal and v3_norm runs a bit-at-a-time integer square root. 892
+    // triangles a frame is 892 square roots a frame, on geometry that only
+    // rotates.
+    {
+        long save;
+        save = g_gl.lighting;
+        g_gl.lighting = 0;
+        unlit = gears_time_us(0);
+        g_gl.lighting = save;
+
+        // And in wireframe, which submits exactly the same geometry through
+        // exactly the same transform, projection, clipping and backface test
+        // and then draws outlines instead of filling. The difference between
+        // the two is the FILL; what is left is everything that happens per
+        // triangle before a pixel is written.
+        save = g_gl.wire;
+        g_gl.wire = 1;
+        wire = gears_time_us(0);
+        g_gl.wire = save;
+        draw_frame(0);
+    }
+
+    puts("\n-- what one gears frame costs --\n");
+    printf("  %d triangles submitted, %d drawn\n", g_gl.tris_in, g_gl.tris_drawn);
+    printf("  %d pixels written, of which the clear wrote %d\n", px, g_gl.clearpix);
+    printf("  the rasteriser walked %d iterations to cover %d\n",
+           g_gl.steps, g_gl.covered);
+    printf("  gl_clear      %d us\n", clear);
+    printf("  draw_frame    %d us\n", frame);
+    printf("  flush + flip  %d us\n", flip);
+    printf("  a whole frame %d us\n", whole);
+    if (g_gl.tris_drawn > 0)
+        printf("  which is %d us per drawn triangle, covering %d pixels each\n",
+               whole / g_gl.tris_drawn, g_gl.covered / g_gl.tris_drawn);
+    printf("  the same frame unlit: %d us, so lighting is %d us of it\n",
+           unlit, frame - unlit);
+    printf("  the same frame in wireframe: %d us, so the fill is about %d us\n",
+           wire, frame - wire);
+}
+
 // After the tests, leave it running: the gears turn until the machine is
 // switched off, which is what the program is for.
 void spin_forever() {
@@ -892,6 +992,11 @@ int main() {
 
     if (!fb_init(1024, 768)) { puts("fb_init failed\n"); for (;;) { } }
     if (!mm_init())          { puts("mm_init failed\n"); for (;;) { } }
+
+    // acpi_init BEFORE mm_protect_null: the pointer to the EBDA, where the
+    // RSDP is looked for, lives at physical 0x40E -- inside the page
+    // mm_protect_null unmaps.
+    if (!acpi_init()) puts("acpi_init found nothing -- the frame report cannot time\n");
     mm_protect_null();
 
     kbd_init();
@@ -899,6 +1004,7 @@ int main() {
 
     run_tests();
 
+    if (acpi_pm_tmr) frame_cost_report();
     puts("gears running; the machine is now interactive\n");
     spin_forever();
     return 0;
