@@ -324,6 +324,31 @@ read_rsp:
     mov %rsp, %rax
     ret
 
+/* void fill64(long *dst, long val, long n) — write n eight-byte words.
+ *
+ * The renderer's clear is the only place in the system that writes tens of
+ * thousands of words in a row, and the loop nano_cc generates for it is five
+ * instructions per word. `rep stosq` is one instruction for the whole run: on
+ * real hardware it is the microcoded block fill, and under qemu's interpreter
+ * — which is how this is actually being run — it is one helper call instead of
+ * a dispatch per word, which is the larger of the two wins here.
+ *
+ * rdi, rsi, rdx are nano_cc's first three arguments, the System V registers.
+ * rax, rcx and rdi are all caller-saved, so nothing needs preserving. A count
+ * of zero writes nothing; a NEGATIVE count would be read as an enormous
+ * unsigned one, so the caller must not pass one, and gl_clear does not.
+ *
+ * cld because `rep stosq` walks backwards with the direction flag set and the
+ * System V ABI's guarantee that it is clear is a guarantee about function
+ * entry, not about this instruction. */
+.globl fill64
+fill64:
+    mov %rsi, %rax
+    mov %rdx, %rcx
+    cld
+    rep stosq
+    ret
+
 /* void io_wait(void) — a throwaway write to an unused port, the traditional
  * short delay the 8259s need between initialisation words on old hardware. */
 .globl io_wait

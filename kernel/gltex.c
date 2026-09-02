@@ -32,6 +32,10 @@
 // must not, because this image reads the framebuffer back.
 #include "nano-kernel.h"
 #include "nano-fb.h"
+// For the PM timer only, and only for the idle-cost report at the end: a
+// frame here is a couple of milliseconds and the PIT tick is ten, so timing
+// one on g_ticks would be measuring the clock.
+#include "nano-acpi.h"
 #include "nano-mouse.h"
 #include "nano-int.h"
 #include "nano-mm.h"
@@ -830,8 +834,15 @@ void test_depth_and_cost() {
     expect("...and still does when it is drawn second",
            vp_pixel(VPW / 2, VPH / 2), rgb(10, 10, 200));
 
-    // A textured frame still costs its viewport and nothing else. Texturing
-    // adds a divide per pixel, not a pixel.
+    // What a textured frame costs the COMPOSITOR -- screen pixels blitted, not
+    // pixels rendered. It used to be exactly the viewport, because the clear
+    // damaged the viewport whatever the frame contained. Since K24b the clear
+    // damages the rectangle it actually rewrote, so a frame that fills a band
+    // across the middle of the viewport now costs the band.
+    //
+    // Asserted as a strict inequality on purpose: "no more than the viewport"
+    // would have passed before the change as well, and an assertion that
+    // cannot fail is not evidence of anything.
     wm_cursor_show(0);
     draw_floor(0);
     gl_flush(&g_gl);
@@ -843,7 +854,9 @@ void test_depth_and_cost() {
     cost = wm_pixels;
     printf("  a textured frame: %d pixels; the viewport is %d, the screen %d\n",
            cost, VPW * VPH, wm_screen_pixels());
-    expect("a textured frame costs its viewport and no more", cost, VPW * VPH);
+    expect_true("a textured frame costs the compositor LESS than its viewport",
+                cost < VPW * VPH);
+    expect_true("...and something, since it did draw a floor", cost > 0);
 
     {
         long fast;
@@ -943,11 +956,18 @@ void demo_floor() {
     glEnd(&g_gls);
 }
 
+// What the last render_scene found: whether it changed any pixels, and
+// whether anything that animates on its own was submitted. The event loop
+// uses both to decide whether the next pass has any work in it.
+long g_scene_damage;
+long g_anim_in_view;
+
 void render_scene() {
     struct M4 clip;
     long i;
 
     if (!g_win[g_win3d].used) return;
+    g_anim_in_view = 0;
     g_gl.wire = g_wire;
     g_gl.lighting = g_light;
 
@@ -976,6 +996,13 @@ void render_scene() {
         at.y = 0;
         at.z = (i / 3) * 5 * GL_ONE;
         if (gl_frustum_sphere(&g_frustum, &at, 113512) != GL_OUTSIDE) {
+            // Something that MOVES BY ITSELF is in view. A cube spins whether
+            // or not anyone touches the mouse, so while one of these is
+            // submitted the next frame cannot be assumed to look like this
+            // one -- and when none of them is, it can. The sphere test is
+            // what makes that argument hold: the radius bounds the cube in
+            // every orientation, so a rejected cube cannot spin into view.
+            g_anim_in_view = 1;
             glPushMatrix(&g_gls);
             glTranslatex(&g_gls, at.x, at.y, at.z);
             glRotatex(&g_gls, (g_spin + i * 20) << GL_FRAC, 0, GL_ONE, 0);
@@ -987,6 +1014,9 @@ void render_scene() {
         i = i + 1;
     }
     g_stat_tris = g_gl.tris_drawn;
+    // Did this frame change the viewport at all? Asked before the flush,
+    // because the flush is what empties the damage box.
+    g_scene_damage = (g_gl.dx1 >= g_gl.dx0);
     gl_flush(&g_gl);
 }
 
@@ -1038,11 +1068,82 @@ void build_desktop() {
     wm_present();
 }
 
+// One pass over the interface: the scene if it needs redrawing, then the HUD
+// over it, then the panel. Lifted out of the event loop so that the idle-cost
+// report below can time exactly what the loop runs and not a copy of it that
+// has drifted.
+long g_redraw;
+
+// Returns 1 if something it did means the scene has to be rendered again --
+// a checkbox that changes what the scene contains, a drag, a key. The scene
+// itself is rendered by the event loop before this runs, because whether it
+// changed anything is what decides whether the interface needs redrawing at
+// all; drawing the HUD first and finding out afterwards is the wrong way
+// round.
+long frame_ui(long down, long pressed, long released, long key) {
+    long again;
+    again = 0;
+    ui_begin(&g_ui, g_win[g_win3d].used ? g_win3d : g_panel_win,
+             VPX + 8, VPY + 8, 130);
+    ui_input(&g_ui, down, pressed, released, key);
+
+    g_view.dx = 0; g_view.dy = 0; g_view.key = 0;
+    if (g_win[g_win3d].used) {
+        // HUD over the scene (it is offered the pointer first), then the
+        // viewport widget last -- the ordering K16 arrived at.
+        ui_window(&g_ui, g_win3d, VPX + 8, VPY + 8, 130);
+        if (ui_checkbox(&g_ui, "textures", &g_texon)) again = 1;
+        if (ui_checkbox(&g_ui, "wireframe", &g_wire)) again = 1;
+
+        ui_window(&g_ui, g_win3d, VPX - 1, VPY - 1, VPW + 2);
+        ui_glview(&g_ui, &g_view, VPH + 2);
+
+        if (g_view.dx || g_view.dy) {
+            cam_look(&g_cam, g_view.dx * (GL_ONE / 3),
+                     0 - g_view.dy * (GL_ONE / 3));
+            again = 1;
+        }
+        if (g_view.key) {
+            long step;
+            step = GL_ONE / 2;
+            if (g_view.key == 'w') cam_move(&g_cam, step, 0, 0);
+            if (g_view.key == 's') cam_move(&g_cam, 0 - step, 0, 0);
+            if (g_view.key == 'a') cam_move(&g_cam, 0, 0 - step, 0);
+            if (g_view.key == 'd') cam_move(&g_cam, 0, step, 0);
+            again = 1;
+        }
+    } else {
+        ui_id(&g_ui, 3);
+    }
+
+    if (g_win[g_panel_win].used) {
+        ui_window(&g_ui, g_panel_win, PPX, PPY, PPW);
+        ui_label(&g_ui, "triangles drawn");
+        ui_progress(&g_ui, g_stat_tris, 0, 9 * 12);
+        if (ui_checkbox(&g_ui, "lighting", &g_light)) again = 1;
+        if (ui_button(&g_ui, "reset view")) {
+            cam_init(&g_cam);
+            g_cam.eye.y = GL_ONE;
+            g_cam.eye.z = 0 - 8 * GL_ONE;
+            g_cam.pitch = 0 - (6 << GL_FRAC);
+            again = 1;
+        }
+    }
+    ui_end(&g_ui);
+    return again;
+}
+
+// Set when something outside the loop has changed what the interface should
+// look like, so the next pass draws it even if nothing else happened. The
+// first pass after the desktop comes up is one of those.
+long g_ui_stale;
+
 void event_loop() {
     long last_tick;
-    long redraw;
+    long touched;
     last_tick = g_ticks;
-    redraw = 1;
+    g_redraw = 1;
+    g_ui_stale = 1;
     for (;;) {
         struct MEvent e;
         long down;
@@ -1052,6 +1153,7 @@ void event_loop() {
         char c;
 
         pressed = 0; released = 0; key = 0;
+        touched = 0;
         down = g_prev_down;
         while (mouse_pop(&e)) {
             wm_input_mouse(e.x, e.y, e.btn);
@@ -1059,11 +1161,13 @@ void event_loop() {
             if (down && !g_prev_down) pressed = 1;
             if (!down && g_prev_down) released = 1;
             g_prev_down = down;
+            touched = 1;
         }
         for (;;) {
             c = kbd_getchar_nb();
             if (c == 0) break;
             if (!wm_input_key(c)) key = c;
+            touched = 1;
         }
 
         if (!g_win[g_win3d].used && !g_win[g_panel_win].used) {
@@ -1072,67 +1176,39 @@ void event_loop() {
             continue;
         }
 
-        ui_begin(&g_ui, g_win[g_win3d].used ? g_win3d : g_panel_win,
-                 VPX + 8, VPY + 8, 130);
-        ui_input(&g_ui, down, pressed, released, key);
-
-        g_view.dx = 0; g_view.dy = 0; g_view.key = 0;
-        if (g_win[g_win3d].used) {
-            // Scene, then HUD (which is offered the pointer first), then the
-            // viewport widget last -- the ordering K16 arrived at.
-            if (redraw) render_scene();
-            ui_window(&g_ui, g_win3d, VPX + 8, VPY + 8, 130);
-            if (ui_checkbox(&g_ui, "textures", &g_texon)) redraw = 1;
-            if (ui_checkbox(&g_ui, "wireframe", &g_wire)) redraw = 1;
-
-            ui_window(&g_ui, g_win3d, VPX - 1, VPY - 1, VPW + 2);
-            ui_glview(&g_ui, &g_view, VPH + 2);
-
-            if (g_view.dx || g_view.dy) {
-                cam_look(&g_cam, g_view.dx * (GL_ONE / 3),
-                         0 - g_view.dy * (GL_ONE / 3));
-                redraw = 1;
-            }
-            if (g_view.key) {
-                long step;
-                step = GL_ONE / 2;
-                if (g_view.key == 'w') cam_move(&g_cam, step, 0, 0);
-                if (g_view.key == 's') cam_move(&g_cam, 0 - step, 0, 0);
-                if (g_view.key == 'a') cam_move(&g_cam, 0, 0 - step, 0);
-                if (g_view.key == 'd') cam_move(&g_cam, 0, step, 0);
-                redraw = 1;
-            }
-        } else {
-            ui_id(&g_ui, 3);
-        }
-
-        if (g_win[g_panel_win].used) {
-            ui_window(&g_ui, g_panel_win, PPX, PPY, PPW);
-            ui_label(&g_ui, "triangles drawn");
-            ui_progress(&g_ui, g_stat_tris, 0, 9 * 12);
-            if (ui_checkbox(&g_ui, "lighting", &g_light)) redraw = 1;
-            if (ui_button(&g_ui, "reset view")) {
-                cam_init(&g_cam);
-                g_cam.eye.y = GL_ONE;
-                g_cam.eye.z = 0 - 8 * GL_ONE;
-                g_cam.pitch = 0 - (6 << GL_FRAC);
-                redraw = 1;
-            }
-        }
-        ui_end(&g_ui);
-
         // Ticks elapsed, not one per frame -- see the note in glapi.c's
         // event loop. A step of one per frame makes the spin rate a function
         // of how expensive the frame was.
+        //
+        // The tick only means the SCENE has to be redrawn if something in it
+        // moves by itself, and the cubes are the only thing here that does.
+        // With none of them in view the world is not changing, and a frame
+        // that redraws an unchanging world is the cpu the report is about.
         if (g_ticks != last_tick) {
             g_spin = (g_spin + (g_ticks - last_tick)) % 360;
             last_tick = g_ticks;
-            redraw = 1;
-        } else if (!g_view.dx && !g_view.dy && !g_view.key) {
-            redraw = 0;
+            if (g_anim_in_view) g_redraw = 1;
         }
 
-        wm_present();
+        // THE SCENE FIRST, AND THEN DECIDE.
+        //
+        // The interface is drawn over the viewport, so it has to be redrawn
+        // whenever the scene has repainted underneath it -- which is only
+        // knowable after the scene has been rendered. Rendering it is now the
+        // cheap half of a pass; drawing the HUD, the two window frames, the
+        // panel and their text is the expensive half, and that is the half
+        // being skipped here.
+        g_scene_damage = 0;
+        if (g_redraw) {
+            render_scene();
+            g_redraw = 0;
+        }
+
+        if (touched || g_scene_damage || g_ui_stale) {
+            g_ui_stale = 0;
+            if (frame_ui(down, pressed, released, key)) g_redraw = 1;
+            wm_present();
+        }
         cpu_idle();
     }
 }
@@ -1250,6 +1326,94 @@ void test_raster_agrees() {
     g_gl.cull = save;
 }
 
+// ============================================================
+// 7. clearing the box against clearing the viewport
+// ============================================================
+//
+// K24b stopped gl_clear writing the whole viewport. It now writes only the
+// rectangle the previous frame dirtied, on the grounds that outside that
+// rectangle the colour buffer already holds bg and the depth buffer already
+// holds zero.
+//
+// That is an argument. This is the measurement: every case below is rendered
+// as a PAIR OF FRAMES -- something, then something else -- once with the
+// viewport cleared each time and once with only the box, and the two buffers
+// hashed. The pair matters more than the single frame. A single frame that
+// covers its own mistakes is easy; what a partial clear gets wrong is the
+// pixels the LAST frame lit and this one does not, so every pair goes from a
+// bigger shape to a smaller one, or to nothing at all.
+
+// Case 6: a frame that draws nothing whatsoever. The client's report, exactly:
+// with the camera turned away there is no geometry, and the frame still cost a
+// full viewport of writes before this change.
+void draw_nothing() {
+    gl_clear(&g_gl);
+    gl_state_init(&g_gls, &g_gl);
+}
+
+void draw_any(long k) {
+    if (k == 6) draw_nothing();
+    else        draw_case(k);
+}
+
+void clear_pair(long prev, long k, char *what) {
+    long full_hash;
+    long box_hash;
+    long full_px;
+    long box_px;
+
+    g_gl.clearall = 1;
+    draw_any(prev);
+    draw_any(k);
+    full_hash = win_hash(0, 0, VPW, VPH);
+    full_px = g_gl.clearpix;
+
+    g_gl.clearall = 0;
+    draw_any(prev);
+    draw_any(k);
+    box_hash = win_hash(0, 0, VPW, VPH);
+    box_px = g_gl.clearpix;
+
+    if (full_hash != box_hash) {
+        printf("  hash %d clearing the box vs %d clearing the viewport\n",
+               box_hash, full_hash);
+        fail(what);
+        return;
+    }
+    printf("  ok  %s: identical", what);
+    printf(", the clear wrote %d of %d\n", box_px, full_px);
+}
+
+void test_clear_box() {
+    long savewire;
+
+    puts("\n-- 7. clearing the dirty box gives the same buffer --\n");
+    puts("  each line is two frames in a row, hashed against the same two\n");
+    puts("  frames with the whole viewport cleared every time\n");
+
+    clear_pair(2, 6, "a floor, then a frame that draws nothing");
+    clear_pair(2, 0, "a floor, then a small quad in the middle of it");
+    clear_pair(1, 0, "a big quad, then a smaller one");
+    clear_pair(4, 5, "a clipped floor, then a backwards quad");
+    clear_pair(3, 2, "the floor split one way, then the other");
+    clear_pair(6, 6, "nothing, then nothing again");
+
+    savewire = g_gl.wire;
+    g_gl.wire = 1;
+    clear_pair(2, 6, "wireframe: a floor, then nothing");
+    clear_pair(2, 0, "wireframe: a floor, then a small quad");
+    g_gl.wire = savewire;
+
+    // The point of the exercise, stated as a number rather than as a claim.
+    draw_any(2);
+    draw_any(6);
+    printf("  after a floor, an empty frame clears %d pixels; the viewport is %d\n",
+           g_gl.clearpix, VPW * VPH);
+    draw_any(6);
+    printf("  a second empty frame clears %d\n", g_gl.clearpix);
+    if (g_gl.clearpix != 0) fail("an empty frame after an empty frame still cleared");
+}
+
 void run_tests() {
     printf("FB: %dx%d at %d bpp\n", fb_width, fb_height, fb_bpp);
     printf("viewport %dx%d = %d pixels\n\n", VPW, VPH, VPW * VPH);
@@ -1277,6 +1441,7 @@ void run_tests() {
     test_modulate();
     test_depth_and_cost();
     test_raster_agrees();
+    test_clear_box();
 
     printf("\nheap: %d pages mapped, %d bytes free\n", heap_pages, heap_bytes_free());
 
@@ -1284,6 +1449,85 @@ void run_tests() {
     else puts("\nPASS: textures, mapped correctly, at the cost of a viewport\n");
 
     puts("\nGLTEXTEST DONE\n");
+}
+
+// ============================================================
+// what one idle pass round the event loop costs
+// ============================================================
+//
+// Reported: "the cpu usage does not go down when no triangles are drawn ...
+// while nothing is on screen the cpu should be idle almost", measured in a
+// Linux process manager against the qemu process.
+//
+// That number is the guest's own loop seen from outside. The loop runs once
+// per timer tick and then halts, so whatever one pass costs, multiplied by
+// the tick rate, IS the percentage he is looking at -- which makes it worth
+// printing here in the same units, from the real desktop, with the real
+// windows up, rather than describing it.
+//
+// Run with the camera pitched at the sky, which is the state he described:
+// the frustum rejects every cube and the floor is behind the eye.
+#define IDLE_ROUNDS 20
+
+long idle_time_us(long what) {
+    long a;
+    long b;
+    long r;
+    a = pm_timer_read();
+    r = 0;
+    while (r < IDLE_ROUNDS) {
+        if (what == 0) render_scene();
+        else if (what == 1) gl_clear(&g_gl);
+        else if (what == 2) { frame_ui(0, 0, 0, 0); wm_present(); }
+        else wm_present();
+        r = r + 1;
+    }
+    b = pm_timer_read();
+    return ((pm_timer_delta(a, b) * 1000000) / PM_TMR_HZ) / IDLE_ROUNDS;
+}
+
+void idle_cost_report() {
+    long savepitch;
+    long scene;
+    long iface;
+    long clear;
+    long px;
+
+    savepitch = g_cam.pitch;
+    g_cam.pitch = 80 << GL_FRAC;              // at the sky: nothing in view
+    g_redraw = 1;
+
+    render_scene();                           // settle: the first frame after a
+    render_scene();                           // camera move still clears the old one
+
+    px = g_gl.pixels;
+    render_scene();
+    px = g_gl.pixels - px;                    // this frame's writes, not the total
+
+    clear = idle_time_us(1);
+    scene = idle_time_us(0);
+    iface = idle_time_us(2);
+
+    puts("\n-- an idle pass round the event loop, camera at the sky --\n");
+    printf("  the whole frame wrote %d pixels; the viewport is %d\n",
+           px, VPW * VPH);
+    printf("  anything in view that moves on its own: %d\n", g_anim_in_view);
+    printf("  gl_clear              %d us\n", clear);
+    printf("  render_scene          %d us\n", scene);
+    printf("  the interface + flip  %d us\n", iface);
+    printf("  a pass that redraws everything: %d us, %d%% of a core at %d Hz\n",
+           scene + iface, ((scene + iface) * g_hz) / 10000, g_hz);
+    if (g_anim_in_view)
+        printf("  what this loop runs while nothing is on screen: %d us, %d%%\n",
+               scene, (scene * g_hz) / 10000);
+    else
+        puts("  what this loop runs while nothing is on screen: nothing at all\n");
+
+    g_cam.pitch = savepitch;
+    g_redraw = 1;
+    g_ui_stale = 1;
+    render_scene();
+    wm_present();
 }
 
 int main() {
@@ -1294,6 +1538,11 @@ int main() {
 
     if (!fb_init(1024, 768)) { puts("fb_init failed\n"); for (;;) { } }
     if (!mm_init())          { puts("mm_init failed\n"); for (;;) { } }
+
+    // acpi_init BEFORE mm_protect_null: the pointer to the EBDA, where the
+    // RSDP is looked for, lives at physical 0x40E -- inside the page
+    // mm_protect_null unmaps.
+    if (!acpi_init()) puts("acpi_init found nothing -- the idle report cannot time\n");
     mm_protect_null();
 
     kbd_init();
@@ -1302,6 +1551,7 @@ int main() {
     run_tests();
 
     build_desktop();
+    if (acpi_pm_tmr) idle_cost_report();
     puts("desktop up; the machine is now interactive\n");
     event_loop();
     return 0;

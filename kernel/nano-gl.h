@@ -430,11 +430,27 @@ struct GLCtx {
     long dx1;
     long dy1;
 
+    // The bounding box of everything the renderer has DIRTIED since the last
+    // clear -- pixels written, and depth entries written, which is not the
+    // same set. Outside it the colour buffer still holds bg and the depth
+    // buffer still holds zero, because that is what the last clear left there
+    // and nothing has touched it since.
+    //
+    // That invariant is what lets gl_clear clear a rectangle instead of a
+    // viewport. It is maintained conservatively: a triangle dirties its whole
+    // clipped bounding box whether or not every pixel in it survived the depth
+    // test, so a fragment that wrote only a depth value cannot escape it.
+    long cx0;
+    long cy0;
+    long cx1;
+    long cy1;
+
     long tris_in;          // counters, so the tests can assert on work done
     long tris_culled;      // backfacing
     long tris_clipped;     // met the near plane
     long tris_drawn;
     long pixels;           // buffer pixels written
+    long clearpix;         // of those, the ones the last gl_clear wrote
 
     // What the rasteriser walked over, as opposed to what it wrote. A
     // triangle is at most half of its bounding box and usually far less, so
@@ -451,6 +467,12 @@ struct GLCtx {
     // has an effect where GL_RASTER_REF was defined; it exists so a test can
     // render the same scene both ways and compare the buffers.
     long refraster;
+
+    // Clear the whole viewport regardless of what was dirtied -- the old
+    // behaviour, kept so a test can render a scene both ways and hash the
+    // buffers. Without it "the box is enough" is an argument rather than a
+    // measurement.
+    long clearall;
 };
 
 // Build the projection matrix for an off-centre frustum, exactly as
@@ -528,8 +550,13 @@ void gl_defaults(struct GLCtx *c, long w) {
     c->bg = rgb(12, 14, 22);
     c->light.x = 0; c->light.y = 0; c->light.z = 0 - GL_ONE;
     c->dx0 = 0; c->dy0 = 0; c->dx1 = -1; c->dy1 = -1;
+    // The whole viewport is dirty until it has been cleared once: the buffer
+    // came from the window manager and holds whatever was there before.
+    c->cx0 = 0; c->cy0 = 0; c->cx1 = c->vw - 1; c->cy1 = c->vh - 1;
     c->boxpix = 0; c->steps = 0; c->covered = 0;
+    c->clearpix = 0;
     c->refraster = 0;
+    c->clearall = 0;
     gl_perspective_pixels(c);
 }
 
@@ -578,12 +605,37 @@ long gl_bind(struct GLCtx *c, long win, long x, long y, long w, long h) {
 }
 #endif
 
-void gl_mark(struct GLCtx *c, long x, long y) {
+// Record that a pixel has been TOUCHED -- written, or had its depth entry
+// written, which the next clear has to undo either way. Separate from the
+// damage box because the two are consumed by different things at different
+// times: damage is emptied by every flush, dirt is emptied by every clear.
+void gl_dirty(struct GLCtx *c, long x, long y) {
+    if (x < 0) x = 0;
+    if (y < 0) y = 0;
+    if (x >= c->vw) x = c->vw - 1;
+    if (y >= c->vh) y = c->vh - 1;
+    if (c->cx1 < c->cx0) { c->cx0 = x; c->cx1 = x; c->cy0 = y; c->cy1 = y; return; }
+    if (x < c->cx0) c->cx0 = x;
+    if (x > c->cx1) c->cx1 = x;
+    if (y < c->cy0) c->cy0 = y;
+    if (y > c->cy1) c->cy1 = y;
+}
+
+// Record that a pixel has CHANGED ON SCREEN, which is the compositor's
+// business and not the clear's.
+void gl_damage(struct GLCtx *c, long x, long y) {
     if (c->dx1 < c->dx0) { c->dx0 = x; c->dx1 = x; c->dy0 = y; c->dy1 = y; return; }
     if (x < c->dx0) c->dx0 = x;
     if (x > c->dx1) c->dx1 = x;
     if (y < c->dy0) c->dy0 = y;
     if (y > c->dy1) c->dy1 = y;
+}
+
+// Both, which is what drawing does: the pixel changed, and it will have to be
+// put back to bg before the next frame.
+void gl_mark(struct GLCtx *c, long x, long y) {
+    gl_dirty(c, x, y);
+    gl_damage(c, x, y);
 }
 
 // Write one pixel, in VIEWPORT coordinates, into the window's backing buffer.
@@ -600,29 +652,76 @@ void gl_put(struct GLCtx *c, long x, long y, long colour) {
     gl_mark(c, x, y);
 }
 
-void gl_clear(struct GLCtx *c) {
+// Fill n words. Behind a function so there is one place to make it fast, and
+// so the user-space build -- which cannot call into the kernel's assembly --
+// still has something to call.
+#ifdef GL_NO_WM
+void gl_fill64(long *dst, long val, long n) {
     long i;
-    long n;
-    n = c->vw * c->vh;
     i = 0;
-    while (i < n) { c->zbuf[i] = 0; i = i + 1; }   // 1/z of 0 = infinitely far
-    {
-        long j;
-        j = 0;
-        while (j < c->vh) {
-            long k;
-            long row;
-            row = (c->vy + j) * c->stride + c->vx;
-            k = 0;
-            while (k < c->vw) { c->pix[row + k] = c->bg; k = k + 1; }
-            j = j + 1;
-        }
-    }
-    c->pixels = c->pixels + n;
-    gl_mark(c, 0, 0);
-    gl_mark(c, c->vw - 1, c->vh - 1);
+    while (i < n) { dst[i] = val; i = i + 1; }
+}
+#else
+extern void fill64();          // isr.s; declared the way nano_cc likes it
+void gl_fill64(long *dst, long val, long n) {
+    if (n > 0) fill64(dst, val, n);
+}
+#endif
+
+// CLEAR WHAT THE LAST FRAME DIRTIED, NOT THE VIEWPORT.
+//
+// The old version wrote the whole colour buffer and the whole depth buffer
+// before it knew what the frame was going to contain, so the cost of a frame
+// had a floor set by the size of the viewport and nothing else -- an empty
+// screen cost the same as a full one, which is what "the cpu does not go down
+// when nothing is drawn" is, from the inside.
+//
+// Outside the dirty box the colour buffer already holds bg and the depth
+// buffer already holds zero: that is what the previous clear put there, and
+// gl_dirty says nothing has touched it since. So clearing the box is not an
+// approximation of clearing the viewport, it produces the identical buffer --
+// which is a claim that gets checked rather than asserted, in glapi.c section
+// 12 and gltex.c section 6, by clearing both ways and hashing.
+//
+// It rests entirely on every write path reporting where it wrote. That was
+// already load-bearing for the compositor, but "relied on" and "checked" are
+// different things, so the dirty box is deliberately conservative: a triangle
+// dirties its whole clipped bounding box, not the pixels that survived the
+// depth test.
+void gl_clear(struct GLCtx *c) {
+    long x0;
+    long y0;
+    long x1;
+    long y1;
+    long w;
+    long j;
+
     c->tris_in = 0; c->tris_culled = 0; c->tris_clipped = 0; c->tris_drawn = 0;
     c->boxpix = 0; c->steps = 0; c->covered = 0;
+    c->clearpix = 0;
+
+    if (c->clearall) {
+        c->cx0 = 0; c->cy0 = 0; c->cx1 = c->vw - 1; c->cy1 = c->vh - 1;
+    }
+    x0 = c->cx0; y0 = c->cy0; x1 = c->cx1; y1 = c->cy1;
+    if (x1 < x0 || y1 < y0) return;        // nothing was dirtied, nothing to undo
+
+    w = x1 - x0 + 1;
+    j = y0;
+    while (j <= y1) {
+        gl_fill64(c->zbuf + j * c->vw + x0, 0, w);   // 1/z of 0 = infinitely far
+        gl_fill64(c->pix + (c->vy + j) * c->stride + c->vx + x0, c->bg, w);
+        j = j + 1;
+    }
+    c->clearpix = w * (y1 - y0 + 1);
+    c->pixels = c->pixels + c->clearpix;
+
+    // The cleared rectangle held something a moment ago, so the compositor has
+    // to repaint it. Damage only: the point of the clear is that the box is
+    // now clean, so re-dirtying it here would defeat the whole thing.
+    gl_damage(c, x0, y0);
+    gl_damage(c, x1, y1);
+    c->cx0 = 0; c->cy0 = 0; c->cx1 = -1; c->cy1 = -1;
 }
 
 // Hand the damage to the compositor. The whole reason the renderer takes a
@@ -889,6 +988,13 @@ void gl_tri_raster_ref(struct GLCtx *c, long *sx, long *sy, long *iz, long colou
     if (c->vy + maxy > c->surfh - 1) maxy = c->surfh - 1 - c->vy;
     if (minx > maxx || miny > maxy) return;
 
+    // The whole clipped box is dirty from here, whatever the depth test does
+    // with it. Deliberately larger than the set of pixels written: a fragment
+    // that loses the depth test still wrote a depth value on the way, and
+    // there is no version of this that is safe to be clever about.
+    gl_dirty(c, minx, miny);
+    gl_dirty(c, maxx, maxy);
+
     c->boxpix = c->boxpix + (maxx - minx + 1) * (maxy - miny + 1);
 
     area = (sx[1] - sx[0]) * (sy[2] - sy[0]) - (sy[1] - sy[0]) * (sx[2] - sx[0]);
@@ -1119,6 +1225,13 @@ void gl_tri_raster(struct GLCtx *c, long *sx, long *sy, long *iz, long colour) {
     if (c->vx + maxx > c->stride - 1) maxx = c->stride - 1 - c->vx;
     if (c->vy + maxy > c->surfh - 1) maxy = c->surfh - 1 - c->vy;
     if (minx > maxx || miny > maxy) return;
+
+    // The whole clipped box is dirty from here, whatever the depth test does
+    // with it. Deliberately larger than the set of pixels written: a fragment
+    // that loses the depth test still wrote a depth value on the way, and
+    // there is no version of this that is safe to be clever about.
+    gl_dirty(c, minx, miny);
+    gl_dirty(c, maxx, maxy);
 
     c->boxpix = c->boxpix + (maxx - minx + 1) * (maxy - miny + 1);
 

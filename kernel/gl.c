@@ -53,6 +53,11 @@ void expect(char *what, long got, long want) {
 // Fixed-point values are compared with a tolerance, because they are the
 // result of a rounded multiply chain. The tolerance is stated in UNITS of
 // 1/65536 so that "close enough" is a number rather than a feeling.
+void expect_true(char *what, long got) {
+    if (got) printf("  ok  %s\n", what);
+    else fail(what);
+}
+
 void expect_near(char *what, long got, long want, long tol) {
     long d;
     d = got - want;
@@ -664,7 +669,14 @@ void test_cost() {
     small = wm_pixels;
     printf("  a rendered frame: %d pixels to the screen\n", small);
     printf("  the viewport is %d, the screen is %d\n", VPW * VPH, wm_screen_pixels());
-    expect("a frame costs its viewport and no more", small, VPW * VPH);
+    // Until K24b this was exactly the viewport, because the clear damaged the
+    // whole viewport whatever the frame contained; now it is the rectangle the
+    // frame actually rewrote, and a cube in the middle of a viewport is a lot
+    // less than the viewport. A strict inequality on purpose: "no more than
+    // the viewport" would have passed before the change too.
+    expect_true("a frame costs the compositor LESS than its viewport",
+                small < VPW * VPH);
+    expect_true("...and something, since a cube was drawn", small > 0);
     check_matches_full("after a rendered frame");
 
     // Forty frames of rotation, to show the cost is per-frame and flat.

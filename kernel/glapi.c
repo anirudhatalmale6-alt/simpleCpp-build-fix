@@ -702,6 +702,13 @@ void draw_scene(long cull) {
         if (cull && gl_frustum_sphere(&g_frustum, &g_obj[i], 113512) == GL_OUTSIDE) {
             g_culled = g_culled + 1;
         } else {
+            // Something that MOVES BY ITSELF has been submitted. These turn
+            // whether or not anyone touches the mouse, so while one of them is
+            // in the scene the next frame cannot be assumed to look like this
+            // one. The sphere test is what makes the converse hold: the radius
+            // bounds the object in every orientation, so a culled one cannot
+            // spin back into view.
+            g_anim_in_view = 1;
             glPushMatrix(&g_gls);
             glTranslatex(&g_gls, g_obj[i].x, g_obj[i].y, g_obj[i].z);
             gl_cube(&g_gls);
@@ -1237,7 +1244,14 @@ void test_cost() {
     printf("  a frame with the scene re-rendered: %d pixels, "
            "%d widgets pushed damage\n", moving, g_ui.invalidations);
     printf("  the viewport is %d, the screen is %d\n", VPW * VPH, wm_screen_pixels());
-    expect("a rendered frame costs its viewport and no more", moving, VPW * VPH);
+    // Until K24b this was exactly the viewport, because the clear damaged the
+    // viewport whatever the frame contained. Now it is the rectangle the frame
+    // actually rewrote, so the assertion is a strict inequality -- "no more
+    // than the viewport" would have passed before the change as well, and an
+    // assertion that cannot fail is not evidence of anything.
+    expect_true("a rendered frame costs the compositor LESS than its viewport",
+                moving < VPW * VPH);
+    expect_true("...and something, since the scene was re-rendered", moving > 0);
 
     // Nothing moved: the scene is not re-rendered and no widget changed
     // state, so the frame costs nothing at all. This is the whole argument
@@ -1420,6 +1434,8 @@ long g_bench_ref_us;
 long g_bench_span_walk;
 long g_bench_ref_walk;
 long g_bench_disagree;
+long g_bench_clear_box;    // what the clear wrote, summed over the sweep
+long g_bench_clear_full;   // ...against what clearing the viewport would
 
 // The last row's numbers, so a sweep can quote its own two ends.
 long g_row_obj;
@@ -1439,8 +1455,30 @@ void bench_row(char *what) {
     long ref_cov;
     long span_hash;
     long ref_hash;
+    long full_hash;
+    long full_clear;
 
+    // K24b: the same pose, drawn once with the whole viewport cleared and
+    // once with only the box the previous frame dirtied. Two frames each way,
+    // because what a partial clear gets wrong is the pixels the LAST frame lit
+    // and this one does not -- a single frame from a known-clean buffer cannot
+    // show it. Free to check here, and it covers every pose in the sweep.
     g_gl.refraster = 0;
+    g_gl.clearall = 1;
+    bench_frame();
+    bench_frame();
+    full_hash = win_hash(g_win3d, VPX, VPY, VPW, VPH);
+    full_clear = g_gl.clearpix;
+    g_gl.clearall = 0;
+    bench_frame();
+    bench_frame();
+    if (win_hash(g_win3d, VPX, VPY, VPW, VPH) != full_hash) {
+        g_bench_disagree = g_bench_disagree + 1;
+        fail("clearing the dirty box left the same buffer as clearing the viewport");
+    }
+    g_bench_clear_box = g_bench_clear_box + g_gl.clearpix;
+    g_bench_clear_full = g_bench_clear_full + full_clear;
+
     p0 = g_gl.pixels;
     bench_frame();
     px = g_gl.pixels - p0 - VPW * VPH;
@@ -1500,6 +1538,7 @@ void test_fill() {
     g_bench_span_us = 0; g_bench_ref_us = 0;
     g_bench_span_walk = 0; g_bench_ref_walk = 0;
     g_bench_disagree = 0;
+    g_bench_clear_box = 0; g_bench_clear_full = 0;
     far_obj = 0; far_us = 0; near_obj = 0; near_us = 0;
 
     puts("  turning on the spot, from where the demo starts:\n");
@@ -1584,7 +1623,10 @@ void test_fill() {
         long empty;
         long r;
 
+        long was;
+
         bench_at(0, 2 * GL_ONE, 0 - 7 * GL_ONE, 180, 0 - 8);   // facing away
+        bench_frame();
         bench_frame();
 
         a = pm_timer_read();
@@ -1595,13 +1637,23 @@ void test_fill() {
 
         empty = bench_us();
 
+        // The same empty frame with the old whole-viewport clear, which is
+        // the number this line used to print and the one the report was
+        // about. Kept side by side rather than replaced: a measurement with
+        // nothing to compare it to is just a number.
+        g_gl.clearall = 1;
+        bench_frame();
+        was = bench_us();
+        g_gl.clearall = 0;
+        bench_frame();
+
         puts("\n  the floor, with the camera facing away and nothing in view:\n");
-        printf("    a whole empty frame:      %d us\n", empty);
-        printf("    gl_clear on its own:      %d us\n", clr);
-        printf("    so the clear is %d%% of a frame that draws nothing\n",
-               empty ? (clr * 100) / empty : 0);
-        printf("    at %d Hz that is %d%% of a core, with an empty screen\n",
-               g_hz, (empty * g_hz) / 10000);
+        printf("    a whole empty frame:              %d us\n", empty);
+        printf("    gl_clear on its own:              %d us\n", clr);
+        printf("    the same frame clearing it all:   %d us\n", was);
+        printf("    at %d Hz that is %d%% of a core, against %d%% before\n",
+               g_hz, (empty * g_hz) / 10000, (was * g_hz) / 10000);
+        if (empty >= was) fail("the empty frame is no cheaper than clearing the viewport");
     }
 
     printf("\n  totals over every pose: span %d us, ref %d us\n",
@@ -1611,8 +1663,10 @@ void test_fill() {
     if (g_bench_ref_us > 0)
         printf("  the span rasteriser is at %d%% of the old one's time\n",
                (g_bench_span_us * 100) / g_bench_ref_us);
+    printf("  the clear wrote %d pixels over the sweep, against %d before\n",
+           g_bench_clear_box, g_bench_clear_full);
     if (g_bench_disagree == 0)
-        puts("  ok  every pose: the two rasterisers produced identical buffers\n");
+        puts("  ok  every pose: both rasterisers, and both clears, identical buffers\n");
     else
         printf("  %d poses DISAGREED\n", g_bench_disagree);
 }
@@ -1690,11 +1744,19 @@ void build_desktop() {
     wm_present();
 }
 
+// What the last render_scene found: whether it changed any pixels, and
+// whether anything that animates on its own was submitted to the renderer.
+// The event loop uses both to decide whether the next pass has any work in it
+// -- see the note in it.
+long g_scene_damage;
+long g_anim_in_view;
+
 void render_scene() {
     struct M4 clip;
     long i;
 
     if (!g_win[g_win3d].used) return;
+    g_anim_in_view = 0;
     g_gl.wire = g_wire;
     g_gl.lighting = g_light;
 
@@ -1736,14 +1798,24 @@ void render_scene() {
         i = i + 1;
     }
     g_stat_tris = g_gl.tris_drawn;
+    // Did this frame change the viewport at all? Asked before the flush,
+    // because the flush is what empties the damage box.
+    g_scene_damage = (g_gl.dx1 >= g_gl.dx0);
     gl_flush(&g_gl);
 }
+
+// Set when something outside the loop has changed what the interface should
+// look like, so the next pass draws it even if nothing else happened. The
+// first pass after the desktop comes up is one of those.
+long g_ui_stale;
 
 void event_loop() {
     long last_tick;
     long redraw;
+    long touched;
     last_tick = g_ticks;
     redraw = 1;
+    g_ui_stale = 1;
     for (;;) {
         struct MEvent e;
         long down;
@@ -1753,6 +1825,7 @@ void event_loop() {
         char c;
 
         pressed = 0; released = 0; key = 0;
+        touched = 0;
         down = g_prev_down;
         while (mouse_pop(&e)) {
             wm_input_mouse(e.x, e.y, e.btn);
@@ -1760,12 +1833,48 @@ void event_loop() {
             if (down && !g_prev_down) pressed = 1;
             if (!down && g_prev_down) released = 1;
             g_prev_down = down;
+            touched = 1;
         }
         for (;;) {
             c = kbd_getchar_nb();
             if (c == 0) break;
             if (!wm_input_key(c)) key = c;
+            touched = 1;
         }
+
+        // THE TICK, AND THEN THE SCENE, AND THEN DECIDE WHETHER TO DRAW.
+        //
+        // By the number of ticks that PASSED, not by one per frame that got
+        // as far as here. A step of one per frame ties the rotation rate to
+        // the frame rate, so a heavy frame does not just take longer to draw,
+        // it makes the cubes turn more slowly -- which is what "it draws them
+        // slower" describes from the other side of the screen. The wall clock
+        // is right here and always was; it just was not being read.
+        //
+        // And the tick only means the SCENE has to be redrawn if something in
+        // it moves by itself. With every object culled, the world is not
+        // changing, and redrawing an unchanging world once per tick is the
+        // cpu K24b is about.
+        if (g_ticks != last_tick) {
+            g_spin = (g_spin + (g_ticks - last_tick)) % 360;
+            last_tick = g_ticks;
+            if (g_anim_in_view) redraw = 1;
+        }
+
+        g_scene_damage = 0;
+        if (redraw) {
+            render_scene();
+            redraw = 0;
+        }
+
+        // The interface is drawn OVER the viewport, so it has to be redrawn
+        // whenever the scene has repainted underneath it -- which is only
+        // knowable once the scene has been rendered. Rendering it is the cheap
+        // half of a pass since K24b; the HUD, two window frames, the panel and
+        // their text are the expensive half, and that is the half skipped when
+        // nothing has changed.
+        if (!touched && !g_scene_damage && !g_ui_stale) { cpu_idle(); continue; }
+        g_ui_stale = 0;
 
         // One ui_begin per frame, then ui_window to move to the other window.
         // Two ui_begin calls would restart the id counter and the panel's
@@ -1801,8 +1910,9 @@ void event_loop() {
             // Each widget is still called exactly once. Calling it twice --
             // once for input, once to paint over the new scene -- would fire
             // its toggle twice, because a press edge lasts the whole frame.
-            if (redraw) render_scene();
-
+            //
+            // The scene itself was drawn just above the ui_begin: same order,
+            // decided one step earlier.
             ui_window(&g_ui, g_win3d, VPX + 8, VPY + 8, 130);
             if (g_hud) {
                 if (ui_checkbox(&g_ui, "wireframe", &g_wire)) redraw = 1;
@@ -1857,20 +1967,6 @@ void event_loop() {
             }
         }
         ui_end(&g_ui);
-
-        // By the number of ticks that PASSED, not by one per frame that got
-        // as far as here. A step of one per frame ties the rotation rate to
-        // the frame rate, so a heavy frame does not just take longer to draw,
-        // it makes the cubes turn more slowly -- which is what "it draws them
-        // slower" describes from the other side of the screen. The wall clock
-        // is right here and always was; it just was not being read.
-        if (g_ticks != last_tick) {
-            g_spin = (g_spin + (g_ticks - last_tick)) % 360;
-            last_tick = g_ticks;
-            redraw = 1;
-        } else if (!g_view.dx && !g_view.dy && !g_view.key) {
-            redraw = 0;
-        }
 
         wm_present();
         cpu_idle();
