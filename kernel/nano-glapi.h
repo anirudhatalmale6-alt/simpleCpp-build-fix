@@ -718,6 +718,13 @@ struct Vtx g_buf_view[GL_MAXBUF * GL_BUFCAP];
 long g_buf_valid[GL_MAXBUF];
 struct M4 g_buf_xfm[GL_MAXBUF];
 
+// Measurement instrument, off by default: force every draw call to re-do the
+// transform, as if the cache were not there. It answers the question the
+// cache exists for -- gears splits each gear into ~70 draw calls because the
+// normal changes mid-strip, and without the cache every one of them would
+// transform the whole buffer again.
+long g_buf_nocache;
+
 long g_buf_over;               // vertices dropped because a buffer filled up
 long g_buf_hit;                // draws that reused a cached transform
 long g_buf_miss;               // draws that had to do the transform
@@ -792,7 +799,7 @@ void glDrawElements(struct GlState *st, long buf, long *idx, long n, long mode) 
     cnt = g_buf_n[i];
     mv = &st->mv[st->mvsp];
 
-    if (!g_buf_valid[i] || !m4_same(&g_buf_xfm[i], mv)) {
+    if (g_buf_nocache || !g_buf_valid[i] || !m4_same(&g_buf_xfm[i], mv)) {
         long k;
         k = 0;
         while (k < cnt) {
