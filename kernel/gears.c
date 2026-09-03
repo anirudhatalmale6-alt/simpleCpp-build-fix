@@ -885,7 +885,18 @@ void run_tests() {
 // The three numbers below are what decide where to look next. gltex's frame
 // is dominated by the fill; this one may not be, because 892 triangles that
 // each cover forty-odd pixels is a very different shape of frame.
-#define GEARS_ROUNDS 10
+// Forty and not ten. The lit-versus-unlit difference is the smallest thing
+// this report tries to resolve, and at ten rounds the host's own jitter is
+// bigger than it -- one run put lighting at 645 us and the next at MINUS 140,
+// which is not a cost, it is noise wearing a number's clothes. A negative
+// answer is the only reason this constant is what it is.
+#define GEARS_ROUNDS 40
+
+// The box a REAL frame dirtied and the box it damaged, captured once so the
+// clear and the flip can each be timed against the work an actual frame gives
+// them. See gears_time_us for why they cannot simply be repeated.
+long g_bx0; long g_by0; long g_bx1; long g_by1;
+long g_dx0; long g_dy0; long g_dx1; long g_dy1;
 
 long gears_time_us(long what) {
     long a;
@@ -895,8 +906,27 @@ long gears_time_us(long what) {
     r = 0;
     while (r < GEARS_ROUNDS) {
         if (what == 0) draw_frame(r * 2 * GL_ONE);
-        else if (what == 1) gl_clear(&g_gl);
-        else if (what == 2) { gl_flush(&g_gl); wm_present(); }
+        else if (what == 1) {
+            // Restore the dirty box before every clear. Repeating a bare
+            // gl_clear does NOT measure a clear: the first one empties the
+            // box and the other thirty-nine find nothing to do and return at
+            // the first line -- which is precisely the optimisation this
+            // renderer just gained. Ten rounds reported 26 us and forty
+            // reported 7, and both are the same single clear divided by a
+            // different number. The 1:4 ratio between them is what gave it
+            // away; a real per-call cost does not move with the loop count.
+            g_gl.cx0 = g_bx0; g_gl.cy0 = g_by0;
+            g_gl.cx1 = g_bx1; g_gl.cy1 = g_by1;
+            gl_clear(&g_gl);
+        }
+        else if (what == 2) {
+            // Same trap on the other side: gl_flush clears the damage box and
+            // wm_present repaints only damaged rectangles, so an unprimed
+            // repeat times an early return.
+            g_gl.dx0 = g_dx0; g_gl.dy0 = g_dy0;
+            g_gl.dx1 = g_dx1; g_gl.dy1 = g_dy1;
+            gl_flush(&g_gl); wm_present();
+        }
         else { draw_frame(r * 2 * GL_ONE); gl_flush(&g_gl); wm_present(); }
         r = r + 1;
     }
@@ -912,6 +942,7 @@ void frame_cost_report() {
     long unlit;
     long wire;
     long px;
+    long scene;
 
     draw_frame(0);
     gl_flush(&g_gl);
@@ -920,6 +951,13 @@ void frame_cost_report() {
     px = g_gl.pixels;
     draw_frame(0);
     px = g_gl.pixels - px;
+
+    // draw_frame clears and then draws, so both boxes are live right here:
+    // the dirt this frame left for the NEXT clear to undo, and the damage it
+    // left for the next present to blit. Capture them, because the timing
+    // loops below consume them and would otherwise be timing an early return.
+    g_bx0 = g_gl.cx0; g_by0 = g_gl.cy0; g_bx1 = g_gl.cx1; g_by1 = g_gl.cy1;
+    g_dx0 = g_gl.dx0; g_dy0 = g_gl.dy0; g_dx1 = g_gl.dx1; g_dy1 = g_gl.dy1;
 
     clear = gears_time_us(1);
     frame = gears_time_us(0);
@@ -956,6 +994,15 @@ void frame_cost_report() {
     printf("  %d pixels written, of which the clear wrote %d\n", px, g_gl.clearpix);
     printf("  the rasteriser walked %d iterations to cover %d\n",
            g_gl.steps, g_gl.covered);
+    // The two numbers that decide whether a hierarchical depth buffer is worth
+    // building. A fragment that is covered but never written was rejected by
+    // the z test -- it is OVERDRAW, and it is the only thing a coarse z pass
+    // can save. If that count is small, no amount of hierarchy helps, and the
+    // answer is a measurement rather than an opinion.
+    scene = px - g_gl.clearpix;
+    if (g_gl.covered > 0)
+        printf("  %d of those covered fragments lost the depth test: %d%% overdraw\n",
+               g_gl.covered - scene, (g_gl.covered - scene) * 100 / g_gl.covered);
     printf("  gl_clear      %d us\n", clear);
     printf("  draw_frame    %d us\n", frame);
     printf("  flush + flip  %d us\n", flip);
