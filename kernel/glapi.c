@@ -43,6 +43,8 @@
 // The old walking rasteriser, kept compiled in HERE and nowhere else, so
 // section 12 can render the same scene both ways and compare the buffers.
 #define GL_RASTER_REF
+// Vertex buffers. Defined here and not in the in-OS sources; see nano-glapi.h.
+#define GL_VBO
 #include "nano-gl.h"
 #include "nano-glapi.h"
 
@@ -2039,6 +2041,7 @@ void run_tests() {
     test_cost();
     if (acpi_pm_tmr) test_fill();
     else puts("\n-- 12. skipped: no ACPI PM timer, nothing to time on --\n");
+    test_vbo();
 
     printf("\nheap: %d pages mapped, %d bytes free\n", heap_pages, heap_bytes_free());
 
@@ -2046,6 +2049,152 @@ void run_tests() {
     else puts("\nPASS: an OpenGL-shaped API, a real frustum, and a 3D widget\n");
 
     puts("\nGLAPITEST DONE\n");
+}
+
+
+// ============================================================
+// 13. a vertex buffer draws the same picture, transforming less
+// ============================================================
+//
+// The claim the milestone rests on is not "it is faster" -- it is "it is the
+// SAME PICTURE, and it transformed fewer vertices". Speed without the first
+// half is just a renderer that draws something else.
+//
+// A cube is the right shape for it: eight corners, six faces, and every
+// corner used by three of them. Submitted as quads through glVertex3x that is
+// 24 transforms. Through a buffer it is 8, and the picture must not move by a
+// single pixel.
+
+// The eight corners, and the six faces as indices into them. Winding matters
+// and is the same in both paths -- counter-clockwise seen from outside -- so
+// backface culling and flat shading make identical decisions either way.
+// Corner k of a cube of half-extent h, in the order GL_QUADS wants.
+long cube_cx(long k, long h) { if (k == 0 || k == 3 || k == 4 || k == 7) return 0 - h; return h; }
+long cube_cy(long k, long h) { if (k < 2 || k == 4 || k == 5) return 0 - h; return h; }
+long cube_cz(long k, long h) { if (k < 4) return h; return 0 - h; }
+
+void vbo_faces(long *idx) {
+    long f[24];
+    long i;
+    // front, back, right, left, top, bottom -- each CCW from outside
+    f[0]=0;  f[1]=1;  f[2]=2;  f[3]=3;
+    f[4]=5;  f[5]=4;  f[6]=7;  f[7]=6;
+    f[8]=1;  f[9]=5;  f[10]=6; f[11]=2;
+    f[12]=4; f[13]=0; f[14]=3; f[15]=7;
+    f[16]=3; f[17]=2; f[18]=6; f[19]=7;
+    f[20]=4; f[21]=5; f[22]=1; f[23]=0;
+    i = 0;
+    while (i < 24) { idx[i] = f[i]; i = i + 1; }
+}
+
+// The same cube, submitted the old way: every face names its four corners, so
+// a corner shared by three faces is transformed three times.
+void vbo_cube_immediate(long h) {
+    long idx[24];
+    long i;
+    vbo_faces(idx);
+    glBegin(&g_gls, GL_QUADS);
+    i = 0;
+    while (i < 24) {
+        long k;
+        k = idx[i];
+        glVertex3x(&g_gls, cube_cx(k, h), cube_cy(k, h), cube_cz(k, h));
+        i = i + 1;
+    }
+    glEnd(&g_gls);
+}
+
+void vbo_place(long z) {
+    gl_clear(&g_gl);
+    gl_state_init(&g_gls, &g_gl);
+    glLoadIdentity(&g_gls);
+    glTranslatex(&g_gls, 0, 0, z);
+    glRotatex(&g_gls, 27 * GL_ONE, GL_ONE, 0, 0);
+    glRotatex(&g_gls, 41 * GL_ONE, 0, GL_ONE, 0);
+}
+
+void test_vbo() {
+    long buf;
+    long idx[24];
+    long i;
+    long h;
+    long hash_imm;
+    long hash_vbo;
+    long verts_imm;
+    long verts_vbo;
+    long drawn_imm;
+
+    puts("\n-- 13. a vertex buffer draws the same picture, transforming less --\n");
+
+    h = GL_ONE;
+    vbo_faces(idx);
+
+    // The old way.
+    vbo_place(6 * GL_ONE);
+    verts_imm = g_gls.verts;
+    vbo_cube_immediate(h);
+    verts_imm = g_gls.verts - verts_imm;
+    hash_imm = win_hash(g_win3d, VPX, VPY, VPW, VPH);
+    drawn_imm = g_gl.pixels;
+
+    // The new way: eight corners in a buffer, the same 24 indices.
+    buf = glGenBuffer(&g_gls);
+    expect_true("a buffer name was handed out", buf > 0);
+    i = 0;
+    while (i < 8) {
+        long at;
+        at = glBufferVertex(&g_gls, buf, cube_cx(i, h), cube_cy(i, h), cube_cz(i, h));
+        if (at != i) fail("glBufferVertex returned the wrong index");
+        i = i + 1;
+    }
+    expect("the buffer holds eight corners", glBufferSize(buf), 8);
+
+    vbo_place(6 * GL_ONE);
+    verts_vbo = g_gls.verts;
+    g_buf_hit = 0; g_buf_miss = 0;
+    glDrawElements(&g_gls, buf, idx, 24, GL_QUADS);
+    verts_vbo = g_gls.verts - verts_vbo;
+    hash_vbo = win_hash(g_win3d, VPX, VPY, VPW, VPH);
+
+    // The whole milestone, in one line.
+    expect_true("the vertex buffer draws a BIT-IDENTICAL picture",
+                hash_vbo == hash_imm);
+    // ...which means nothing if the cube missed the viewport entirely.
+    expect_true("...and the picture is actually a cube, not an empty viewport",
+                g_gl.pixels - drawn_imm > 500);
+
+    expect("submitting face by face transforms every shared corner again",
+           verts_imm, 24);
+    expect("...through a buffer each corner is transformed once", verts_vbo, 8);
+
+    // The cache: same buffer, same matrix, second draw transforms nothing.
+    g_buf_hit = 0; g_buf_miss = 0;
+    verts_vbo = g_gls.verts;
+    glDrawElements(&g_gls, buf, idx, 24, GL_QUADS);
+    expect("drawing again under the same matrix transforms nothing",
+           g_gls.verts - verts_vbo, 0);
+    expect("...and it is the cache that says so", g_buf_hit, 1);
+
+    // Move it, and the cache must NOT be reused -- this is the half that a
+    // broken invalidation still passes the test above.
+    vbo_place(7 * GL_ONE);
+    g_buf_hit = 0; g_buf_miss = 0;
+    verts_vbo = g_gls.verts;
+    glDrawElements(&g_gls, buf, idx, 24, GL_QUADS);
+    expect("moving the object re-transforms it", g_gls.verts - verts_vbo, 8);
+    expect("...and the cache reports a miss", g_buf_miss, 1);
+
+    // And the moved cube must be a DIFFERENT picture, or the re-transform
+    // above proved nothing.
+    expect_true("...and the moved cube really did draw somewhere else",
+                win_hash(g_win3d, VPX, VPY, VPW, VPH) != hash_vbo);
+
+    // Appending a vertex invalidates the cached transform, even though the
+    // matrix has not moved.
+    glBufferVertex(&g_gls, buf, 0, 0, 0);
+    g_buf_hit = 0; g_buf_miss = 0;
+    glDrawElements(&g_gls, buf, idx, 24, GL_QUADS);
+    expect("adding a vertex invalidates the cached transform", g_buf_miss, 1);
 }
 
 int main() {

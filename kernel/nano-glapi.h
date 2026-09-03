@@ -541,21 +541,16 @@ void gl_emit_tri(struct GlState *st, struct Vtx *a, struct Vtx *b, struct Vtx *c
     gl_tri_view(st->c, &a->p, &b->p, &c->p, st->colour);
 }
 
-void glVertex3x(struct GlState *st, long x, long y, long z) {
-    struct V3 m;
+// Primitive assembly, given a vertex ALREADY in view space.
+//
+// Split out of glVertex3x so that the vertex-array path can reach it without
+// a second copy of these rules. That matters more than the tidiness: the
+// strip and quad-strip cases below carry winding corrections that are easy to
+// state and easy to get subtly wrong, and a duplicate would be free to drift
+// away from this one. There is one set of them, and both paths run it.
+void gl_assemble(struct GlState *st, struct Vtx *pp) {
     struct Vtx p;
-
-    if (st->list) { gl_list_add(st, GLC_VERTEX, x, y, z); return; }
-    if (st->prim < 0 || !st->c) return;
-    m.x = x; m.y = y; m.z = z;
-    // Model space to view space, once, here -- exactly where OpenGL does it.
-    m4_apply(&p.p, &st->mv[st->mvsp], &m);
-    // The texture coordinate is snapshotted onto the vertex NOW, not read
-    // later. glTexCoord is current state and the caller will have changed it
-    // by the time this vertex completes a triangle.
-    p.s = st->cs;
-    p.t = st->ct;
-    st->verts = st->verts + 1;
+    p = *pp;
 
     if (st->prim == GL_POINTS) {
         gl_point_view(st->c, &p.p, st->colour);
@@ -655,6 +650,24 @@ void glVertex3x(struct GlState *st, long x, long y, long z) {
     }
 }
 
+void glVertex3x(struct GlState *st, long x, long y, long z) {
+    struct V3 m;
+    struct Vtx p;
+
+    if (st->list) { gl_list_add(st, GLC_VERTEX, x, y, z); return; }
+    if (st->prim < 0 || !st->c) return;
+    m.x = x; m.y = y; m.z = z;
+    // Model space to view space, once, here -- exactly where OpenGL does it.
+    m4_apply(&p.p, &st->mv[st->mvsp], &m);
+    // The texture coordinate is snapshotted onto the vertex NOW, not read
+    // later. glTexCoord is current state and the caller will have changed it
+    // by the time this vertex completes a triangle.
+    p.s = st->cs;
+    p.t = st->ct;
+    st->verts = st->verts + 1;
+    gl_assemble(st, &p);
+}
+
 void glEnd(struct GlState *st) {
     if (st->list) { gl_list_add(st, GLC_END, 0, 0, 0); return; }
     if (st->prim == GL_LINE_LOOP && st->total > 2 && st->c) {
@@ -665,6 +678,159 @@ void glEnd(struct GlState *st) {
     st->nvalid = 0;
     if (st->c) st->c->nvalid = 0;
 }
+
+#ifdef GL_VBO
+// ---------- vertex buffers ----------
+//
+// A buffer holds vertices in MODEL space and you draw with an index list,
+// which is the shape an OBJ file already has: a pile of vertices, then faces
+// that index into them. It is also where the transform saving lives, and the
+// saving is structural rather than a lookup table with an invalidation bug
+// waiting in it -- glDrawElements transforms the WHOLE buffer once and then
+// indexes the result, so a vertex used by six faces is transformed once.
+//
+// The cache is keyed on the modelview matrix the buffer was transformed with.
+// Draw the same buffer twice under the same matrix -- which is what happens
+// when a mesh is split into several draw calls because the normal changes
+// between them -- and the second draw transforms nothing. Move the object and
+// the matrix differs, so it re-transforms. Nothing has to remember to
+// invalidate it, which is the point: an explicit invalidate is a line someone
+// forgets to write.
+//
+// The whole section is behind GL_VBO because src/wingl.c and src/gears.c are
+// compiled by the compiler running INSIDE the OS and include this header.
+// nano_cc's preprocessor drops an #ifdef block before the lexer ever sees it,
+// so those two pay nothing for this -- which matters, because the in-OS
+// compiler has a size ceiling it hits silently.
+#define GL_MAXBUF 4
+#define GL_BUFCAP 1024
+
+long g_buf_used[GL_MAXBUF];
+long g_buf_n[GL_MAXBUF];
+long g_buf_x[GL_MAXBUF * GL_BUFCAP];
+long g_buf_y[GL_MAXBUF * GL_BUFCAP];
+long g_buf_z[GL_MAXBUF * GL_BUFCAP];
+long g_buf_s[GL_MAXBUF * GL_BUFCAP];
+long g_buf_t[GL_MAXBUF * GL_BUFCAP];
+
+// The transformed result, and the matrix that produced it.
+struct Vtx g_buf_view[GL_MAXBUF * GL_BUFCAP];
+long g_buf_valid[GL_MAXBUF];
+struct M4 g_buf_xfm[GL_MAXBUF];
+
+long g_buf_over;               // vertices dropped because a buffer filled up
+long g_buf_hit;                // draws that reused a cached transform
+long g_buf_miss;               // draws that had to do the transform
+
+long glGenBuffer(struct GlState *st) {
+    long i;
+    i = 0;
+    while (i < GL_MAXBUF) {
+        if (!g_buf_used[i]) {
+            g_buf_used[i] = 1;
+            g_buf_n[i] = 0;
+            g_buf_valid[i] = 0;
+            return i + 1;
+        }
+        i = i + 1;
+    }
+    st->overflow = st->overflow + 1;
+    return 0;
+}
+
+// Append one vertex, in model space, carrying the CURRENT texture coordinate
+// -- same rule as glVertex3x, and for the same reason: glTexCoord is state
+// and the caller will have moved on by the time this vertex is drawn.
+// Returns its index, which is what the caller needs to build the index list.
+long glBufferVertex(struct GlState *st, long buf, long x, long y, long z) {
+    long i;
+    long at;
+    if (buf < 1 || buf > GL_MAXBUF) { st->overflow = st->overflow + 1; return -1; }
+    i = buf - 1;
+    if (!g_buf_used[i]) { st->overflow = st->overflow + 1; return -1; }
+    if (g_buf_n[i] >= GL_BUFCAP) { g_buf_over = g_buf_over + 1; return -1; }
+    at = i * GL_BUFCAP + g_buf_n[i];
+    g_buf_x[at] = x; g_buf_y[at] = y; g_buf_z[at] = z;
+    g_buf_s[at] = st->cs; g_buf_t[at] = st->ct;
+    // The contents changed, so anything already transformed is stale.
+    g_buf_valid[i] = 0;
+    g_buf_n[i] = g_buf_n[i] + 1;
+    return g_buf_n[i] - 1;
+}
+
+long glBufferSize(long buf) {
+    if (buf < 1 || buf > GL_MAXBUF) return 0;
+    return g_buf_n[buf - 1];
+}
+
+long m4_same(struct M4 *a, struct M4 *b) {
+    long i;
+    i = 0;
+    while (i < 16) {
+        if (a->m[i] != b->m[i]) return 0;
+        i = i + 1;
+    }
+    return 1;
+}
+
+// Draw `n` indices from `buf` as primitive `mode`.
+//
+// The assembly is gl_assemble, the same function glVertex3x feeds, so every
+// winding rule -- the alternating swap in a triangle strip, the reversed far
+// pair in a quad strip -- is the one already under test, not a copy of it.
+void glDrawElements(struct GlState *st, long buf, long *idx, long n, long mode) {
+    long i;
+    long base;
+    long cnt;
+    struct M4 *mv;
+
+    if (!st->c) return;
+    if (buf < 1 || buf > GL_MAXBUF) { st->overflow = st->overflow + 1; return; }
+    i = buf - 1;
+    if (!g_buf_used[i]) { st->overflow = st->overflow + 1; return; }
+    base = i * GL_BUFCAP;
+    cnt = g_buf_n[i];
+    mv = &st->mv[st->mvsp];
+
+    if (!g_buf_valid[i] || !m4_same(&g_buf_xfm[i], mv)) {
+        long k;
+        k = 0;
+        while (k < cnt) {
+            struct V3 m;
+            m.x = g_buf_x[base + k];
+            m.y = g_buf_y[base + k];
+            m.z = g_buf_z[base + k];
+            m4_apply(&g_buf_view[base + k].p, mv, &m);
+            g_buf_view[base + k].s = g_buf_s[base + k];
+            g_buf_view[base + k].t = g_buf_t[base + k];
+            st->verts = st->verts + 1;
+            k = k + 1;
+        }
+        g_buf_xfm[i] = *mv;
+        g_buf_valid[i] = 1;
+        g_buf_miss = g_buf_miss + 1;
+    } else {
+        g_buf_hit = g_buf_hit + 1;
+    }
+
+    // Stand in for glBegin without recording into a display list: this is a
+    // draw, not a command to remember.
+    st->prim = mode;
+    st->total = 0;
+    st->nv = 0;
+
+    i = 0;
+    while (i < n) {
+        long v;
+        v = idx[i];
+        if (v >= 0 && v < cnt) gl_assemble(st, &g_buf_view[base + v]);
+        else st->overflow = st->overflow + 1;
+        i = i + 1;
+    }
+    glEnd(st);
+}
+#endif  // GL_VBO
+
 
 // Replay a recorded list. The modelview in force at the call is the one the
 // vertices go through, which is what makes one recorded gear usable at three

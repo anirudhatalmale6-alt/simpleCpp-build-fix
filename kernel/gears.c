@@ -54,6 +54,7 @@
 #include "nano-term.h"
 #include "nano-ui.h"
 #include "nano-gl.h"
+#define GL_VBO
 #include "nano-glapi.h"
 
 long g_fail;
@@ -457,6 +458,355 @@ void draw_frame(long angle) {
     glTranslatex(&g_gls, 0 - (31 * GL_ONE) / 10, (42 * GL_ONE) / 10, 0);
     glRotatex(&g_gls, 0 - 2 * angle - 25 * GL_ONE, 0, 0, GL_ONE);
     glCallList(&g_gls, g_gear3);
+    glPopMatrix(&g_gls);
+
+    glPopMatrix(&g_gls);
+}
+
+
+// ============================================================
+// the same gear, through a vertex buffer
+// ============================================================
+//
+// gear() above submits every face's corners individually, so a corner shared
+// by three faces is transformed three times. Here the corners go into a
+// buffer once and the faces become index lists, which is what glDrawElements
+// wants and what an OBJ file already is.
+//
+// Two details make this a transcription rather than a rewrite, which matters
+// because the test asserts the two draw the SAME PICTURE:
+//
+//   The normal changes in the MIDDLE of the outward-face strip -- once per
+//   quad. A draw call has one current normal, so each of those quads becomes
+//   its own GL_QUAD_STRIP call of four indices: the previous pair, then the
+//   new pair. A four-vertex quad strip emits (v0,v1,v3,v2), which is exactly
+//   the quad the original emitted at that point. Real GL forces the same
+//   split for the same reason.
+//
+//   Vertices are deduplicated on EXACT position. Gears carry no texture
+//   coordinates, so position is the whole vertex; if that ever stops being
+//   true this has to compare s and t as well or two corners that differ only
+//   in texture coordinate will be merged.
+
+#define GRP_MAX     512
+#define GRP_MAXIDX  4096
+
+long g_grp_mode[GRP_MAX];
+long g_grp_nx[GRP_MAX];
+long g_grp_ny[GRP_MAX];
+long g_grp_nz[GRP_MAX];
+long g_grp_start[GRP_MAX];
+long g_grp_count[GRP_MAX];
+long g_grp_n;
+
+long g_gidx[GRP_MAXIDX];
+long g_gidx_n;
+
+// Which groups belong to which gear.
+long g_gear_grp0[3];
+long g_gear_grpn[3];
+long g_gear_buf[3];
+
+// The buffer being built, and a shadow copy of its positions so a vertex can
+// be looked up before it is added. glBufferVertex does not deduplicate -- a
+// buffer is storage, and deciding what counts as "the same vertex" belongs to
+// whoever is loading the mesh.
+long g_vb_x[GL_BUFCAP];
+long g_vb_y[GL_BUFCAP];
+long g_vb_z[GL_BUFCAP];
+long g_vb_n;
+long g_vb_buf;
+
+long g_vb_dupes;               // how much sharing the dedup actually found
+
+void vb_start(long buf) {
+    g_vb_buf = buf;
+    g_vb_n = 0;
+}
+
+long vb_add(long x, long y, long z) {
+    long i;
+    i = 0;
+    while (i < g_vb_n) {
+        if (g_vb_x[i] == x && g_vb_y[i] == y && g_vb_z[i] == z) {
+            g_vb_dupes = g_vb_dupes + 1;
+            return i;
+        }
+        i = i + 1;
+    }
+    g_vb_x[g_vb_n] = x; g_vb_y[g_vb_n] = y; g_vb_z[g_vb_n] = z;
+    g_vb_n = g_vb_n + 1;
+    return glBufferVertex(&g_gls, g_vb_buf, x, y, z);
+}
+
+// Open a group. Every group carries the normal that was current when it
+// opened, because that is what the original had current when it emitted these
+// quads.
+void grp_open(long mode, long nx, long ny, long nz) {
+    if (g_grp_n >= GRP_MAX) { fail("group table full"); return; }
+    g_grp_mode[g_grp_n] = mode;
+    g_grp_nx[g_grp_n] = nx; g_grp_ny[g_grp_n] = ny; g_grp_nz[g_grp_n] = nz;
+    g_grp_start[g_grp_n] = g_gidx_n;
+    g_grp_count[g_grp_n] = 0;
+    g_grp_n = g_grp_n + 1;
+}
+
+void grp_idx(long v) {
+    if (g_gidx_n >= GRP_MAXIDX) { fail("index list full"); return; }
+    g_gidx[g_gidx_n] = v;
+    g_gidx_n = g_gidx_n + 1;
+    g_grp_count[g_grp_n - 1] = g_grp_count[g_grp_n - 1] + 1;
+}
+
+// One quad of a strip whose normal has just changed: the previous pair, then
+// the new pair, as a four-vertex strip.
+// The normal goes in a separate call because nano_cc stops at six arguments
+// and position-pair plus normal is seven.
+long g_grp_cnx; long g_grp_cny; long g_grp_cnz;
+
+void grp_setn(long nx, long ny, long nz) {
+    g_grp_cnx = nx; g_grp_cny = ny; g_grp_cnz = nz;
+}
+
+void grp_quad_strip(long p0, long p1, long n0, long n1) {
+    grp_open(GL_QUAD_STRIP, g_grp_cnx, g_grp_cny, g_grp_cnz);
+    grp_idx(p0); grp_idx(p1); grp_idx(n0); grp_idx(n1);
+}
+
+void gear_vbo(long which, long buf, long inner_radius, long outer_radius,
+              long width, long teeth) {
+    long i;
+    long r0;
+    long r1;
+    long r2;
+    long angle;
+    long da;
+    long hw;
+    long full;
+    long tooth_depth;
+    long p0;
+    long p1;
+
+    tooth_depth = (GL_ONE * 7) / 10;
+    r0 = inner_radius;
+    r1 = outer_radius - tooth_depth / 2;
+    r2 = outer_radius + tooth_depth / 2;
+    full = 360 * GL_ONE;
+    da = full / teeth / 4;
+    hw = width / 2;
+
+    vb_start(buf);
+    g_gear_buf[which] = buf;
+    g_gear_grp0[which] = g_grp_n;
+
+    // front face -- one normal for the whole strip, so one draw call
+    grp_open(GL_QUAD_STRIP, 0, 0, GL_ONE);
+    i = 0;
+    while (i <= teeth) {
+        angle = i * full / teeth;
+        grp_idx(vb_add(fx_mul(r0, gl_cos_fx(angle)), fx_mul(r0, gl_sin_fx(angle)), hw));
+        grp_idx(vb_add(fx_mul(r1, gl_cos_fx(angle)), fx_mul(r1, gl_sin_fx(angle)), hw));
+        grp_idx(vb_add(fx_mul(r0, gl_cos_fx(angle)), fx_mul(r0, gl_sin_fx(angle)), hw));
+        grp_idx(vb_add(fx_mul(r1, gl_cos_fx(angle + 3 * da)),
+                       fx_mul(r1, gl_sin_fx(angle + 3 * da)), hw));
+        i = i + 1;
+    }
+
+    // front sides of the teeth
+    grp_open(GL_QUADS, 0, 0, GL_ONE);
+    i = 0;
+    while (i < teeth) {
+        angle = i * full / teeth;
+        grp_idx(vb_add(fx_mul(r1, gl_cos_fx(angle)), fx_mul(r1, gl_sin_fx(angle)), hw));
+        grp_idx(vb_add(fx_mul(r2, gl_cos_fx(angle + da)),
+                       fx_mul(r2, gl_sin_fx(angle + da)), hw));
+        grp_idx(vb_add(fx_mul(r2, gl_cos_fx(angle + 2 * da)),
+                       fx_mul(r2, gl_sin_fx(angle + 2 * da)), hw));
+        grp_idx(vb_add(fx_mul(r1, gl_cos_fx(angle + 3 * da)),
+                       fx_mul(r1, gl_sin_fx(angle + 3 * da)), hw));
+        i = i + 1;
+    }
+
+    // back face
+    grp_open(GL_QUAD_STRIP, 0, 0, 0 - GL_ONE);
+    i = 0;
+    while (i <= teeth) {
+        angle = i * full / teeth;
+        grp_idx(vb_add(fx_mul(r1, gl_cos_fx(angle)), fx_mul(r1, gl_sin_fx(angle)), 0 - hw));
+        grp_idx(vb_add(fx_mul(r0, gl_cos_fx(angle)), fx_mul(r0, gl_sin_fx(angle)), 0 - hw));
+        grp_idx(vb_add(fx_mul(r1, gl_cos_fx(angle + 3 * da)),
+                       fx_mul(r1, gl_sin_fx(angle + 3 * da)), 0 - hw));
+        grp_idx(vb_add(fx_mul(r0, gl_cos_fx(angle)), fx_mul(r0, gl_sin_fx(angle)), 0 - hw));
+        i = i + 1;
+    }
+
+    // back sides of the teeth
+    grp_open(GL_QUADS, 0, 0, 0 - GL_ONE);
+    i = 0;
+    while (i < teeth) {
+        angle = i * full / teeth;
+        grp_idx(vb_add(fx_mul(r1, gl_cos_fx(angle + 3 * da)),
+                       fx_mul(r1, gl_sin_fx(angle + 3 * da)), 0 - hw));
+        grp_idx(vb_add(fx_mul(r2, gl_cos_fx(angle + 2 * da)),
+                       fx_mul(r2, gl_sin_fx(angle + 2 * da)), 0 - hw));
+        grp_idx(vb_add(fx_mul(r2, gl_cos_fx(angle + da)),
+                       fx_mul(r2, gl_sin_fx(angle + da)), 0 - hw));
+        grp_idx(vb_add(fx_mul(r1, gl_cos_fx(angle)), fx_mul(r1, gl_sin_fx(angle)), 0 - hw));
+        i = i + 1;
+    }
+
+    // outward faces of the teeth -- the normal changes once per quad, so each
+    // quad is its own four-index strip carrying the pair before it.
+    i = 0;
+    p0 = -1; p1 = -1;
+    while (i < teeth) {
+        long u;
+        long v;
+        long len;
+        long q0;
+        long q1;
+
+        angle = i * full / teeth;
+
+        q0 = vb_add(fx_mul(r1, gl_cos_fx(angle)), fx_mul(r1, gl_sin_fx(angle)), hw);
+        q1 = vb_add(fx_mul(r1, gl_cos_fx(angle)), fx_mul(r1, gl_sin_fx(angle)), 0 - hw);
+        // The first pair of the whole strip opens it; afterwards this pair is
+        // the quad closing the PREVIOUS tooth, under the normal left current
+        // at the end of the last iteration (cos, sin of the previous angle).
+        if (p0 >= 0) {
+            grp_setn(gl_cos_fx((i - 1) * full / teeth),
+                     gl_sin_fx((i - 1) * full / teeth), 0);
+            grp_quad_strip(p0, p1, q0, q1);
+        }
+        p0 = q0; p1 = q1;
+
+        u = fx_mul(r2, gl_cos_fx(angle + da)) - fx_mul(r1, gl_cos_fx(angle));
+        v = fx_mul(r2, gl_sin_fx(angle + da)) - fx_mul(r1, gl_sin_fx(angle));
+        len = fx_sqrt(fx_mul(u, u) + fx_mul(v, v));
+        if (len) { u = fx_div(u, len); v = fx_div(v, len); }
+        q0 = vb_add(fx_mul(r2, gl_cos_fx(angle + da)),
+                    fx_mul(r2, gl_sin_fx(angle + da)), hw);
+        q1 = vb_add(fx_mul(r2, gl_cos_fx(angle + da)),
+                    fx_mul(r2, gl_sin_fx(angle + da)), 0 - hw);
+        grp_setn(v, 0 - u, 0);
+        grp_quad_strip(p0, p1, q0, q1);
+        p0 = q0; p1 = q1;
+
+        q0 = vb_add(fx_mul(r2, gl_cos_fx(angle + 2 * da)),
+                    fx_mul(r2, gl_sin_fx(angle + 2 * da)), hw);
+        q1 = vb_add(fx_mul(r2, gl_cos_fx(angle + 2 * da)),
+                    fx_mul(r2, gl_sin_fx(angle + 2 * da)), 0 - hw);
+        grp_setn(gl_cos_fx(angle), gl_sin_fx(angle), 0);
+        grp_quad_strip(p0, p1, q0, q1);
+        p0 = q0; p1 = q1;
+
+        u = fx_mul(r1, gl_cos_fx(angle + 3 * da)) - fx_mul(r2, gl_cos_fx(angle + 2 * da));
+        v = fx_mul(r1, gl_sin_fx(angle + 3 * da)) - fx_mul(r2, gl_sin_fx(angle + 2 * da));
+        len = fx_sqrt(fx_mul(u, u) + fx_mul(v, v));
+        if (len) { u = fx_div(u, len); v = fx_div(v, len); }
+        q0 = vb_add(fx_mul(r1, gl_cos_fx(angle + 3 * da)),
+                    fx_mul(r1, gl_sin_fx(angle + 3 * da)), hw);
+        q1 = vb_add(fx_mul(r1, gl_cos_fx(angle + 3 * da)),
+                    fx_mul(r1, gl_sin_fx(angle + 3 * da)), 0 - hw);
+        grp_setn(v, 0 - u, 0);
+        grp_quad_strip(p0, p1, q0, q1);
+        p0 = q0; p1 = q1;
+
+        i = i + 1;
+    }
+    // the closing pair, under the last normal set inside the loop
+    {
+        long q0;
+        long q1;
+        q0 = vb_add(fx_mul(r1, gl_cos_fx(0)), fx_mul(r1, gl_sin_fx(0)), hw);
+        q1 = vb_add(fx_mul(r1, gl_cos_fx(0)), fx_mul(r1, gl_sin_fx(0)), 0 - hw);
+        grp_setn(gl_cos_fx((teeth - 1) * full / teeth),
+                 gl_sin_fx((teeth - 1) * full / teeth), 0);
+        grp_quad_strip(p0, p1, q0, q1);
+    }
+
+    // inside radius cylinder -- normal per angle step, so again one quad per
+    // draw call
+    p0 = -1; p1 = -1;
+    i = 0;
+    while (i <= teeth) {
+        long q0;
+        long q1;
+        angle = i * full / teeth;
+        q0 = vb_add(fx_mul(r0, gl_cos_fx(angle)), fx_mul(r0, gl_sin_fx(angle)), 0 - hw);
+        q1 = vb_add(fx_mul(r0, gl_cos_fx(angle)), fx_mul(r0, gl_sin_fx(angle)), hw);
+        if (p0 >= 0) {
+            grp_setn(0 - gl_cos_fx(angle), 0 - gl_sin_fx(angle), 0);
+            grp_quad_strip(p0, p1, q0, q1);
+        }
+        p0 = q0; p1 = q1;
+        i = i + 1;
+    }
+
+    g_gear_grpn[which] = g_grp_n - g_gear_grp0[which];
+}
+
+void draw_gear_vbo(long which) {
+    long g;
+    long end;
+    g = g_gear_grp0[which];
+    end = g + g_gear_grpn[which];
+    while (g < end) {
+        glNormal3x(&g_gls, g_grp_nx[g], g_grp_ny[g], g_grp_nz[g]);
+        glDrawElements(&g_gls, g_gear_buf[which], &g_gidx[g_grp_start[g]],
+                       g_grp_count[g], g_grp_mode[g]);
+        g = g + 1;
+    }
+}
+
+long g_vbuf1;
+long g_vbuf2;
+long g_vbuf3;
+
+void build_gears_vbo() {
+    g_grp_n = 0;
+    g_gidx_n = 0;
+    g_vb_dupes = 0;
+    g_vbuf1 = glGenBuffer(&g_gls);
+    gear_vbo(0, g_vbuf1, GL_ONE, 4 * GL_ONE, GL_ONE, 20);
+    g_vbuf2 = glGenBuffer(&g_gls);
+    gear_vbo(1, g_vbuf2, GL_ONE / 2, 2 * GL_ONE, 2 * GL_ONE, 10);
+    g_vbuf3 = glGenBuffer(&g_gls);
+    gear_vbo(2, g_vbuf3, (GL_ONE * 13) / 10, 2 * GL_ONE, GL_ONE / 2, 10);
+}
+
+// draw_frame, with each glCallList replaced by its buffer.
+void draw_frame_vbo(long angle) {
+    gl_clear(&g_gl);
+    setup_projection();
+
+    glPushMatrix(&g_gls);
+    glRotatex(&g_gls, g_view_rotx, GL_ONE, 0, 0);
+    glRotatex(&g_gls, g_view_roty, 0, GL_ONE, 0);
+    glRotatex(&g_gls, g_view_rotz, 0, 0, GL_ONE);
+
+    glPushMatrix(&g_gls);
+    glTranslatex(&g_gls, 0 - 3 * GL_ONE, 0 - 2 * GL_ONE, 0);
+    glRotatex(&g_gls, angle, 0, 0, GL_ONE);
+    glMaterialx(&g_gls, GL_FRONT, GL_AMBIENT_AND_DIFFUSE,
+                (GL_ONE * 8) / 10, GL_ONE / 10, 0);
+    draw_gear_vbo(0);
+    glPopMatrix(&g_gls);
+
+    glPushMatrix(&g_gls);
+    glTranslatex(&g_gls, (31 * GL_ONE) / 10, 0 - 2 * GL_ONE, 0);
+    glRotatex(&g_gls, 0 - 2 * angle - 9 * GL_ONE, 0, 0, GL_ONE);
+    glMaterialx(&g_gls, GL_FRONT, GL_AMBIENT_AND_DIFFUSE,
+                0, (GL_ONE * 8) / 10, (GL_ONE * 2) / 10);
+    draw_gear_vbo(1);
+    glPopMatrix(&g_gls);
+
+    glPushMatrix(&g_gls);
+    glTranslatex(&g_gls, 0 - (31 * GL_ONE) / 10, (42 * GL_ONE) / 10, 0);
+    glRotatex(&g_gls, 0 - 2 * angle - 25 * GL_ONE, 0, 0, GL_ONE);
+    glMaterialx(&g_gls, GL_FRONT, GL_AMBIENT_AND_DIFFUSE,
+                (GL_ONE * 2) / 10, (GL_ONE * 2) / 10, GL_ONE);
+    draw_gear_vbo(2);
     glPopMatrix(&g_gls);
 
     glPopMatrix(&g_gls);
@@ -979,16 +1329,20 @@ long gears_pair_us(long mode) {
         draw_frame(ang);
         t1 = pm_timer_read();
 
-        // B: the same frame with one stage removed.
-        if (mode == 0) { save = g_gl.lighting; g_gl.lighting = 0; }
+        // B: the same frame with one stage removed -- or, for mode 4, the
+        // same frame drawn the other way, which is the only comparison in
+        // here where BOTH sides produce a picture and the pictures match.
+        if (mode == 4) { }
+        else if (mode == 0) { save = g_gl.lighting; g_gl.lighting = 0; }
         else if (mode == 1) { save = g_gl.wire; g_gl.wire = 1; }
         else if (mode == 2) { save = g_gl.xformonly; g_gl.xformonly = 1; }
-        else { save = g_gl.twodiv; g_gl.twodiv = 1; }
-        draw_frame(ang);
+        else if (mode == 3) { save = g_gl.twodiv; g_gl.twodiv = 1; }
+        if (mode == 4) draw_frame_vbo(ang);
+        else draw_frame(ang);
         if (mode == 0) g_gl.lighting = save;
         else if (mode == 1) g_gl.wire = save;
         else if (mode == 2) g_gl.xformonly = save;
-        else g_gl.twodiv = save;
+        else if (mode == 3) g_gl.twodiv = save;
         t2 = pm_timer_read();
 
         suma = suma + pm_timer_delta(t0, t1);
@@ -1069,6 +1423,8 @@ void frame_cost_report() {
     long dsub;
     long fa3;
     long div_d;
+    long fa4;
+    long vbo_t;
 
     draw_frame(0);
     gl_flush(&g_gl);
@@ -1108,6 +1464,8 @@ void frame_cost_report() {
     // covered fragment. B minus A is therefore one divide per fragment and
     // nothing else -- the cleanest way to price the thing without guessing.
     fa3 = gears_pair_us(3); div_d = g_ab - fa3;
+    // Display lists against vertex buffers, same picture both sides.
+    fa4 = gears_pair_us(4); vbo_t = g_ab;
     frame = fa2;
 
     // The same frame with the lighting turned off. Not a proposal to turn it
@@ -1166,8 +1524,78 @@ void frame_cost_report() {
            rest_d - fill_d);
     printf("  one divide per fragment: %d us over %d fragments\n",
            div_d, g_gl.covered);
+    printf("  display lists %d us vs vertex buffers %d us, saving %d us (%d%%)\n",
+           fa4, vbo_t, fa4 - vbo_t,
+           fa4 > 0 ? ((fa4 - vbo_t) * 100) / fa4 : 0);
     dv = list_distinct_verts(g_gear1, &dsub);
     printf("  gear 1 list: %d vertex commands, %d distinct positions\n", dsub, dv);
+}
+
+
+// ============================================================
+// 8. the same gears through vertex buffers
+// ============================================================
+void test_vbo_gears() {
+    long hash_list;
+    long hash_vbo;
+    long verts_list;
+    long verts_vbo;
+    long tris_list;
+    long tris_vbo;
+    long drawn;
+
+    puts("\n-- 8. the same gears, through vertex buffers --\n");
+
+    build_gears_vbo();
+    printf("  %d groups, %d indices, %d duplicate corners found\n",
+           g_grp_n, g_gidx_n, g_vb_dupes);
+    printf("  gear 1 buffer holds %d vertices\n", glBufferSize(g_vbuf1));
+
+    // The old way.
+    g_gls.verts = 0; g_gls.tris = 0;
+    draw_frame(0);
+    verts_list = g_gls.verts;
+    tris_list = g_gls.tris;
+    hash_list = win_hash(g_win3d, VPX, VPY, VPW, VPH);
+    drawn = win_drawn(g_win3d, VPX, VPY, VPW, VPH);
+
+    // The new way.
+    g_gls.verts = 0; g_gls.tris = 0;
+    draw_frame_vbo(0);
+    verts_vbo = g_gls.verts;
+    tris_vbo = g_gls.tris;
+    hash_vbo = win_hash(g_win3d, VPX, VPY, VPW, VPH);
+
+    expect_true("the gears are actually on screen", drawn > 5000);
+    expect_true("vertex buffers draw a BIT-IDENTICAL frame", hash_vbo == hash_list);
+    expect("...from the same number of triangles", tris_vbo, tris_list);
+    printf("  %d vertex transforms through display lists, %d through buffers\n",
+           verts_list, verts_vbo);
+    expect_true("...having transformed fewer vertices", verts_vbo < verts_list);
+
+    // Rotated, because a frame that matches in one pose can still be wrong in
+    // another -- the cache is keyed on the matrix and pose 0 is the one every
+    // buffer was first transformed under.
+    g_gls.verts = 0;
+    draw_frame(37 * GL_ONE);
+    hash_list = win_hash(g_win3d, VPX, VPY, VPW, VPH);
+    verts_list = g_gls.verts;
+    g_gls.verts = 0;
+    draw_frame_vbo(37 * GL_ONE);
+    hash_vbo = win_hash(g_win3d, VPX, VPY, VPW, VPH);
+    verts_vbo = g_gls.verts;
+    expect_true("...and still identical once the gears have turned",
+                hash_vbo == hash_list);
+    expect_true("...still transforming fewer", verts_vbo < verts_list);
+
+    // Each gear is transformed once per frame however many draw calls it
+    // takes. Three gears, so three transforms of three buffers.
+    g_buf_hit = 0; g_buf_miss = 0;
+    draw_frame_vbo(51 * GL_ONE);
+    expect("a frame transforms each of the three buffers exactly once",
+           g_buf_miss, 3);
+    expect_true("...and every other draw call reuses the cache",
+                g_buf_hit == g_grp_n - 3);
 }
 
 // After the tests, leave it running: the gears turn until the machine is
@@ -1205,6 +1633,7 @@ int main() {
 
     run_tests();
 
+    test_vbo_gears();
     if (acpi_pm_tmr) frame_cost_report();
     puts("gears running; the machine is now interactive\n");
     spin_forever();
