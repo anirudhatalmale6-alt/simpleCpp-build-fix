@@ -1365,6 +1365,23 @@ void gl_tri_raster(struct GLCtx *c, long *sx, long *sy, long *iz, long colour) {
                 // far one is done on the numerator; the z-buffer one needs the
                 // actual reciprocal, so it pays for the divide -- but only
                 // once the far test has let it through.
+                // TWO THINGS TRIED HERE AND MEASURED, NEITHER OF WHICH WORKED.
+                // Do not reach for either again without a paired measurement:
+                //
+                //   Hoisting c->zbuf, c->pix, c->depth and the pixel counter
+                //   into locals for the whole triangle. nano_cc keeps nothing
+                //   in a register across a statement, so each of those is a
+                //   load per fragment and this looked certain to pay. Output
+                //   was bit-identical -- 70635 pixels either way -- and the
+                //   fill did not move out of its 5500-6900 us noise band.
+                //
+                //   The divide below. c->twodiv times one EXTRA divide per
+                //   fragment on the same operands, so the delta is a divide
+                //   and nothing else: 327-584 us over 27513 fragments, which
+                //   is 12-20 ns each and under a tenth of the fill.
+                //
+                // The fill runs at about 200 ns per fragment and where that
+                // time actually goes is still open.
                 if (nn >= farnum) {
                     long d;
                     // Larger 1/z is nearer, so a fragment beyond the far plane
