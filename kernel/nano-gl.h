@@ -463,6 +463,28 @@ struct GLCtx {
     long steps;            // inner-loop iterations actually executed
     long covered;          // of those, the ones actually inside a triangle
 
+    // Vertices pushed through m4_apply. Three per triangle today, whether or
+    // not the triangle survives and whether or not the vertex was already
+    // transformed a moment ago for its neighbour -- which is the whole
+    // question transform caching asks, so it needs a number.
+    long xforms;
+
+    // Stop each triangle immediately after the backface decision. Draws
+    // nothing; exists so a frame's transform-and-cull stage can be timed on
+    // its own instead of inferred from the difference between two frames that
+    // both draw. Never set outside a measurement.
+    long xformonly;
+
+    // Measurement instrument, off by default. Performs ONE EXTRA divide per
+    // covered fragment, on the same operands, and sinks the result so nothing
+    // can discard it. The frame-time delta between off and on is the cost of
+    // one 64-bit divide per fragment -- measured, rather than reasoned about
+    // from "a divide is slow", which under a TCG qemu means a helper call and
+    // not an instruction. The picture is IDENTICAL either way, so the delta is
+    // the divide and nothing else.
+    long twodiv;
+    long divsink;
+
     // Draw through the old walking rasteriser instead of the span one. Only
     // has an effect where GL_RASTER_REF was defined; it exists so a test can
     // render the same scene both ways and compare the buffers.
@@ -554,6 +576,8 @@ void gl_defaults(struct GLCtx *c, long w) {
     // came from the window manager and holds whatever was there before.
     c->cx0 = 0; c->cy0 = 0; c->cx1 = c->vw - 1; c->cy1 = c->vh - 1;
     c->boxpix = 0; c->steps = 0; c->covered = 0;
+    c->xforms = 0; c->xformonly = 0;
+    c->twodiv = 0; c->divsink = 0;
     c->clearpix = 0;
     c->refraster = 0;
     c->clearall = 0;
@@ -697,7 +721,7 @@ void gl_clear(struct GLCtx *c) {
     long j;
 
     c->tris_in = 0; c->tris_culled = 0; c->tris_clipped = 0; c->tris_drawn = 0;
-    c->boxpix = 0; c->steps = 0; c->covered = 0;
+    c->boxpix = 0; c->steps = 0; c->covered = 0; c->xforms = 0;
     c->clearpix = 0;
 
     if (c->clearall) {
@@ -1348,6 +1372,7 @@ void gl_tri_raster(struct GLCtx *c, long *sx, long *sy, long *iz, long colour) {
                     // depth test, so that coplanar surfaces drawn later do not
                     // fight for the same pixel.
                     d = nn / area;
+                    if (c->twodiv) c->divsink = c->divsink + (nn / area);
                     if (!c->depth || d > c->zbuf[idx]) {
                         c->zbuf[idx] = d;
                         if (textured) {
@@ -1518,6 +1543,8 @@ void gl_tri_view(struct GLCtx *c, struct V3 *a, struct V3 *b, struct V3 *v, long
         if (c->frontcw) f = 0 - f;
         if (f <= 0) { c->tris_culled = c->tris_culled + 1; return; }
     }
+
+    if (c->xformonly) return;      // measurement only; see GLCtx.xformonly
 
     // Cull with the geometric normal always -- which way a triangle faces is a
     // property of its winding, not of whatever normal the caller supplied.
@@ -1720,6 +1747,7 @@ void gl_tri(struct GLCtx *c, struct M4 *mv, struct V3 *a, struct V3 *b,
     m4_apply(&ta, mv, a);
     m4_apply(&tb, mv, b);
     m4_apply(&tc, mv, v);
+    c->xforms = c->xforms + 3;
     gl_tri_view(c, &ta, &tb, &tc, base);
 }
 

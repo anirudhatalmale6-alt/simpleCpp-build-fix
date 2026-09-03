@@ -927,11 +927,125 @@ long gears_time_us(long what) {
             g_gl.dx1 = g_dx1; g_gl.dy1 = g_dy1;
             gl_flush(&g_gl); wm_present();
         }
+        else if (what == 4) {
+            // Transform and cull only: every triangle goes through m4_apply
+            // three times and through the view-space backface test, and then
+            // stops. What is left out is projection, clipping, the raster
+            // setup and the fill.
+            long save;
+            save = g_gl.xformonly;
+            g_gl.xformonly = 1;
+            draw_frame(r * 2 * GL_ONE);
+            g_gl.xformonly = save;
+        }
         else { draw_frame(r * 2 * GL_ONE); gl_flush(&g_gl); wm_present(); }
         r = r + 1;
     }
     b = pm_timer_read();
     return ((pm_timer_delta(a, b) * 1000000) / PM_TMR_HZ) / GEARS_ROUNDS;
+}
+
+// Every interesting number in this report is a DIFFERENCE -- lit minus unlit
+// is the lighting, solid minus wireframe is the fill -- and a difference of
+// two separately-timed runs inherits the drift of both. Under a TCG qemu on a
+// loaded host, draw_frame alone came back at 11012, 11824, 11961 and 13699 us
+// on four runs of identical code. Subtract two of those and a 400 us stage
+// can read anywhere from -1300 to +2700; that is how "lighting" managed to
+// measure MINUS 140 us on one run and 1499 on another.
+//
+// So the two variants are interleaved INSIDE one loop, timed separately round
+// by round. Whatever the host is doing at round 19 is done to both of them,
+// and the difference survives it. g_ab is the second total; the return value
+// is the first.
+long g_ab;
+
+long gears_pair_us(long mode) {
+    long r;
+    long t0;
+    long t1;
+    long t2;
+    long suma;
+    long sumb;
+    long save;
+
+    suma = 0; sumb = 0;
+    r = 0;
+    while (r < GEARS_ROUNDS) {
+        long ang;
+        ang = r * 2 * GL_ONE;
+
+        // A: the frame as it is actually drawn.
+        t0 = pm_timer_read();
+        draw_frame(ang);
+        t1 = pm_timer_read();
+
+        // B: the same frame with one stage removed.
+        if (mode == 0) { save = g_gl.lighting; g_gl.lighting = 0; }
+        else if (mode == 1) { save = g_gl.wire; g_gl.wire = 1; }
+        else if (mode == 2) { save = g_gl.xformonly; g_gl.xformonly = 1; }
+        else { save = g_gl.twodiv; g_gl.twodiv = 1; }
+        draw_frame(ang);
+        if (mode == 0) g_gl.lighting = save;
+        else if (mode == 1) g_gl.wire = save;
+        else if (mode == 2) g_gl.xformonly = save;
+        else g_gl.twodiv = save;
+        t2 = pm_timer_read();
+
+        suma = suma + pm_timer_delta(t0, t1);
+        sumb = sumb + pm_timer_delta(t1, t2);
+        r = r + 1;
+    }
+    g_ab = ((sumb * 1000000) / PM_TMR_HZ) / GEARS_ROUNDS;
+    return ((suma * 1000000) / PM_TMR_HZ) / GEARS_ROUNDS;
+}
+
+// How many DISTINCT model-space positions a display list holds, against how
+// many GLC_VERTEX commands it replays. That ratio is the hard ceiling on what
+// caching a transformed vertex can save: a vertex submitted once cannot be
+// transformed fewer than once, no matter how the cache is built.
+//
+// O(n^2) and it runs once at start-up, which is the right trade for a number
+// that decides whether a milestone is worth doing.
+long g_vx[GL_LISTCAP];
+long g_vy[GL_LISTCAP];
+long g_vz[GL_LISTCAP];
+
+long list_distinct_verts(long list, long *submitted) {
+    long i;
+    long base;
+    long n;
+    long distinct;
+    long subs;
+
+    base = (list - 1) * GL_LISTCAP;
+    n = glListSize(list);
+    distinct = 0;
+    subs = 0;
+    i = 0;
+    while (i < n) {
+        if (g_list_op[base + i] == GLC_VERTEX) {
+            long k;
+            long seen;
+            subs = subs + 1;
+            seen = 0;
+            k = 0;
+            while (k < distinct) {
+                if (g_vx[k] == g_list_a[base + i] &&
+                    g_vy[k] == g_list_b[base + i] &&
+                    g_vz[k] == g_list_c[base + i]) { seen = 1; k = distinct; }
+                k = k + 1;
+            }
+            if (!seen) {
+                g_vx[distinct] = g_list_a[base + i];
+                g_vy[distinct] = g_list_b[base + i];
+                g_vz[distinct] = g_list_c[base + i];
+                distinct = distinct + 1;
+            }
+        }
+        i = i + 1;
+    }
+    *submitted = subs;
+    return distinct;
 }
 
 void frame_cost_report() {
@@ -943,14 +1057,34 @@ void frame_cost_report() {
     long wire;
     long px;
     long scene;
+    long xform;
+    long xf;
+    long lit_d;
+    long fill_d;
+    long rest_d;
+    long fa0;
+    long fa1;
+    long fa2;
+    long dv;
+    long dsub;
+    long fa3;
+    long div_d;
 
     draw_frame(0);
     gl_flush(&g_gl);
     wm_present();
 
     px = g_gl.pixels;
+    g_gls.verts = 0;
     draw_frame(0);
     px = g_gl.pixels - px;
+    // The transform count that matters is the glapi one, not gl_tri's. A quad
+    // strip already carries transformed vertices forward in vbuf, so a vertex
+    // shared by two triangles of the same strip is transformed ONCE -- the
+    // three-per-triangle figure only applies to the low-level gl_tri entry
+    // point, which gears does not use. What is left to save is the vertices
+    // that appear in more than one primitive.
+    xf = g_gls.verts;
 
     // draw_frame clears and then draws, so both boxes are live right here:
     // the dirt this frame left for the NEXT clear to undo, and the damage it
@@ -960,9 +1094,21 @@ void frame_cost_report() {
     g_dx0 = g_gl.dx0; g_dy0 = g_gl.dy0; g_dx1 = g_gl.dx1; g_dy1 = g_gl.dy1;
 
     clear = gears_time_us(1);
-    frame = gears_time_us(0);
     flip  = gears_time_us(2);
     whole = gears_time_us(3);
+
+    // Each of these three runs both variants round by round, so `frame` comes
+    // back three times over from three separate paired runs. Keeping the last
+    // one and reporting each difference against the `frame` measured IN THE
+    // SAME loop is the point -- pairing across loops would put the drift back.
+    fa0 = gears_pair_us(0); unlit = g_ab;   lit_d  = fa0 - unlit;
+    fa1 = gears_pair_us(1); wire  = g_ab;   fill_d = fa1 - wire;
+    fa2 = gears_pair_us(2); xform = g_ab;   rest_d = fa2 - xform;
+    // Mode 3 draws the SAME picture twice, once with an extra divide per
+    // covered fragment. B minus A is therefore one divide per fragment and
+    // nothing else -- the cleanest way to price the thing without guessing.
+    fa3 = gears_pair_us(3); div_d = g_ab - fa3;
+    frame = fa2;
 
     // The same frame with the lighting turned off. Not a proposal to turn it
     // off -- it is what makes a gear look like a gear -- but a measurement of
@@ -1010,10 +1156,18 @@ void frame_cost_report() {
     if (g_gl.tris_drawn > 0)
         printf("  which is %d us per drawn triangle, covering %d pixels each\n",
                whole / g_gl.tris_drawn, g_gl.covered / g_gl.tris_drawn);
-    printf("  the same frame unlit: %d us, so lighting is %d us of it\n",
-           unlit, frame - unlit);
-    printf("  the same frame in wireframe: %d us, so the fill is about %d us\n",
-           wire, frame - wire);
+    // Each stage against the frame it was interleaved with, not against a
+    // frame timed in a different loop. See gears_pair_us.
+    printf("  lighting        %d us  (frame %d, unlit %d)\n", lit_d, fa0, unlit);
+    printf("  the fill        %d us  (frame %d, wireframe %d)\n", fill_d, fa1, wire);
+    printf("  transform+cull  %d us  over %d vertex transforms submitted\n",
+           xform, xf);
+    printf("  everything else %d us  (project, clip, raster setup, lines)\n",
+           rest_d - fill_d);
+    printf("  one divide per fragment: %d us over %d fragments\n",
+           div_d, g_gl.covered);
+    dv = list_distinct_verts(g_gear1, &dsub);
+    printf("  gear 1 list: %d vertex commands, %d distinct positions\n", dsub, dv);
 }
 
 // After the tests, leave it running: the gears turn until the machine is
