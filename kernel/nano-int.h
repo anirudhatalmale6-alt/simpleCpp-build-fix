@@ -139,13 +139,65 @@ void pit_init(long hz) {
 // A ring buffer, filled by the IRQ and drained by whoever is reading. The
 // polling version could only ever be doing one thing at a time; this one lets
 // the CPU sleep between keys.
+// KEY CODES ABOVE ASCII, for the keys that are not characters.
+//
+// Arrows, Home, End, Delete and the rest arrive from the i8042 as a 0xE0
+// PREFIX byte followed by a scancode. The handler below used to ignore the
+// prefix entirely and look the second byte up in the ASCII table, which has
+// no entry for any of those scancodes -- so every one of them mapped to 0 and
+// was DROPPED. Pressing an arrow did nothing at all, silently.
+//
+// Checked rather than assumed: g_keymap has no entry for 0x47, 0x48, 0x4B,
+// 0x4D, 0x50 or 0x51, and with the prefix handling sabotaged the editor
+// appends at the caret instead of moving it. I had first written here that
+// the second byte collided with a letter and typed one; that is the more
+// interesting story and it is not what happens.
+//
+// Nobody noticed because the old text widget could only append and
+// backspace: there was no cursor to move, so nobody ever pressed an arrow.
+//
+// These live above 255 so that no byte value can collide with them, and the
+// ring is `long` rather than `char` for the same reason -- a code above 127
+// in a signed char comes back NEGATIVE, which is the same family of bug as
+// the unsigned-is-ignored one in the ATA sector count.
+#define KEY_UP     0x100
+#define KEY_DOWN   0x101
+#define KEY_LEFT   0x102
+#define KEY_RIGHT  0x103
+#define KEY_HOME   0x104
+#define KEY_END    0x105
+#define KEY_PGUP   0x106
+#define KEY_PGDN   0x107
+#define KEY_DEL    0x108
+#define KEY_INS    0x109
+
 #define KBD_RING 256
-char g_kbd_ring[KBD_RING];
+long g_kbd_ring[KBD_RING];
 long g_kbd_head;
 long g_kbd_tail;
 long g_kbd_dropped;
+// Set when the previous byte from the controller was 0xE0, so the NEXT byte
+// is read from the extended table instead of the ASCII one.
+long g_kbd_ext;
 
-void kbd_push(char c) {
+// Map an extended (0xE0-prefixed) scancode to one of the codes above.
+// Returns 0 for the ones nothing needs yet, which are then dropped rather
+// than mistaken for a letter.
+long kbd_extended(long sc) {
+    if (sc == 0x48) return KEY_UP;
+    if (sc == 0x50) return KEY_DOWN;
+    if (sc == 0x4B) return KEY_LEFT;
+    if (sc == 0x4D) return KEY_RIGHT;
+    if (sc == 0x47) return KEY_HOME;
+    if (sc == 0x4F) return KEY_END;
+    if (sc == 0x49) return KEY_PGUP;
+    if (sc == 0x51) return KEY_PGDN;
+    if (sc == 0x53) return KEY_DEL;
+    if (sc == 0x52) return KEY_INS;
+    return 0;
+}
+
+void kbd_push(long c) {
     long next;
     next = (g_kbd_head + 1) % KBD_RING;
     if (next == g_kbd_tail) { g_kbd_dropped = g_kbd_dropped + 1; return; }
@@ -320,8 +372,27 @@ long isr_dispatch(struct Regs *r) {
 #endif
 
     if (v == IRQ_BASE + 1) {                    // keyboard
-        int sc;
-        sc = inb(0x60);
+        long sc;
+        sc = inb(0x60) & 0xFF;
+        // 0xE0 is not a key. It says the NEXT byte is an extended scancode,
+        // and it must be consumed and remembered rather than looked up --
+        // 0xE0 itself indexes into the ASCII table at a letter.
+        if (sc == 0xE0) { g_kbd_ext = 1; pic_eoi(1); return (long)r; }
+
+        if (g_kbd_ext) {
+            g_kbd_ext = 0;
+            // Releases of extended keys arrive as 0xE0 followed by code|0x80.
+            // Dropping them here is what stops every arrow press producing
+            // two events.
+            if (sc < 128) {
+                long k;
+                k = kbd_extended(sc);
+                if (k) kbd_push(k);
+            }
+            pic_eoi(1);
+            return (long)r;
+        }
+
         // Shift is not a character: it is a state the next keypress reads.
         // Its release matters as much as its press, which is why the release
         // codes are checked before the "is this a press" test below.
@@ -438,20 +509,37 @@ long g_idle_wakeups;
 // The non-blocking form. An event loop that also has a mouse to service cannot
 // sit inside keyboard_getchar_irq waiting for a key, or the pointer freezes
 // whenever nobody is typing -- which is most of the time.
-char kbd_getchar_nb() {
-    char c;
+// Returns a long now, so a key above 255 survives the trip. The old
+// char-returning name is kept below for the syscall path, which only ever
+// wants printable characters.
+long kbd_getkey_nb() {
+    long c;
     if (!kbd_available()) return 0;
     c = g_kbd_ring[g_kbd_tail];
     g_kbd_tail = (g_kbd_tail + 1) % KBD_RING;
     return c;
 }
 
+char kbd_getchar_nb() {
+    long c;
+    c = kbd_getkey_nb();
+    // A process reading characters has no way to represent an arrow key, so
+    // it gets nothing rather than a truncated one that would arrive as some
+    // unrelated letter.
+    if (c > 255) return 0;
+    return c;
+}
+
 char keyboard_getchar_irq() {
     for (;;) {
         if (kbd_available()) {
-            char c;
+            long c;
             c = g_kbd_ring[g_kbd_tail];
             g_kbd_tail = (g_kbd_tail + 1) % KBD_RING;
+            // Skip the non-character keys rather than truncating them: an
+            // arrow key narrowed into a char arrives as an unrelated letter,
+            // which is exactly the bug the 0xE0 handling above fixed.
+            if (c > 255) continue;
             return c;
         }
         g_idle_wakeups = g_idle_wakeups + 1;

@@ -37,12 +37,13 @@
 
 // The number of widgets whose appearance is remembered between frames. This is
 // the ONLY retained state in the file.
-#define UI_MAXID   128
+#define UI_MAXID   256
 
 #define UI_ROW_H   20
 #define UI_PAD     4
 #define UI_BOX     12          // checkbox side, slider handle width
 #define UI_NOSTATE (0 - 1)     // "never drawn", so the first frame always draws
+#define UI_MENU_NONE (0 - 1)   // no dropdown is open
 
 struct Ui {
     long win;                  // the window being drawn into
@@ -64,6 +65,18 @@ struct Ui {
     long hot;
     long active;
     long focus;
+
+    // Which top-level menu is open, or UI_MENU_NONE. State, because a
+    // dropdown that stays open across frames is state and there is one of it.
+    long menu_open;
+    // Set when a click has been consumed by something that sits ON TOP of the
+    // normal widgets -- dismissing a dropdown must not also press the button
+    // that happened to be underneath it.
+    long swallow;
+    // Scroll position of the list box. One list per panel is enough for the
+    // editor and the file manager; a second concurrent list would need this
+    // keyed by id, and that is the moment to change it rather than now.
+    long list_top;
 
     long id;                   // auto-id counter, reset every frame
     long ox;                   // panel origin, window coordinates
@@ -173,6 +186,9 @@ void ui_begin(struct Ui *ui, long win, long x, long y, long w) {
     ui->ovwin = -1;
     ui->ovx0 = 0; ui->ovy0 = 0; ui->ovx1 = -1; ui->ovy1 = -1;
     ui_window(ui, win, x, y, w);
+    // Cleared every frame: it only ever suppresses the click that dismissed
+    // a dropdown, and only for that frame.
+    ui->swallow = 0;
 }
 
 // "Something has drawn over this rectangle of this window since the last ui
@@ -818,7 +834,602 @@ long ui_glview(struct Ui *ui, struct GlView *v, long h) {
 
 // ---------- setup ----------
 
+// ============================================================
+// a text buffer you can edit
+// ============================================================
+//
+// A flat array of bytes with newlines in it, and a caret that is an OFFSET
+// into it. Not a list of lines.
+//
+// The line-list version is the tempting one -- it makes "go to line 40" free.
+// It also makes every edit that crosses a line boundary a splice of two data
+// structures, and makes the buffer disagree with the bytes you save. A flat
+// array is what the file IS, so saving is one fs_write and loading is one
+// fs_read, and there is no second representation to drift.
+//
+// The cost is that finding line starts means scanning. That is paid once per
+// frame in ed_layout, over the visible window only, and the visible window is
+// about forty lines.
+
+#define ED_CAP    16384        // one buffer's bytes
+#define ED_MAXLN  2048         // line starts cached per layout
+
+struct Edit {
+    char *buf;                 // caller-owned, ED_CAP bytes
+    long len;                  // bytes in use, not counting the terminator
+    long caret;                // offset of the insertion point, 0..len
+    long top;                  // first visible line
+    long dirty;                // edited since the last save
+    long rows;                 // visible rows, set by the widget each frame
+    long cols;
+    // Line starts, recomputed each frame. line[i] is the offset of the first
+    // byte of line i; nlines is how many there are. Always at least one line,
+    // because an empty buffer still has a place to type.
+    long line[ED_MAXLN];
+    long nlines;
+};
+
+void ed_init(struct Edit *e, char *storage) {
+    long i;
+    e->buf = storage;
+    e->buf[0] = 0;
+    e->len = 0;
+    e->caret = 0;
+    e->top = 0;
+    e->dirty = 0;
+    e->rows = 1;
+    e->cols = 1;
+    e->nlines = 1;
+    i = 0;
+    while (i < ED_MAXLN) { e->line[i] = 0; i = i + 1; }
+}
+
+// Recompute the line table. Cheap and total, rather than incremental: an
+// incremental version has to be right about every edit that inserts or
+// removes a newline, and being wrong there means the caret lands on the wrong
+// line in a way that looks like a rendering bug.
+void ed_layout(struct Edit *e) {
+    long i;
+    long n;
+    n = 0;
+    e->line[n] = 0;
+    n = 1;
+    i = 0;
+    while (i < e->len && n < ED_MAXLN) {
+        if (e->buf[i] == '\n') { e->line[n] = i + 1; n = n + 1; }
+        i = i + 1;
+    }
+    e->nlines = n;
+}
+
+// Which line an offset falls on. Linear, because the table is small and a
+// binary search here would be the third place that has to agree about what a
+// line start means.
+long ed_line_of(struct Edit *e, long off) {
+    long i;
+    i = 0;
+    while (i + 1 < e->nlines && e->line[i + 1] <= off) i = i + 1;
+    return i;
+}
+
+long ed_line_len(struct Edit *e, long ln) {
+    long start;
+    long end;
+    if (ln < 0 || ln >= e->nlines) return 0;
+    start = e->line[ln];
+    if (ln + 1 < e->nlines) end = e->line[ln + 1] - 1;   // minus the newline
+    else end = e->len;
+    if (end < start) end = start;
+    return end - start;
+}
+
+long ed_col_of(struct Edit *e, long off) {
+    return off - e->line[ed_line_of(e, off)];
+}
+
+void ed_insert(struct Edit *e, long ch) {
+    long i;
+    if (e->len + 1 >= ED_CAP) return;
+    i = e->len;
+    while (i > e->caret) { e->buf[i] = e->buf[i - 1]; i = i - 1; }
+    e->buf[e->caret] = ch;
+    e->len = e->len + 1;
+    e->caret = e->caret + 1;
+    e->buf[e->len] = 0;
+    e->dirty = 1;
+    ed_layout(e);
+}
+
+// Delete the byte AT `at`. Backspace and Delete are the same operation on
+// different offsets, which is why there is one of these and not two.
+void ed_delete_at(struct Edit *e, long at) {
+    long i;
+    if (at < 0 || at >= e->len) return;
+    i = at;
+    while (i < e->len - 1) { e->buf[i] = e->buf[i + 1]; i = i + 1; }
+    e->len = e->len - 1;
+    e->buf[e->len] = 0;
+    if (e->caret > at) e->caret = e->caret - 1;
+    e->dirty = 1;
+    ed_layout(e);
+}
+
+// Vertical movement keeps the COLUMN, clamped to the target line's length --
+// which is what every editor does and what makes arrowing down a ragged file
+// feel right rather than snapping to column zero.
+void ed_move_vert(struct Edit *e, long delta) {
+    long ln;
+    long col;
+    long want;
+    ln = ed_line_of(e, e->caret);
+    col = e->caret - e->line[ln];
+    want = ln + delta;
+    if (want < 0) want = 0;
+    if (want >= e->nlines) want = e->nlines - 1;
+    if (col > ed_line_len(e, want)) col = ed_line_len(e, want);
+    e->caret = e->line[want] + col;
+}
+
+// Keep the caret on screen. Called after every movement rather than inside
+// each one, so there is a single place that decides what "visible" means.
+void ed_scroll_to_caret(struct Edit *e) {
+    long ln;
+    ln = ed_line_of(e, e->caret);
+    if (ln < e->top) e->top = ln;
+    if (e->rows > 0 && ln >= e->top + e->rows) e->top = ln - e->rows + 1;
+    if (e->top < 0) e->top = 0;
+}
+
+// Apply one keystroke. Returns 1 if the buffer or caret changed.
+long ed_key(struct Edit *e, long k) {
+    long before;
+    before = e->caret;
+    if (k == 0) return 0;
+
+    if (k == KEY_LEFT)  { if (e->caret > 0) e->caret = e->caret - 1; }
+    else if (k == KEY_RIGHT) { if (e->caret < e->len) e->caret = e->caret + 1; }
+    else if (k == KEY_UP)    ed_move_vert(e, 0 - 1);
+    else if (k == KEY_DOWN)  ed_move_vert(e, 1);
+    else if (k == KEY_PGUP)  ed_move_vert(e, 0 - e->rows);
+    else if (k == KEY_PGDN)  ed_move_vert(e, e->rows);
+    else if (k == KEY_HOME)  e->caret = e->line[ed_line_of(e, e->caret)];
+    else if (k == KEY_END) {
+        long ln;
+        ln = ed_line_of(e, e->caret);
+        e->caret = e->line[ln] + ed_line_len(e, ln);
+    }
+    else if (k == KEY_DEL)   { ed_delete_at(e, e->caret); ed_scroll_to_caret(e); return 1; }
+    else if (k == '\b')      { if (e->caret > 0) { ed_delete_at(e, e->caret - 1); ed_scroll_to_caret(e); return 1; } }
+    else if (k == '\n' || k == '\r') { ed_insert(e, '\n'); ed_scroll_to_caret(e); return 1; }
+    else if (k == '\t')      { ed_insert(e, ' '); ed_insert(e, ' '); ed_scroll_to_caret(e); return 1; }
+    else if (k >= 32 && k <= 126) { ed_insert(e, k); ed_scroll_to_caret(e); return 1; }
+    else return 0;
+
+    ed_scroll_to_caret(e);
+    return e->caret != before;
+}
+
+// The editing area. Returns 1 if this frame changed the buffer or the caret.
+//
+// The state hash is the whole reason this is cheap: it folds the caret, the
+// scroll position, the length and a hash of the VISIBLE text, so a frame in
+// which nothing moved repaints nothing -- the same rule as every other widget
+// here, and the reason an idle editor costs no pixels.
+long ui_edit(struct Ui *ui, struct Edit *e, long h) {
+    long id;
+    long w;
+    long hot;
+    long focused;
+    long changed;
+    long hash;
+    long i;
+    long r;
+
+    id = ui_next_id(ui);
+    w = ui_slot(ui);
+    hot = ui_hit(ui, ui->x, ui->y, w, h);
+    changed = 0;
+
+    if (hot) ui->hot = id;
+    if (ui->mpressed) {
+        if (hot && ui->active < 0) { ui->focus = id; ui->active = id; }
+        else if (!hot && ui->focus == id) ui->focus = -1;
+    }
+    focused = (ui->focus == id);
+
+    e->rows = (h - 4) / FONT_H;
+    e->cols = (w - 6) / FONT_W;
+    if (e->rows < 1) e->rows = 1;
+    if (e->cols < 1) e->cols = 1;
+
+    // Clicking inside puts the caret where the click was, which is the one
+    // piece of mouse editing worth having before selection exists.
+    if (hot && ui->mpressed) {
+        long row;
+        long col;
+        long ln;
+        row = (ui->my - ui->y - 2) / FONT_H;
+        col = (ui->mx - ui->x - 3) / FONT_W;
+        if (row < 0) row = 0;
+        if (col < 0) col = 0;
+        ln = e->top + row;
+        if (ln >= e->nlines) ln = e->nlines - 1;
+        if (col > ed_line_len(e, ln)) col = ed_line_len(e, ln);
+        e->caret = e->line[ln] + col;
+        changed = 1;
+    }
+
+    if (focused && ui->key) {
+        if (ed_key(e, ui->key)) changed = 1;
+    }
+
+    hash = 5381;
+    hash = ((hash * 33) + e->caret) & 0xFFFFFFF;
+    hash = ((hash * 33) + e->top) & 0xFFFFFFF;
+    hash = ((hash * 33) + e->len) & 0xFFFFFFF;
+    r = 0;
+    while (r < e->rows && e->top + r < e->nlines) {
+        long ln;
+        long st;
+        long n;
+        ln = e->top + r;
+        st = e->line[ln];
+        n = ed_line_len(e, ln);
+        if (n > e->cols) n = e->cols;
+        i = 0;
+        while (i < n) { hash = ((hash * 33) + (e->buf[st + i] & 255)) & 0xFFFFFFF; i = i + 1; }
+        r = r + 1;
+    }
+
+    if (ui_paint(ui, id, (hash << 2) + (focused ? 2 : 0))) {
+        wm_win_fill(ui->win, ui->x, ui->y, w, h, rgb(255, 255, 255));
+        wm_win_frame(ui->win, ui->x, ui->y, w, h,
+                     focused ? ui->accent : ui->edge);
+        r = 0;
+        while (r < e->rows && e->top + r < e->nlines) {
+            long ln;
+            long st;
+            long n;
+            char save;
+            ln = e->top + r;
+            st = e->line[ln];
+            n = ed_line_len(e, ln);
+            if (n > e->cols) n = e->cols;
+            // Draw the line by terminating it in place and putting the byte
+            // back. The buffer is one array with no per-line terminators, so
+            // there is nothing else to hand a string-drawing call -- and
+            // copying each line into a scratch buffer would be a second copy
+            // of the text that can disagree with the first.
+            save = e->buf[st + n];
+            e->buf[st + n] = 0;
+            ui_text_clip(ui, ui->x + 3, ui->y + 2 + r * FONT_H - (UI_ROW_H - FONT_H) / 2,
+                         UI_ROW_H, e->buf + st, w - 6);
+            e->buf[st + n] = save;
+            r = r + 1;
+        }
+        if (focused) {
+            long cl;
+            long cc;
+            cl = ed_line_of(e, e->caret);
+            cc = e->caret - e->line[cl];
+            if (cc > e->cols) cc = e->cols;
+            if (cl >= e->top && cl < e->top + e->rows)
+                wm_win_fill(ui->win, ui->x + 3 + cc * FONT_W,
+                            ui->y + 2 + (cl - e->top) * FONT_H, 1, FONT_H, ui->fg);
+        }
+    }
+    ui_advance_h(ui, w, h);
+    return changed;
+}
+
+// ============================================================
+// a menu bar
+// ============================================================
+//
+// NO FUNCTION POINTERS, so a menu cannot be a list of callbacks. It is a
+// table of strings plus a table saying which menu each item belongs to, and
+// the widget returns the index of whatever was chosen. The caller switches on
+// it -- the same shape as the display-list opcodes and the syscall
+// dispatcher, for the same reason.
+//
+// The open menu is remembered in the Ui rather than by the caller, because a
+// dropdown that is open across frames is state and there is exactly one of it.
+
+// Returns the chosen item index, or -1. `tops` are the bar labels, `items`
+// the entries, `owner[i]` the bar index item i belongs to.
+long ui_menubar(struct Ui *ui, char **tops, long ntops,
+                char **items, long *owner, long nitems) {
+    long i;
+    long x;
+    long chosen;
+    long id;
+    long barh;
+
+    chosen = UI_MENU_NONE;
+    barh = UI_ROW_H;
+    id = ui_next_id(ui);
+
+    // The bar itself.
+    x = ui->ox;
+    i = 0;
+    while (i < ntops) {
+        long tw;
+        long hot;
+        tw = (ui_strlen(tops[i]) + 2) * FONT_W;
+        hot = ui_hit(ui, x, ui->y, tw, barh);
+        if (hot && ui->mpressed) {
+            // Clicking the open menu's own title closes it. Without this the
+            // only way to dismiss a menu is to pick something from it.
+            if (ui->menu_open == i) ui->menu_open = UI_MENU_NONE;
+            else ui->menu_open = i;
+        }
+        if (ui_paint(ui, id + i, (ui->menu_open == i ? 2 : 0) + (hot ? 1 : 0))) {
+            wm_win_fill(ui->win, x, ui->y, tw, barh,
+                        ui->menu_open == i ? ui->accent : ui->bg);
+            wm_win_text(ui->win, x + FONT_W, ui->y + (barh - FONT_H) / 2,
+                        tops[i], ui->menu_open == i ? rgb(255,255,255) : ui->fg);
+        }
+        x = x + tw;
+        i = i + 1;
+    }
+
+    // The open dropdown, drawn UNDER the bar and over whatever is beneath it.
+    if (ui->menu_open != UI_MENU_NONE) {
+        long dy;
+        long dw;
+        long n;
+        long ox;
+        // Where this menu's title starts, so the dropdown lines up with it.
+        ox = ui->ox;
+        i = 0;
+        while (i < ui->menu_open) { ox = ox + (ui_strlen(tops[i]) + 2) * FONT_W; i = i + 1; }
+
+        dw = 0;
+        n = 0;
+        i = 0;
+        while (i < nitems) {
+            if (owner[i] == ui->menu_open) {
+                long tw;
+                tw = (ui_strlen(items[i]) + 3) * FONT_W;
+                if (tw > dw) dw = tw;
+                n = n + 1;
+            }
+            i = i + 1;
+        }
+
+        dy = ui->y + barh;
+        // The panel is repainted every frame it is open. It sits on top of
+        // other widgets, so it cannot use the skip-if-unchanged path: the
+        // thing underneath does not know it is covered, and the first frame
+        // after it closes is the only chance anyone has to repaint it.
+        wm_win_fill(ui->win, ox, dy, dw, n * UI_ROW_H, ui->bg);
+        wm_win_frame(ui->win, ox, dy, dw, n * UI_ROW_H, ui->edge);
+        wm_invalidate(ui->win, ox, dy, dw, n * UI_ROW_H);
+
+        {
+            long row;
+            row = 0;
+            i = 0;
+            while (i < nitems) {
+                if (owner[i] == ui->menu_open) {
+                    long iy;
+                    long hot;
+                    iy = dy + row * UI_ROW_H;
+                    hot = ui_hit(ui, ox, iy, dw, UI_ROW_H);
+                    if (hot) {
+                        wm_win_fill(ui->win, ox + 1, iy + 1, dw - 2, UI_ROW_H - 2,
+                                    ui->accent);
+                    }
+                    wm_win_text(ui->win, ox + FONT_W, iy + (UI_ROW_H - FONT_H) / 2,
+                                items[i], hot ? rgb(255,255,255) : ui->fg);
+                    if (hot && ui->mpressed) {
+                        chosen = i;
+                        ui->menu_open = UI_MENU_NONE;
+                        // The click is spent. Widgets drawn after this one
+                        // must not also see it, or choosing "Open" from a
+                        // menu that overlaps a button presses the button too.
+                        ui->swallow = 1;
+                    }
+                    row = row + 1;
+                }
+                i = i + 1;
+            }
+        }
+
+        // A click anywhere else closes it, and must NOT also reach the widget
+        // underneath -- otherwise dismissing a menu presses whatever happened
+        // to be behind it.
+        if (ui->mpressed && chosen == UI_MENU_NONE) {
+            if (!ui_hit(ui, ox, dy, dw, n * UI_ROW_H) &&
+                !ui_hit(ui, ui->ox, ui->y, ui->pw, barh)) {
+                ui->menu_open = UI_MENU_NONE;
+                ui->swallow = 1;
+            }
+        }
+        // One place, at the end, rather than at each of the two sites that
+        // set it -- so there is no path that sets swallow and forgets.
+        if (ui->swallow) ui->mpressed = 0;
+    }
+
+    ui->id = id + ntops;
+    ui_advance_h(ui, ui->pw, barh);
+    return chosen;
+}
+
+// ============================================================
+// a list box
+// ============================================================
+//
+// This IS the open/save dialog. Give it a block of names and it shows them,
+// scrolls them and returns the index of the one clicked, or -1.
+//
+// Names come as one flat char array of NUL-terminated strings plus a count,
+// rather than an array of pointers, because that is the shape fs_readdir
+// fills and converting between the two is a copy that can go stale.
+
+long ui_list_name_at(char *names, long i) {
+    long off;
+    long n;
+    off = 0;
+    n = 0;
+    while (n < i) {
+        while (names[off]) off = off + 1;
+        off = off + 1;
+        n = n + 1;
+    }
+    return off;
+}
+
+// `sel` is in/out: the highlighted row. Returns the index ACTIVATED by a
+// click, or -1. Highlighting and activating are different events -- arrowing
+// through a list must not open every file it passes over.
+long ui_list(struct Ui *ui, char *names, long count, long *sel, long h) {
+    long id;
+    long w;
+    long hot;
+    long focused;
+    long rows;
+    long i;
+    long hash;
+    long activated;
+
+    id = ui_next_id(ui);
+    w = ui_slot(ui);
+    hot = ui_hit(ui, ui->x, ui->y, w, h);
+    activated = 0 - 1;
+    rows = (h - 4) / UI_ROW_H;
+    if (rows < 1) rows = 1;
+
+    if (hot) ui->hot = id;
+    if (ui->mpressed) {
+        if (hot && ui->active < 0) { ui->focus = id; ui->active = id; }
+        else if (!hot && ui->focus == id) ui->focus = -1;
+    }
+    focused = (ui->focus == id);
+
+    if (*sel < 0) *sel = 0;
+    if (*sel >= count) *sel = count - 1;
+
+    // Scroll so the selection is visible, using the same rule as the editor.
+    if (*sel < ui->list_top) ui->list_top = *sel;
+    if (*sel >= ui->list_top + rows) ui->list_top = *sel - rows + 1;
+    if (ui->list_top < 0) ui->list_top = 0;
+
+    if (focused && ui->key) {
+        if (ui->key == KEY_UP && *sel > 0) *sel = *sel - 1;
+        else if (ui->key == KEY_DOWN && *sel < count - 1) *sel = *sel + 1;
+        else if (ui->key == KEY_HOME) *sel = 0;
+        else if (ui->key == KEY_END) *sel = count - 1;
+        else if (ui->key == '\n' || ui->key == '\r') activated = *sel;
+        if (*sel < ui->list_top) ui->list_top = *sel;
+        if (*sel >= ui->list_top + rows) ui->list_top = *sel - rows + 1;
+    }
+
+    if (hot && ui->mpressed) {
+        long row;
+        row = (ui->my - ui->y - 2) / UI_ROW_H;
+        if (row >= 0 && ui->list_top + row < count) {
+            *sel = ui->list_top + row;
+            activated = *sel;
+        }
+    }
+
+    hash = 5381;
+    hash = ((hash * 33) + *sel) & 0xFFFFFFF;
+    hash = ((hash * 33) + ui->list_top) & 0xFFFFFFF;
+    hash = ((hash * 33) + count) & 0xFFFFFFF;
+    i = 0;
+    while (i < count) {
+        long off;
+        off = ui_list_name_at(names, i);
+        while (names[off]) { hash = ((hash * 33) + (names[off] & 255)) & 0xFFFFFFF; off = off + 1; }
+        i = i + 1;
+    }
+
+    if (ui_paint(ui, id, (hash << 2) + (focused ? 2 : 0))) {
+        wm_win_fill(ui->win, ui->x, ui->y, w, h, rgb(255, 255, 255));
+        wm_win_frame(ui->win, ui->x, ui->y, w, h, focused ? ui->accent : ui->edge);
+        i = 0;
+        while (i < rows && ui->list_top + i < count) {
+            long idx;
+            long iy;
+            long off;
+            idx = ui->list_top + i;
+            iy = ui->y + 2 + i * UI_ROW_H;
+            off = ui_list_name_at(names, idx);
+            if (idx == *sel)
+                wm_win_fill(ui->win, ui->x + 1, iy, w - 2, UI_ROW_H, ui->accent);
+            ui_text_clip(ui, ui->x + 3, iy, UI_ROW_H, names + off, w - 6);
+            i = i + 1;
+        }
+    }
+    ui_advance_h(ui, w, h);
+    return activated;
+}
+
+// ============================================================
+// a tab strip
+// ============================================================
+//
+// Returns the tab clicked, or -1. The close boxes return their tab index
+// NEGATED minus two, so one return value carries both events without an
+// out-parameter -- -2 is "close tab 0", -3 is "close tab 1". Ugly but it
+// keeps the call site to one switch, and nano_cc has no out-parameters worth
+// the name.
+
+#define UI_TAB_CLOSE(i) (0 - 2 - (i))
+
+long ui_tabs(struct Ui *ui, char *names, long count, long active) {
+    long id;
+    long x;
+    long i;
+    long result;
+    long h;
+
+    id = ui_next_id(ui);
+    result = 0 - 1;
+    h = UI_ROW_H;
+    x = ui->x;
+
+    i = 0;
+    while (i < count) {
+        long off;
+        long tw;
+        long hot;
+        long cx;
+        off = ui_list_name_at(names, i);
+        tw = (ui_strlen(names + off) + 4) * FONT_W;
+        hot = ui_hit(ui, x, ui->y, tw, h);
+        cx = x + tw - FONT_W - 2;
+
+        if (hot && ui->mpressed) {
+            // The close box is a hit test inside a hit test, and it has to be
+            // checked FIRST or clicking the x just switches to the tab.
+            if (ui->mx >= cx && ui->mx < cx + FONT_W) result = UI_TAB_CLOSE(i);
+            else result = i;
+        }
+
+        if (ui_paint(ui, id + i, (i == active ? 4 : 0) + (hot ? 2 : 0) +
+                                  (ui_strlen(names + off) & 1))) {
+            wm_win_fill(ui->win, x, ui->y, tw, h,
+                        i == active ? rgb(255, 255, 255) : ui->bg);
+            wm_win_frame(ui->win, x, ui->y, tw, h, ui->edge);
+            ui_text_clip(ui, x + FONT_W, ui->y, h, names + off, tw - 2 * FONT_W);
+            wm_win_text(ui->win, cx, ui->y + (h - FONT_H) / 2, "x", ui->edge);
+        }
+        x = x + tw;
+        i = i + 1;
+    }
+
+    ui->id = id + count;
+    ui_advance_h(ui, ui->pw, h);
+    return result;
+}
+
 void ui_init(struct Ui *ui) {
+    ui->menu_open = UI_MENU_NONE;
+    ui->swallow = 0;
+    ui->list_top = 0;
     ui->always = 0;
     ui->skipped = 0;
     ui->ovwin = -1;

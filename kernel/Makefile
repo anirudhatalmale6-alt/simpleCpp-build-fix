@@ -712,6 +712,62 @@ srvtest: srv.elf
 # fsdisk -- the filesystem on a real ATA disk. Built like every other image,
 # but it is the only one that needs a DRIVE attached, and the only one whose
 # result depends on what a previous run left behind.
+# edit -- the text editor. Needs a DRIVE, like fsdisk, because saving to a
+# disk that outlives the machine is the point of it.
+edit.s: edit.c nano-kernel.h nano-fb.h nano-mouse.h nano-int.h nano-mm.h \
+        nano-thread.h nano-ata.h nano-fs.h nano-wm.h nano-wmin.h nano-term.h \
+        nano-ui.h $(NANO)
+	$(NANO) --kernel edit.c edit.s
+
+edit64.bin: boot64.s isr.s edit.s kernel64.ld
+	as --64 boot64.s -o boot64.o
+	as --64 isr.s    -o isr.o
+	as --64 edit.s   -o edit.o
+	ld -T kernel64.ld -o edit64.elf boot64.o isr.o edit.o
+	objcopy -O binary edit64.elf edit64.bin
+
+blob-edit.s:
+	@printf '.section .blob, "a"\n.incbin "edit64.bin"\n' > $@
+
+edit.elf: boot32.s blob-edit.s edit64.bin final.ld
+	as --32 boot32.s    -o boot32.o
+	as --32 blob-edit.s -o blob-edit.o
+	ld -m elf_i386 -T final.ld -o edit.elf boot32.o blob-edit.o
+
+edit: edit.elf
+
+edit-disk.img:
+	dd if=/dev/zero of=edit-disk.img bs=1M count=8 2>/dev/null
+
+editrun: edit.elf edit-disk.img
+	$(QEMU) -kernel edit.elf -no-reboot \
+	  -drive file=edit-disk.img,format=raw,if=ide
+
+# Two boots on one drive: the first types and saves keep.txt, the second has
+# to load it back. Only the second run proves anything, and the SEQUENCE is
+# asserted here because the image cannot know which boot it is -- it has
+# nothing to know it with except the disk, which is the thing under test.
+edittest: edit.elf
+	@rm -f edit-disk.img edit-boot1.log edit-boot2.log
+	@dd if=/dev/zero of=edit-disk.img bs=1M count=8 2>/dev/null
+	@echo "--- boot 1: blank drive, types and saves"
+	@timeout 220 $(QEMU) -kernel edit.elf -no-reboot -display none \
+	   -serial file:edit-boot1.log \
+	   -drive file=edit-disk.img,format=raw,if=ide >/dev/null 2>&1; true
+	@echo "--- boot 2: same drive, must load it back"
+	@timeout 220 $(QEMU) -kernel edit.elf -no-reboot -display none \
+	   -serial file:edit-boot2.log \
+	   -drive file=edit-disk.img,format=raw,if=ide >/dev/null 2>&1; true
+	@tr -d '\r' < edit-boot1.log
+	@tr -d '\r' < edit-boot2.log
+	@fail=0; \
+	grep -q "FIRST BOOT" edit-boot1.log || { echo "FAIL: boot 1 did not start from a blank drive"; fail=1; }; \
+	grep -q "LATER BOOT" edit-boot2.log || { echo "FAIL: boot 2 did not find keep.txt -- nothing survived"; fail=1; }; \
+	grep -q "CHECKS FAILED" edit-boot1.log && { echo "FAIL: boot 1 had failures"; fail=1; }; \
+	grep -q "CHECKS FAILED" edit-boot2.log && { echo "FAIL: boot 2 had failures"; fail=1; }; \
+	if [ $$fail -eq 0 ]; then echo "PASS: typed, saved, rebooted, loaded back"; \
+	else echo "EDIT SEQUENCE FAILED"; exit 1; fi
+
 fsdisk.s: fsdisk.c nano-kernel.h nano-mm.h nano-thread.h nano-int.h nano-fs.h nano-ata.h $(NANO)
 	$(NANO) --kernel fsdisk.c fsdisk.s
 
@@ -858,9 +914,10 @@ user/%.elf: user/%.c user/nano-user.h user/ustart.o user/user.ld $(NANO)
 # kernel image it has to be embedded in.
 user/cc.elf: ../simpleC++.c ../nano-libc.h user/os-base.h user/ustart.o user/user.ld $(NANO)
 	@mkdir -p user/ccbuild
-	@awk '/^#include <(stdio|stdlib|string|ctype|stdarg)\.h>$$/ { next } \
+	@{ echo '#define NANO_CC_INOS 1'; \
+	   awk '/^#include <(stdio|stdlib|string|ctype|stdarg)\.h>$$/ { next } \
 	      /^static FILE \*fout;$$/ && !done { print "#include \"nano-libc.h\""; done=1 } \
-	      { print }' ../simpleC++.c > user/ccbuild/cc.c
+	      { print }' ../simpleC++.c ; } > user/ccbuild/cc.c
 	@cp ../nano-libc.h user/ccbuild/
 	@cp user/os-base.h user/ccbuild/nano-base.h
 	cd user/ccbuild && ../../$(NANO) --kernel --bss cc.c cc.s

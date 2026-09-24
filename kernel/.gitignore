@@ -195,3 +195,11 @@ fsdisk64.bin
 fsdisk-boot*.log
 nano-disk.img
 sab-disk.img
+blob-edit.s
+edit.s
+edit.elf
+edit64.elf
+edit64.bin
+edit-disk.img
+edit-boot1.log
+edit-boot2.log
