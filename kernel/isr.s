@@ -349,6 +349,39 @@ fill64:
     rep stosq
     ret
 
+/* void insw(int port, void *buf, long count) — read `count` 16-bit words from
+ * an I/O port into memory. SysV: port in edi, buf in rsi, count in rdx.
+ *
+ * The ATA data register moves a sector as 256 words, and doing that with 256
+ * calls through a one-byte-at-a-time helper is 256 function calls where the
+ * hardware offers one instruction.
+ *
+ * ORDER MATTERS in the three moves below: rdx holds the count on entry AND is
+ * where the port has to end up, so the count is saved into rcx first. Writing
+ * them in the obvious order silently transfers `port` words.
+ *
+ * cld for the same reason fill64 has it: the direction flag is guaranteed
+ * clear at function entry, which is not a guarantee about this instruction,
+ * and boot32.s has already been bitten once by assuming otherwise. */
+.globl insw
+insw:
+    mov %rdx, %rcx
+    mov %edi, %edx
+    mov %rsi, %rdi
+    cld
+    rep insw
+    ret
+
+/* void outsw(int port, void *buf, long count) — the same, outbound. rsi is
+ * already the source register rep outsw wants, so it is left alone. */
+.globl outsw
+outsw:
+    mov %rdx, %rcx
+    mov %edi, %edx
+    cld
+    rep outsw
+    ret
+
 /* void io_wait(void) — a throwaway write to an unused port, the traditional
  * short delay the 8259s need between initialisation words on old hardware. */
 .globl io_wait

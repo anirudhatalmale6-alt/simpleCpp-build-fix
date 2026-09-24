@@ -184,3 +184,14 @@ blob-gears.s
 gears64.elf
 gears64.bin
 gears.elf
+
+# fsdisk: build products and the drive it writes to. The disk image is state,
+# not source -- deleting it is what "start from a blank disk" means.
+blob-fsdisk.s
+fsdisk.s
+fsdisk.elf
+fsdisk64.elf
+fsdisk64.bin
+fsdisk-boot*.log
+nano-disk.img
+sab-disk.img

@@ -709,6 +709,73 @@ srvtest: srv.elf
 # Filesystem: a RAM disk, a Unix-shaped layout (superblock, bitmaps, inodes,
 # directory entries), and the operations the shell tools need.
 # ---------------------------------------------------------------------------
+# fsdisk -- the filesystem on a real ATA disk. Built like every other image,
+# but it is the only one that needs a DRIVE attached, and the only one whose
+# result depends on what a previous run left behind.
+fsdisk.s: fsdisk.c nano-kernel.h nano-mm.h nano-thread.h nano-int.h nano-fs.h nano-ata.h $(NANO)
+	$(NANO) --kernel fsdisk.c fsdisk.s
+
+fsdisk64.bin: boot64.s isr.s fsdisk.s kernel64.ld
+	as --64 boot64.s -o boot64.o
+	as --64 isr.s    -o isr.o
+	as --64 fsdisk.s -o fsdisk.o
+	ld -T kernel64.ld -o fsdisk64.elf boot64.o isr.o fsdisk.o
+	objcopy -O binary fsdisk64.elf fsdisk64.bin
+
+blob-fsdisk.s:
+	@printf '.section .blob, "a"\n.incbin "fsdisk64.bin"\n' > $@
+
+fsdisk.elf: boot32.s blob-fsdisk.s fsdisk64.bin final.ld
+	as --32 boot32.s      -o boot32.o
+	as --32 blob-fsdisk.s -o blob-fsdisk.o
+	ld -m elf_i386 -T final.ld -o fsdisk.elf boot32.o blob-fsdisk.o
+
+fsdisk: fsdisk.elf
+
+# A blank 8 MiB drive. Deleting this file is what "start again" means.
+nano-disk.img:
+	dd if=/dev/zero of=nano-disk.img bs=1M count=8 2>/dev/null
+
+fsdiskrun: fsdisk.elf nano-disk.img
+	$(QEMU) -kernel fsdisk.elf -no-reboot \
+	  -drive file=nano-disk.img,format=raw,if=ide
+
+# THE TEST, and the reason it is two runs: the first formats a blank drive and
+# the second has to find what the first one wrote. A single run proves nothing
+# about durability -- it is the reboot that is the feature.
+fsdisktest: fsdisk.elf
+	@rm -f nano-disk.img fsdisk-boot1.log fsdisk-boot2.log fsdisk-boot3.log
+	@dd if=/dev/zero of=nano-disk.img bs=1M count=8 2>/dev/null
+	@echo "--- boot 1: blank disk, should format and write"
+	@timeout 220 $(QEMU) -kernel fsdisk.elf -no-reboot -display none \
+	   -serial file:fsdisk-boot1.log \
+	   -drive file=nano-disk.img,format=raw,if=ide >/dev/null 2>&1; true
+	@echo "--- boot 2: same disk, should mount and read back"
+	@timeout 220 $(QEMU) -kernel fsdisk.elf -no-reboot -display none \
+	   -serial file:fsdisk-boot2.log \
+	   -drive file=nano-disk.img,format=raw,if=ide >/dev/null 2>&1; true
+	@echo "--- boot 3: again, to exercise syncing a MOUNTED filesystem"
+	@timeout 220 $(QEMU) -kernel fsdisk.elf -no-reboot -display none \
+	   -serial file:fsdisk-boot3.log \
+	   -drive file=nano-disk.img,format=raw,if=ide >/dev/null 2>&1; true
+	@tr -d '\r' < fsdisk-boot1.log
+	@tr -d '\r' < fsdisk-boot2.log
+	@tr -d '\r' < fsdisk-boot3.log
+	@echo "--- the sequence itself, which only the harness can check"
+	@# The image cannot know it is the second boot -- it has nothing to know it
+	@# with except the disk, which is the thing under test. So the ORDER is
+	@# asserted here. Without this, a broken fs_sync makes boot 2 find a blank
+	@# disk, take the format branch, and pass every check it runs.
+	@fail=0; \
+	grep -q "FIRST BOOT" fsdisk-boot1.log || { echo "FAIL: boot 1 did not format a blank disk"; fail=1; }; \
+	grep -q "LATER BOOT" fsdisk-boot2.log || { echo "FAIL: boot 2 did not MOUNT -- nothing survived"; fail=1; }; \
+	grep -q "LATER BOOT" fsdisk-boot3.log || { echo "FAIL: boot 3 did not MOUNT"; fail=1; }; \
+	grep -q "CHECKS FAILED" fsdisk-boot1.log && { echo "FAIL: boot 1 had failures"; fail=1; }; \
+	grep -q "CHECKS FAILED" fsdisk-boot2.log && { echo "FAIL: boot 2 had failures"; fail=1; }; \
+	grep -q "CHECKS FAILED" fsdisk-boot3.log && { echo "FAIL: boot 3 had failures"; fail=1; }; \
+	if [ $$fail -eq 0 ]; then echo "PASS: formatted once, mounted twice, every byte intact"; \
+	else echo "FSDISK SEQUENCE FAILED"; exit 1; fi
+
 fs.s: fs.c nano-kernel.h nano-mm.h nano-thread.h nano-int.h nano-fs.h $(NANO)
 	$(NANO) --kernel fs.c fs.s
 

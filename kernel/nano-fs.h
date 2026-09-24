@@ -66,6 +66,15 @@
 long disk_base;
 long disk_blocks;
 
+// Which device the blocks actually live on. 0 = RAM, 1 = the ATA disk.
+//
+// There is no automatic fallback between them, on purpose. If a caller asks
+// for a disk and there is no disk, it gets told so and decides what to do --
+// silently handing back memory would mean files that are written, read back
+// correctly, and gone at the next boot, with nothing anywhere reporting a
+// problem. That is the worst shape a bug can have.
+long disk_is_ata;
+
 long fs_dev_init(long nblocks) {
     long bytes;
     bytes = nblocks * BLK_SIZE;
@@ -73,7 +82,71 @@ long fs_dev_init(long nblocks) {
     if (!disk_base) return 0;
     memset((void *)disk_base, 0, bytes);
     disk_blocks = nblocks;
+    disk_is_ata = 0;
     return 1;
+}
+
+// Back the filesystem with the ATA disk.
+//
+// THE SHAPE, AND WHY IT IS THIS SHAPE. Everything above the block layer --
+// the bitmaps, the inode table, the indirect blocks, fs_read and fs_write --
+// reaches the disk through `blk_addr`, as a POINTER it reads and writes
+// directly. That is thirteen call sites of pointer arithmetic, and rewriting
+// them all to do read-modify-write through a buffer is how a working, tested
+// filesystem acquires new bugs.
+//
+// So the in-memory blocks stay exactly what they were, and become a full
+// image of the disk: read in at mount, written back at fs_sync. Nothing above
+// the block layer changes at all.
+//
+// The cost is that a sync writes every block rather than the changed ones,
+// and the whole filesystem has to fit in memory. Both are real limits and
+// both are recorded here rather than discovered later. The reason it is not a
+// dirty-bit cache -- which is the faster design and the obvious next step --
+// is that a dirty bit has to be SET by somebody, and the thirteen sites that
+// write through a raw pointer are exactly the thirteen places that would
+// forget. A sync that writes everything cannot miss a write; that is worth
+// more than the speed until the pointer sites are gone.
+long fs_dev_init_ata(long nblocks) {
+#ifdef NANO_ATA_H
+    long i;
+    if (!ata_present) return 0;
+    if (ata_sectors > 0 && nblocks > ata_sectors) return 0;
+    if (!fs_dev_init(nblocks)) return 0;
+    disk_is_ata = 1;
+    // Read the disk in. A brand-new image is all zeroes, which fs_mount will
+    // correctly reject for a bad magic, so a first boot formats and a later
+    // boot finds its filesystem.
+    i = 0;
+    while (i < nblocks) {
+        if (!ata_read_sector(i, (char *)(disk_base + i * BLK_SIZE))) return 0;
+        i = i + 1;
+    }
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+// Write the image back. Returns the number of blocks written, or -1 if the
+// filesystem is not on a disk at all -- which is a different answer from 0,
+// and callers that care about durability need to tell those apart.
+long fs_sync() {
+#ifdef NANO_ATA_H
+    long i;
+    long n;
+    if (!disk_is_ata) return -1;
+    n = 0;
+    i = 0;
+    while (i < disk_blocks) {
+        if (!ata_write_sector(i, (char *)(disk_base + i * BLK_SIZE))) return n;
+        n = n + 1;
+        i = i + 1;
+    }
+    return n;
+#else
+    return -1;
+#endif
 }
 
 long blk_addr(long b) {
@@ -700,7 +773,12 @@ long fs_readdir(long dir, long index, char *name_out) {
 }
 
 // ---------- bring-up ----------
-long fs_format(long nblocks, long ninodes) {
+// Lay a filesystem down on whatever device is ALREADY set up. Split out of
+// fs_format because the disk path has to call fs_dev_init_ata first -- calling
+// fs_format there would re-run fs_dev_init, which allocates a fresh RAM image
+// and quietly sets disk_is_ata back to 0, so every later sync would report
+// "not on a disk" and the files would live and die in memory.
+long fs_format_on_dev(long nblocks, long ninodes) {
     long itable_blocks;
 
     // The block bitmap is ONE block: 512 bytes, 4096 bits, 4096 blocks. Ask
@@ -709,8 +787,6 @@ long fs_format(long nblocks, long ninodes) {
     // formatted, mountable filesystem that corrupts an inode on the first big
     // file. Refusing to format is the only honest failure here.
     if (nblocks > BLK_SIZE * 8) return 0;
-
-    if (!fs_dev_init(nblocks)) return 0;
 
     // Getting this wrong overlaps the inode table with the data area, and the
     // first file written then corrupts an inode.
@@ -741,6 +817,33 @@ long fs_format(long nblocks, long ninodes) {
         dir_add(root, "..", root);
     }
 
+    fs_mounted = 1;
+    return 1;
+}
+
+long fs_format(long nblocks, long ninodes) {
+    if (nblocks > BLK_SIZE * 8) return 0;
+    if (!fs_dev_init(nblocks)) return 0;
+    return fs_format_on_dev(nblocks, ninodes);
+}
+
+// Mount a filesystem that is already on the disk. fs_dev_init_ata has read the
+// image in; this is the part that decides whether what came back IS one.
+//
+// sb_read checks the magic and refuses a blank disk, which is what makes the
+// first-boot-formats / later-boot-mounts split work without a flag file
+// anywhere. It does NOT check that the geometry is self-consistent, so that is
+// done here: a superblock claiming more blocks than the device has, or a data
+// area starting before the inode table ends, is a corrupt filesystem and
+// mounting it would corrupt it further.
+long fs_mount() {
+    if (!sb_read()) return 0;
+    if (sb_nblocks <= 0 || sb_nblocks > disk_blocks) return 0;
+    if (sb_ninodes <= 0) return 0;
+    if (sb_inode_start < 3) return 0;
+    if (sb_data_start <= sb_inode_start) return 0;
+    if (sb_data_start >= sb_nblocks) return 0;
+    mutex_init(&fs_lock);
     fs_mounted = 1;
     return 1;
 }
