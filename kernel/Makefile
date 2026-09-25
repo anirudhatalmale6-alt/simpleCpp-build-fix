@@ -18,7 +18,8 @@ QEMU   := qemu-system-x86_64
 # it .incbin's had been built -- "file not found: user/hello.elf" on a clean
 # tree, and a perfectly good build on the second attempt.
 UPROGS := user/hello.elf user/twin.elf user/wild.elf user/cc.elf user/as.elf \
-          user/uidemo.elf user/edit.elf user/files.elf user/sh.elf
+          user/uidemo.elf user/edit.elf user/files.elf user/sh.elf \
+          user/cat.elf user/bulk.elf
 QFLAGS := -kernel kernel.elf -no-reboot
 
 # No built-in rules.

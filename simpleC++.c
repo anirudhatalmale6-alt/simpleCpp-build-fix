@@ -31,7 +31,27 @@
 // Output / errors
 // ---------------------------------------------------------------------
 static FILE *fout;
-static void die(const char *m) { fprintf(stderr, "nano_cc: error: %s\n", m); exit(1); }
+
+/* The output path, remembered so that a failing compile can DELETE it.
+   nano_cc emits as it parses, so an error in the code generator leaves a
+   half-written .s behind -- one that is NEWER than every source file. make
+   then considers it up to date, assembles the truncated text, and the build
+   fails at the LINKER with "undefined reference to .L1878": a label whose
+   definition was never reached. Worse, a rebuild that fails this way keeps
+   the previous run's output in place, so edits appear to have no effect.
+   An interrupted compile must leave no artifact at all. */
+static const char *g_outpath;
+static void discard_output(void) {
+    if (fout) { fclose(fout); fout = 0; }
+    /* The in-OS build has unlink() in nano-libc.h and no remove(). */
+#ifdef NANO_CC_INOS
+    if (g_outpath) { unlink(g_outpath); g_outpath = 0; }
+#else
+    if (g_outpath) { remove(g_outpath); g_outpath = 0; }
+#endif
+}
+static void die(const char *m) {
+    fprintf(stderr, "nano_cc: error: %s\n", m); discard_output(); exit(1); }
 static void emit(const char *fmt, ...) {
     va_list a; va_start(a, fmt); vfprintf(fout, fmt, a); va_end(a);
     fputc('\n', fout);
@@ -406,6 +426,7 @@ static void die_at(int idx, const char *msg) {
     while (ls < le && (SRC[ls] == ' ' || SRC[ls] == '\t')) ls++;
     fprintf(stderr, "nano_cc: error: %s\n", msg);
     fprintf(stderr, "  line %d after preprocessing:  %.*s\n", line, le - ls, SRC + ls);
+    discard_output();
     exit(1);
 }
 
@@ -895,8 +916,12 @@ static Node *parse_primary(void) {
                    they were, which is the least useful possible behaviour.
                    Same shape as add_tok: the check existed downstream of the
                    write that overflows. */
-                if (n->nargs >= (int)(sizeof n->args / sizeof n->args[0]))
-                    die("more than 6 call arguments is not supported yet");
+                if (n->nargs >= (int)(sizeof n->args / sizeof n->args[0])) {
+                    char m[320];
+                    snprintf(m, sizeof m, "call to %s(): more than 6 call arguments "
+                             "is not supported yet", n->name);
+                    die_at(P, m);
+                }
                 n->args[n->nargs++] = parse_assign();
                 if (!eat(T_COMMA)) break;
             }
@@ -2303,7 +2328,12 @@ static Type *gen_expr(Node *n) {
         // Arguments 7 and beyond go on the stack in the SysV ABI, which this
         // code generator does not implement — say so instead of walking off
         // the end of ARGREG.
-        if (n->nargs > 6) die("more than 6 call arguments is not supported yet");
+        if (n->nargs > 6) {
+            char m[320];
+            snprintf(m, sizeof m, "call to %s(): more than 6 call arguments "
+                     "is not supported yet (%d given)", n->name, n->nargs);
+            die_node(n, m);
+        }
         for (int i = 0; i < n->nargs; i++) {
             Type *at = gen_expr(n->args[i]);
             // A struct used as a value decays to its ADDRESS here, so passing
@@ -2719,6 +2749,7 @@ int main(int argc, char **argv) {
 
     fout = fopen(outpath, "w");
     if (!fout) { perror("fopen"); return 1; }
+    g_outpath = outpath;
 
     if (g_nasm) {
         emit("section .text");
@@ -2850,7 +2881,7 @@ int main(int argc, char **argv) {
         }
     }
 
-    fclose(fout);
+    fclose(fout); fout = 0; g_outpath = 0;   /* success: keep the output */
     printf("Compiled %s -> %s%s\n", inpath, outpath, kernel_mode ? " (kernel mode)" : "");
     return 0;
 }

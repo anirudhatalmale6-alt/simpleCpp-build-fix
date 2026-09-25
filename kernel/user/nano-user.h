@@ -50,6 +50,7 @@ extern long syscall6(long nr, long a, long b, long c, long d, long e);
 #define SYS_ISDIR      24
 #define SYS_SPAWN      25
 #define SYS_WAIT       26
+#define SYS_PIPE       27
 
 // The non-character keys, as delivered by SYS_WINPOLL in out[3].
 //
@@ -123,6 +124,10 @@ long spawn(char *path, long argc, char **argv, long outfd, long infd) {
 // The child's exit code once it has finished, or -1 while it is still
 // running. Does NOT block -- poll it.
 long waitpid_(long pid)                     { return syscall4(SYS_WAIT, pid, 0, 0); }
+// out[0] becomes the read end, out[1] the write end. Reading an empty pipe
+// blocks until there is data or every writer has closed; writing a full one
+// blocks until the reader drains it.
+long pipe_(long *out)                       { return syscall4(SYS_PIPE, (long)out, 0, 0); }
 
 // ---------- windows ----------
 long win_open(long x, long y, long w, long h, char *title) {

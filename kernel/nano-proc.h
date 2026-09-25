@@ -447,6 +447,80 @@ long elf_load(long root, char *img, long len, long *top_out) {
 #define FD_NONE    0
 #define FD_CONSOLE 1
 #define FD_FILE    2
+// The two ends are different KINDS rather than one kind plus a direction
+// flag, so that "can I read this" is answered by the same field that already
+// decides everything else about a descriptor.
+#define FD_PIPE_R  3
+#define FD_PIPE_W  4
+
+// ---------- pipes ----------
+//
+// A ring buffer with a count of how many descriptors still refer to each end.
+// The counts are the whole design: a read on an empty pipe must block while a
+// writer still exists and return end-of-file once none do, and those are the
+// same question asked at two different moments.
+#define MAX_PIPES 8
+#define PIPE_CAP  4096
+
+long g_pipe_used[MAX_PIPES];
+char g_pipe_buf[MAX_PIPES * PIPE_CAP];
+long g_pipe_head[MAX_PIPES];        // bytes written, total
+long g_pipe_tail[MAX_PIPES];        // bytes read, total
+long g_pipe_readers[MAX_PIPES];
+long g_pipe_writers[MAX_PIPES];
+
+long pipe_bytes(long p) { return g_pipe_head[p] - g_pipe_tail[p]; }
+long pipe_space(long p) { return PIPE_CAP - pipe_bytes(p); }
+
+long pipe_alloc() {
+    long i;
+    i = 0;
+    while (i < MAX_PIPES) {
+        if (!g_pipe_used[i]) {
+            g_pipe_used[i] = 1;
+            g_pipe_head[i] = 0;
+            g_pipe_tail[i] = 0;
+            g_pipe_readers[i] = 0;
+            g_pipe_writers[i] = 0;
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// Drop one reference to an end. The pipe is freed only when BOTH ends are
+// gone -- freeing it when the writer closes would pull the buffer out from
+// under a reader that still has data to drain, which is the difference
+// between "the producer finished" and "the data is gone".
+void pipe_release(long p, long kind) {
+    if (p < 0 || p >= MAX_PIPES || !g_pipe_used[p]) return;
+    if (kind == FD_PIPE_R && g_pipe_readers[p] > 0) g_pipe_readers[p] = g_pipe_readers[p] - 1;
+    if (kind == FD_PIPE_W && g_pipe_writers[p] > 0) g_pipe_writers[p] = g_pipe_writers[p] - 1;
+    if (g_pipe_readers[p] == 0 && g_pipe_writers[p] == 0) g_pipe_used[p] = 0;
+}
+
+long pipe_read(long p, char *dst, long n) {
+    long got;
+    got = 0;
+    while (got < n && pipe_bytes(p) > 0) {
+        dst[got] = g_pipe_buf[p * PIPE_CAP + (g_pipe_tail[p] % PIPE_CAP)];
+        g_pipe_tail[p] = g_pipe_tail[p] + 1;
+        got = got + 1;
+    }
+    return got;
+}
+
+long pipe_write(long p, char *src, long n) {
+    long put;
+    put = 0;
+    while (put < n && pipe_space(p) > 0) {
+        g_pipe_buf[p * PIPE_CAP + (g_pipe_head[p] % PIPE_CAP)] = src[put];
+        g_pipe_head[p] = g_pipe_head[p] + 1;
+        put = put + 1;
+    }
+    return put;
+}
 
 // argv. Eight arguments of 128 bytes is not a POSIX limit, it is a limit that
 // fits on the initial stack page without needing a second one.
@@ -766,6 +840,22 @@ long proc_poll() {
                     g_procs[i].state = P_EXITED;
                     g_procs[i].exitcode = g_threads[t].retval;
                 }
+                // Release every pipe end it still held. A process that dies
+                // mid-pipeline would otherwise leave the writer count above
+                // zero forever, and the reader at the other end would block
+                // for a producer that no longer exists. Death has to close
+                // descriptors for the same reason exit does.
+                {
+                    long f;
+                    f = 0;
+                    while (f < MAX_FDS) {
+                        if (g_procs[i].fd_kind[f] == FD_PIPE_R ||
+                            g_procs[i].fd_kind[f] == FD_PIPE_W)
+                            pipe_release(g_procs[i].fd_ino[f], g_procs[i].fd_kind[f]);
+                        g_procs[i].fd_kind[f] = FD_NONE;
+                        f = f + 1;
+                    }
+                }
                 as_destroy(g_procs[i].root);
                 g_procs[i].root = 0;
 #ifdef NANO_WM_H
@@ -933,6 +1023,9 @@ long proc_wait(long pid) {
 // slept inside the kernel on a process that might never exit is a hang with
 // no way out. The shell polls, which is honest about what it is doing.
 #define SYS_WAIT     26
+// SYS_PIPE(out) -> 0, writing two descriptors into out[0] (read) and out[1]
+// (write). Two at once because a pipe with only one end is not a pipe.
+#define SYS_PIPE     27
 
 // The window calls. Numbers exist whether or not a window manager was
 // compiled in; the IMPLEMENTATIONS are behind #ifdef NANO_WM_H and every one
@@ -1206,6 +1299,30 @@ long syscall_dispatch(long nr, long a, long b, long c, long d, long e) {
             while (i < c) { putc(p[i]); i = i + 1; }
             return c;
         }
+        if (kind == FD_PIPE_W) {
+            long pi;
+            long put;
+            pi = g_procs[slot].fd_ino[a];
+            // No reader left means nobody will ever drain this. Writing into
+            // it would block forever, so say so instead -- this is SIGPIPE's
+            // job in a system that has signals, and an error here in one that
+            // does not.
+            if (g_pipe_readers[pi] == 0) return -1;
+            put = 0;
+            while (put < c) {
+                long n2;
+                n2 = pipe_write(pi, (char *)(b + put), c - put);
+                put = put + n2;
+                if (put >= c) break;
+                if (g_pipe_readers[pi] == 0) return put > 0 ? put : -1;
+                // Full. Yield rather than spin: this kernel is cooperative
+                // above the timer, and the reader cannot drain the pipe while
+                // this syscall holds the CPU.
+                thread_yield();
+            }
+            return put;
+        }
+        if (kind == FD_PIPE_R) return -1;
         if (kind != FD_FILE || !g_procs[slot].fd_ino[a]) return -1;
         {
             long n;
@@ -1226,6 +1343,26 @@ long syscall_dispatch(long nr, long a, long b, long c, long d, long e) {
         // EOF is at least a truthful answer, and it is what makes a program
         // reading stdin terminate rather than hang.
         if (kind == FD_CONSOLE) return 0;
+        if (kind == FD_PIPE_R) {
+            long pi;
+            if (c < 0) return -1;
+            if (!user_range_ok(slot, b, c)) return -1;
+            pi = g_procs[slot].fd_ino[a];
+            // Wait for a writer to put something in. Yield rather than spin:
+            // the scheduler is cooperative above the timer, so a reader that
+            // holds the CPU is a reader the writer can never satisfy.
+            while (pipe_bytes(pi) == 0 && g_pipe_writers[pi] > 0) thread_yield();
+            // Empty AND no writer can ever appear -- every write end has been
+            // closed -- is end-of-file. Note the ORDER: the buffer is checked
+            // before the writer count, so bytes left behind by a writer that
+            // has already exited are still delivered. `hello | cat` finishes
+            // long before cat is scheduled, and reporting EOF on the strength
+            // of the writer count alone would discard its output.
+            if (pipe_bytes(pi) == 0) return 0;
+            return pipe_read(pi, (char *)b, c);
+        }
+        // Reading the WRITE end is a program error, not end-of-file.
+        if (kind == FD_PIPE_W) return -1;
         if (kind != FD_FILE || !g_procs[slot].fd_ino[a]) return -1;
         if (c < 0) return -1;
         if (!user_range_ok(slot, b, c)) return -1;
@@ -1244,6 +1381,8 @@ long syscall_dispatch(long nr, long a, long b, long c, long d, long e) {
 
     if (nr == SYS_CLOSE) {
         if (slot < 0 || a < 3 || a >= MAX_FDS) return -1;
+        if (g_procs[slot].fd_kind[a] == FD_PIPE_R || g_procs[slot].fd_kind[a] == FD_PIPE_W)
+            pipe_release(g_procs[slot].fd_ino[a], g_procs[slot].fd_kind[a]);
         g_procs[slot].fd_kind[a] = FD_NONE;
         g_procs[slot].fd_ino[a] = 0;
         g_procs[slot].fd_pos[a] = 0;
@@ -1370,18 +1509,74 @@ long syscall_dispatch(long nr, long a, long b, long c, long d, long e) {
         // spawn, because the child's slot does not exist until then.
         child = proc_slot_of(pid);
         if (child >= 0) {
+            // The child's copy is a NEW reference. Without the count going
+            // up, the parent closing its end straight after the spawn drops
+            // the pipe to zero and the child is left holding a descriptor to
+            // a buffer that has been freed -- which is exactly what a shell
+            // does between the two halves of `a | b`.
             if (d >= 0 && d < MAX_FDS && g_procs[slot].fd_kind[d] != FD_NONE) {
                 g_procs[child].fd_kind[1] = g_procs[slot].fd_kind[d];
                 g_procs[child].fd_ino[1]  = g_procs[slot].fd_ino[d];
                 g_procs[child].fd_pos[1]  = g_procs[slot].fd_pos[d];
+                if (g_procs[slot].fd_kind[d] == FD_PIPE_W)
+                    g_pipe_writers[g_procs[slot].fd_ino[d]] = g_pipe_writers[g_procs[slot].fd_ino[d]] + 1;
+                if (g_procs[slot].fd_kind[d] == FD_PIPE_R)
+                    g_pipe_readers[g_procs[slot].fd_ino[d]] = g_pipe_readers[g_procs[slot].fd_ino[d]] + 1;
             }
             if (e >= 0 && e < MAX_FDS && g_procs[slot].fd_kind[e] != FD_NONE) {
                 g_procs[child].fd_kind[0] = g_procs[slot].fd_kind[e];
                 g_procs[child].fd_ino[0]  = g_procs[slot].fd_ino[e];
                 g_procs[child].fd_pos[0]  = g_procs[slot].fd_pos[e];
+                if (g_procs[slot].fd_kind[e] == FD_PIPE_R)
+                    g_pipe_readers[g_procs[slot].fd_ino[e]] = g_pipe_readers[g_procs[slot].fd_ino[e]] + 1;
+                if (g_procs[slot].fd_kind[e] == FD_PIPE_W)
+                    g_pipe_writers[g_procs[slot].fd_ino[e]] = g_pipe_writers[g_procs[slot].fd_ino[e]] + 1;
             }
         }
         return pid;
+    }
+
+    if (nr == SYS_PIPE) {
+        long pi;
+        long rfd;
+        long wfd;
+        long *out;
+        long fd;
+
+        if (slot < 0) return -1;
+        if (!user_range_ok(slot, a, 2 * 8)) return -1;
+
+        pi = pipe_alloc();
+        if (pi < 0) return -1;
+
+        // Both descriptors are found BEFORE either is claimed. Taking the
+        // read end and then failing to find a slot for the write end would
+        // leave a half-open pipe nobody can finish or free.
+        rfd = -1;
+        wfd = -1;
+        fd = 3;
+        while (fd < MAX_FDS) {
+            if (g_procs[slot].fd_kind[fd] == FD_NONE) {
+                if (rfd < 0) rfd = fd;
+                else { wfd = fd; fd = MAX_FDS; }
+            }
+            fd = fd + 1;
+        }
+        if (rfd < 0 || wfd < 0) { g_pipe_used[pi] = 0; return -1; }
+
+        g_procs[slot].fd_kind[rfd] = FD_PIPE_R;
+        g_procs[slot].fd_ino[rfd] = pi;
+        g_procs[slot].fd_pos[rfd] = 0;
+        g_procs[slot].fd_kind[wfd] = FD_PIPE_W;
+        g_procs[slot].fd_ino[wfd] = pi;
+        g_procs[slot].fd_pos[wfd] = 0;
+        g_pipe_readers[pi] = 1;
+        g_pipe_writers[pi] = 1;
+
+        out = (long *)a;
+        out[0] = rfd;
+        out[1] = wfd;
+        return 0;
     }
 
     if (nr == SYS_WAIT) {

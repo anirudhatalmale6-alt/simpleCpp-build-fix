@@ -233,3 +233,9 @@ user/files.elf
 user/sh.s
 user/sh.o
 user/sh.elf
+user/cat.s
+user/cat.o
+user/cat.elf
+user/bulk.s
+user/bulk.o
+user/bulk.elf

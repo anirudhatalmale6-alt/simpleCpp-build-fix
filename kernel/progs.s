@@ -53,6 +53,18 @@ p_sh:
     .incbin "user/sh.elf"
 p_sh_end:
 
+.align 16
+p_cat:
+    .incbin "user/cat.elf"
+p_cat_end:
+
+/* A bulk producer, used to push several buffers' worth through a pipe so the
+ * writer actually runs out of space and has to wait for the reader. */
+.align 16
+p_bulk:
+    .incbin "user/bulk.elf"
+p_bulk_end:
+
 /* The C compiler. 131 KB, which is most of this image -- and 19.6 MB before
  * nano_cc learned to leave uninitialised globals in .bss instead of writing
  * their zero bytes into the object. */
@@ -244,6 +256,26 @@ prog_sh_addr:
 .globl prog_sh_size
 prog_sh_size:
     mov $(p_sh_end - p_sh), %rax
+    ret
+
+.globl prog_cat_addr
+prog_cat_addr:
+    lea p_cat(%rip), %rax
+    ret
+
+.globl prog_cat_size
+prog_cat_size:
+    mov $(p_cat_end - p_cat), %rax
+    ret
+
+.globl prog_bulk_addr
+prog_bulk_addr:
+    lea p_bulk(%rip), %rax
+    ret
+
+.globl prog_bulk_size
+prog_bulk_size:
+    mov $(p_bulk_end - p_bulk), %rax
     ret
 
 .globl prog_cc_addr

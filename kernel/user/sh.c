@@ -110,6 +110,41 @@ long g_nwords;
 char g_redir_out[96];
 char g_redir_in[96];
 
+// The right-hand side of a pipeline, unparsed. Split before tokenising so
+// each half runs through the same parser rather than through a second one
+// that is meant to behave identically.
+char g_rhs[160];
+long g_has_pipe;
+
+// Split `a | b` at the FIRST top-level bar. `||` is not a pipe, and
+// splitting on a bare scan for '|' would cut it in half and leave two
+// nonsense commands -- so the pair is skipped rather than matched.
+void split_pipe(char *line, char *lhs, char *rhs) {
+    long i;
+    long j;
+    g_has_pipe = 0;
+    i = 0;
+    while (line[i]) {
+        if (line[i] == '|' && line[i + 1] == '|') { i = i + 2; continue; }
+        if (line[i] == '|') {
+            j = 0;
+            while (j < i && j < 159) { lhs[j] = line[j]; j = j + 1; }
+            lhs[j] = 0;
+            j = 0;
+            i = i + 1;
+            while (line[i] && j < 159) { rhs[j] = line[i]; j = j + 1; i = i + 1; }
+            rhs[j] = 0;
+            g_has_pipe = 1;
+            return;
+        }
+        i = i + 1;
+    }
+    j = 0;
+    while (line[j] && j < 159) { lhs[j] = line[j]; j = j + 1; }
+    lhs[j] = 0;
+    rhs[0] = 0;
+}
+
 // Returns 0 on a parse error, having said why.
 long parse(char *s) {
     long i;
@@ -211,6 +246,84 @@ long builtin(char *cmd) {
 // most worth having a record of.
 void trace(char *s) { write(1, s, str_len(s)); }
 
+// A bare name means /bin/name; anything with a slash is taken as given.
+void resolve(char *word, char *out) {
+    long has_slash;
+    long i;
+    has_slash = 0;
+    i = 0;
+    while (word[i]) { if (word[i] == '/') has_slash = 1; i = i + 1; }
+    if (has_slash) path_join(out, g_cwd, word, 160);
+    else { str_copy(out, "/bin/", 160); str_copy(out + 5, word, 155); }
+}
+
+// Start one half of a pipeline. Returns the pid, or 0.
+//
+// outfd/infd are the pipe ends the caller wants used, or -1. A `>` or `<` on
+// THIS half overrides them, which is what every shell does: in `a | b > f`
+// the file wins for b's stdout, so nothing is lost down a pipe nobody reads.
+// The first version of this ignored the redirections it had just parsed, and
+// `hello | cat > piped.txt` wrote cat's output to the console instead.
+long start(char *cmd, long outfd, long infd) {
+    char path[160];
+    char *av[MAXARGV];
+    long i;
+    long pid;
+    long myout;
+    long myin;
+    long opened_out;
+    long opened_in;
+
+    if (!parse(cmd)) return 0;
+    if (g_nwords == 0) return 0;
+
+    myout = outfd;
+    myin = infd;
+    opened_out = 0 - 1;
+    opened_in = 0 - 1;
+
+    if (g_redir_out[0]) {
+        char f[160];
+        path_join(f, g_cwd, g_redir_out, 160);
+        ftruncate_(f);
+        opened_out = open(f, O_WRONLY | O_CREAT);
+        trace("sh: redirect out -> "); trace(f);
+        trace(opened_out < 0 ? " FAILED\n" : " ok\n");
+        if (opened_out < 0) { out_str("sh: cannot write "); out_str(f); out_str("\n"); return 0; }
+        myout = opened_out;
+    }
+    if (g_redir_in[0]) {
+        char f[160];
+        path_join(f, g_cwd, g_redir_in, 160);
+        opened_in = open(f, O_RDONLY);
+        trace("sh: redirect in <- "); trace(f);
+        trace(opened_in < 0 ? " FAILED\n" : " ok\n");
+        if (opened_in < 0) {
+            out_str("sh: cannot read "); out_str(f); out_str("\n");
+            if (opened_out >= 0) close(opened_out);
+            return 0;
+        }
+        myin = opened_in;
+    }
+
+    resolve(g_words[0], path);
+    i = 0;
+    while (i < g_nwords) { av[i] = g_words[i]; i = i + 1; }
+    pid = spawn(path, g_nwords, av, myout, myin);
+    // > 0, not just non-zero. An unhandled syscall number returns -1, which is
+    // perfectly truthy, so a spawn that never reached the kernel at all used to
+    // report "ok" here and the failure surfaced later as an empty output file.
+    trace("sh: spawn "); trace(path); trace(pid > 0 ? " ok\n" : " FAILED\n");
+
+    // Only the ones THIS call opened. The pipe ends belong to the caller and
+    // are closed there, once both halves have been given their copies.
+    if (opened_out >= 0) close(opened_out);
+    if (opened_in >= 0) close(opened_in);
+
+    if (pid <= 0) { out_str("sh: cannot run "); out_str(path); out_str("\n"); return 0; }
+    return pid;
+}
+
 void run(char *line) {
     char path[160];
     char *av[MAXARGV];
@@ -219,6 +332,41 @@ void run(char *line) {
     long infd;
 
     trace("sh: run ["); trace(line); trace("]\n");
+
+    // A pipeline, before anything else: both halves are programs, and a
+    // builtin on either side of a bar has nowhere to send its output because
+    // builtins write into the shell's own pane rather than to a descriptor.
+    {
+        char lhs[160];
+        split_pipe(line, lhs, g_rhs);
+        if (g_has_pipe) {
+            long fds[2];
+            long lpid;
+            long rpid;
+
+            if (pipe_(fds) < 0) { out_str("sh: no free pipe\n"); return; }
+            trace("sh: pipe created\n");
+
+            // Left writes into fds[1], right reads from fds[0].
+            lpid = start(lhs, fds[1], 0 - 1);
+            rpid = start(g_rhs, 0 - 1, fds[0]);
+
+            // THE SHELL'S OWN ENDS CLOSE NOW, and this is the part that is
+            // easy to get wrong. Each child holds its own reference, so this
+            // does not shut theirs -- but if the shell kept the write end
+            // open, the reader would never see end-of-file and `a | b` would
+            // hang after a finished.
+            close(fds[0]);
+            close(fds[1]);
+
+            if (lpid && rpid) {
+                out_str("["); out_num(lpid); out_str(" | "); out_num(rpid); out_str("]\n");
+                g_child = rpid;
+                str_copy(g_childname, "pipeline", 64);
+            }
+            return;
+        }
+    }
     if (!parse(line)) return;
     if (g_nwords == 0) { trace("sh: nothing to run\n"); return; }
     if (builtin(g_words[0])) { trace("sh: builtin\n"); return; }
@@ -267,7 +415,7 @@ void run(char *line) {
     if (outfd >= 0) close(outfd);
     if (infd >= 0) close(infd);
 
-    trace("sh: spawn "); trace(path); trace(g_child ? " ok\n" : " FAILED\n");
+    trace("sh: spawn "); trace(path); trace(g_child > 0 ? " ok\n" : " FAILED\n");
     if (!g_child) {
         out_str("sh: cannot run "); out_str(path); out_str("\n");
         return;

@@ -76,6 +76,10 @@ extern long prog_files_addr();
 extern long prog_files_size();
 extern long prog_sh_addr();
 extern long prog_sh_size();
+extern long prog_cat_addr();
+extern long prog_cat_size();
+extern long prog_bulk_addr();
+extern long prog_bulk_size();
 
 // ALWAYS overwrite, and truncate first.
 //
@@ -415,6 +419,8 @@ void main_thread(long unused) {
     // ---------- the shell, and a process starting a process ----------
     puts("\n-- 6. a PROCESS starting a process --\n");
     install("/bin/sh", prog_sh_addr(), prog_sh_size());
+    install("/bin/cat", prog_cat_addr(), prog_cat_size());
+    install("/bin/bulk", prog_bulk_addr(), prog_bulk_size());
     fs_sync();
 
     {
@@ -478,6 +484,144 @@ void main_thread(long unused) {
                                 n > 10 && b[0] == 'h' && b[1] == 'e');
                 }
                 expect_true("...and the shell is still running afterwards",
+                            proc_running(sp) == 1);
+            }
+
+            // ---------- THE PIPE ----------
+            //
+            // `hello | cat > piped.txt`. cat does nothing but copy stdin to
+            // stdout, so if piped.txt ends up holding hello's output then
+            // every part of the pipe worked: the write end, the ring buffer,
+            // the blocking read, and the end-of-file that arrives when the
+            // last writer closes. If the EOF were missing, cat would never
+            // return and the file would stay empty.
+            {
+                char *cmd;
+                long k;
+                long ino;
+                long direct;
+
+                direct = fs_lookup("/out.txt");
+                direct = direct > 0 ? fs_size(direct) : 0;
+
+                cmd = "hello | cat > piped.txt";
+                k = 0;
+                while (cmd[k]) { kbd_push(cmd[k]); k = k + 1; }
+                kbd_push('\n');
+
+                t0 = g_ticks;
+                while (g_ticks - t0 < 200) { proc_poll(); wm_present(); thread_yield(); }
+
+                ino = fs_lookup("/piped.txt");
+                expect_true("a PIPELINE ran: hello | cat > piped.txt",
+                            ino > 0 && fs_size(ino) > 0);
+                if (ino > 0) {
+                    // Named pb/pn rather than b/n: nano_cc has no
+                    // block-scoped shadowing, and the earlier redirection
+                    // test in this same function already has a `b`.
+                    char pb[160];
+                    long pn;
+                    pn = fs_read(ino, 0, pb, 159);
+                    if (pn < 0) pn = 0;
+                    pb[pn] = 0;
+                    printf("  /piped.txt holds %d bytes: %s", pn, pb);
+                    expect_true("...and it is hello's output, through cat",
+                                pn > 10 && pb[0] == 'h' && pb[1] == 'e');
+                    // The bytes that went through the pipe must match the
+                    // bytes that went straight to a file. Same producer, two
+                    // routes -- if they differ, the pipe changed the data.
+                    expect("...the same length as writing it straight to a file",
+                           pn, direct);
+                }
+                // Every pipe the run used must be back in the free pool. A
+                // pipeline that works but leaks its buffer would pass the
+                // check above and fail on the ninth pipeline of a session.
+                {
+                    long q;
+                    long leaked;
+                    leaked = 0;
+                    q = 0;
+                    while (q < MAX_PIPES) {
+                        if (g_pipe_used[q]) leaked = leaked + 1;
+                        q = q + 1;
+                    }
+                    expect("...and every pipe was released", leaked, 0);
+                }
+                expect_true("...and the shell survived the pipeline",
+                            proc_running(sp) == 1);
+            }
+
+            // ---------- A PIPE BIGGER THAN THE PIPE ----------
+            //
+            // hello writes 86 bytes. The buffer is 4096, so that test never
+            // fills it and never proves the two things that make a pipe a
+            // pipe rather than a big enough queue: a writer that runs out of
+            // space and WAITS, and a ring that WRAPS past the end of its
+            // storage. bulk writes about 18 KB, so both happen several times.
+            //
+            // Checked against the same program writing straight to a file,
+            // byte for byte, rather than against a length worked out here --
+            // a hand-computed expected size would have to duplicate bulk's
+            // own formatting, and would then agree with it when both were
+            // wrong.
+            {
+                char *bcmd;
+                long bk;
+                long pino;
+                long dino;
+                long dsz;
+
+                bcmd = "bulk > bdirect.txt";
+                bk = 0;
+                while (bcmd[bk]) { kbd_push(bcmd[bk]); bk = bk + 1; }
+                kbd_push('\n');
+                t0 = g_ticks;
+                while (g_ticks - t0 < 400) { proc_poll(); wm_present(); thread_yield(); }
+
+                bcmd = "bulk | cat > bpiped.txt";
+                bk = 0;
+                while (bcmd[bk]) { kbd_push(bcmd[bk]); bk = bk + 1; }
+                kbd_push('\n');
+                t0 = g_ticks;
+                while (g_ticks - t0 < 400) { proc_poll(); wm_present(); thread_yield(); }
+
+                dino = fs_lookup("/bdirect.txt");
+                pino = fs_lookup("/bpiped.txt");
+                dsz = dino > 0 ? fs_size(dino) : 0;
+
+                printf("  bulk direct %d bytes, through the pipe %d bytes\n",
+                       dsz, pino > 0 ? fs_size(pino) : 0);
+                expect_true("a bulk producer wrote more than one pipe buffer",
+                            dsz > PIPE_CAP);
+                expect("...and the same byte count came through the pipe",
+                       pino > 0 ? fs_size(pino) : 0, dsz);
+
+                // Length alone would pass if a wrap wrote the right NUMBER of
+                // bytes in the wrong ORDER, so compare the contents.
+                if (pino > 0 && dino > 0 && dsz > 0 && fs_size(pino) == dsz) {
+                    char da[256];
+                    char pa[256];
+                    long off;
+                    long bad;
+                    long got;
+                    long j;
+                    bad = 0;
+                    off = 0;
+                    while (off < dsz) {
+                        got = dsz - off;
+                        if (got > 256) got = 256;
+                        if (fs_read(dino, off, da, got) != got) { bad = bad + 1; break; }
+                        if (fs_read(pino, off, pa, got) != got) { bad = bad + 1; break; }
+                        j = 0;
+                        while (j < got) {
+                            if (da[j] != pa[j]) bad = bad + 1;
+                            j = j + 1;
+                        }
+                        off = off + got;
+                    }
+                    expect("...and every byte matches, in order", bad, 0);
+                }
+                expect_true("...and the shell survived the bulk pipeline",
                             proc_running(sp) == 1);
             }
         }
