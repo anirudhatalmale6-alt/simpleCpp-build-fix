@@ -31,6 +31,13 @@ p_wild:
     .incbin "user/wild.elf"
 p_wild_end:
 
+/* The GUI apps, which are the point of the apps-not-demos milestone: the same
+ * nano-ui.h the kernel images compile, running as ordinary processes. */
+.align 16
+p_uidemo:
+    .incbin "user/uidemo.elf"
+p_uidemo_end:
+
 /* The C compiler. 131 KB, which is most of this image -- and 19.6 MB before
  * nano_cc learned to leave uninitialised globals in .bss instead of writing
  * their zero bytes into the object. */
@@ -179,9 +186,19 @@ prog_wild_addr:
     lea p_wild(%rip), %rax
     ret
 
+.globl prog_uidemo_addr
+prog_uidemo_addr:
+    lea p_uidemo(%rip), %rax
+    ret
+
 .globl prog_wild_size
 prog_wild_size:
     mov $(p_wild_end - p_wild), %rax
+    ret
+
+.globl prog_uidemo_size
+prog_uidemo_size:
+    mov $(p_uidemo_end - p_uidemo), %rax
     ret
 
 .globl prog_cc_addr

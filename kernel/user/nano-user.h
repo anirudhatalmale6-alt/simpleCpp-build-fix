@@ -16,6 +16,8 @@
 // wide as any call here needs; a fourth would mean touching r10, since rcx is
 // destroyed by `syscall` on real hardware and this stays close to that shape.
 extern long syscall4(long nr, long a, long b, long c);
+// Five arguments, which only SYS_WINOPEN needs.
+extern long syscall6(long nr, long a, long b, long c, long d, long e);
 
 // These numbers are the interface. They match the SYS_* defines in
 // kernel/nano-proc.h; if the two ever disagree the calls silently do the wrong
@@ -34,6 +36,37 @@ extern long syscall4(long nr, long a, long b, long c);
 #define SYS_TICKS  10
 #define SYS_UNLINK 11
 #define SYS_BRK    12
+#define SYS_WINOPEN    13
+#define SYS_WINBLIT    14
+#define SYS_WINPRESENT 15
+#define SYS_WINPOLL    16
+#define SYS_WINCLOSE   17
+#define SYS_NAP        18
+#define SYS_TRUNCATE   19
+#define SYS_SYNC       20
+#define SYS_MKDIR      21
+#define SYS_RENAME     22
+#define SYS_READDIR    23
+
+// The non-character keys, as delivered by SYS_WINPOLL in out[3].
+//
+// These are interface numbers in exactly the way the SYS_* values above are,
+// and they are written out here for the same stated reason: the kernel's
+// nano-int.h defines them for its own use, and a shared include would drag
+// the kernel's interrupt handling into every program. They must match
+// nano-int.h; uitest asserts the kernel half and apptest asserts that an
+// arrow pressed at a PROCESS arrives as KEY_LEFT and not as a letter, which
+// is the only check that can catch the two drifting apart.
+#define KEY_UP     0x100
+#define KEY_DOWN   0x101
+#define KEY_LEFT   0x102
+#define KEY_RIGHT  0x103
+#define KEY_HOME   0x104
+#define KEY_END    0x105
+#define KEY_PGUP   0x106
+#define KEY_PGDN   0x107
+#define KEY_DEL    0x108
+#define KEY_INS    0x109
 
 // open() flags. Linux's values, because the fuller C library in nano-libc.h
 // speaks them and one set of numbers is better than two.
@@ -55,6 +88,34 @@ long getpid()                               { return syscall4(SYS_GETPID, 0, 0, 
 void yield()                                { syscall4(SYS_YIELD, 0, 0, 0); }
 long ticks()                                { return syscall4(SYS_TICKS, 0, 0, 0); }
 long unlink(char *path)                     { return syscall4(SYS_UNLINK, (long)path, 0, 0); }
+void nap(long ms)                           { syscall4(SYS_NAP, ms, 0, 0); }
+
+// An editor's Save is "make the file be exactly these bytes", which is a
+// truncate and then a write -- without the truncate, saving something shorter
+// leaves the tail of the longer version behind it.
+long ftruncate_(char *path)                 { return syscall4(SYS_TRUNCATE, (long)path, 0, 0); }
+// Blocks written, or -1 if this filesystem is not on a disk at all. A caller
+// that cares about durability has to tell that apart from "wrote nothing".
+long fsync_()                               { return syscall4(SYS_SYNC, 0, 0, 0); }
+long mkdir_(char *path)                     { return syscall4(SYS_MKDIR, (long)path, 0, 0); }
+long rename_(char *from, char *to)          { return syscall4(SYS_RENAME, (long)from, (long)to, 0); }
+// (path, index, name_out[64]) -> 1 if there was an entry there.
+long readdir_(char *path, long i, char *nm) { return syscall4(SYS_READDIR, (long)path, i, (long)nm); }
+
+// ---------- windows ----------
+long win_open(long x, long y, long w, long h, char *title) {
+    return syscall6(SYS_WINOPEN, x, y, w, h, (long)title);
+}
+// Copy a w*h pixel buffer into the window's client area at `off`, which is a
+// LINEAR offset -- oy * client_width + ox -- not a pair. Checked against the
+// kernel rather than assumed: it computes ox = off % cw and oy = off / cw.
+long win_blit(long hnd, long *pix, long w, long h, long off) {
+    return syscall6(SYS_WINBLIT, hnd, (long)pix, w, h, off);
+}
+long win_present(long hnd)                  { return syscall4(SYS_WINPRESENT, hnd, 0, 0); }
+// out[6]: mouse x, mouse y, buttons, one key, client width, client height.
+long win_poll(long hnd, long *out)          { return syscall4(SYS_WINPOLL, hnd, (long)out, 0); }
+long win_close(long hnd)                    { return syscall4(SYS_WINCLOSE, hnd, 0, 0); }
 
 // ---------- the small amount of libc a program needs ----------
 

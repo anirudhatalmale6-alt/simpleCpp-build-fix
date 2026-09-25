@@ -211,3 +211,14 @@ files64.bin
 files-disk.img
 files-boot1.log
 files-boot2.log
+user/nano-ui.h
+user/nano-font.h
+user/uidemo.s
+user/uidemo.o
+user/uidemo.elf
+blob-apps.s
+apps.s
+apps.elf
+apps64.elf
+apps64.bin
+apps-serial.log

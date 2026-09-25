@@ -27,6 +27,8 @@
 #define NANO_WM_H
 
 #define WM_MAXWIN   16
+// Longest window title kept. Copied rather than referenced -- see struct Win.
+#define WM_TITLE_MAX 48
 #define WM_MAXDMG   32
 
 // Title bar and border, in pixels.
@@ -39,7 +41,23 @@ struct Win {
     long used;
     long x; long y; long w; long h;     // outer rectangle, screen coordinates
     long *pix;                          // w*h pixels, 0x00RRGGBB, one per long
-    char *title;
+    // The title is COPIED, not pointed at.
+    //
+    // It used to be a `char *`, and the comment at SYS_WINOPEN said the title
+    // "is copied by wm_create, so the process's string does not have to
+    // outlive the call". That was not true -- wm_create stored the pointer.
+    // For a kernel-side window that is harmless, because the string is a
+    // literal in the same image. For a window opened BY A PROCESS it is a
+    // kernel that holds a user pointer forever and dereferences it every time
+    // it repaints a title bar, in whatever address space happens to be
+    // current. The symptom was a page fault at a user address, from KERNEL
+    // mode, in the kernel's own main thread -- a fault that looks nothing
+    // like the program that caused it.
+    //
+    // Worse than the crash: with a different process's address space loaded,
+    // that same pointer resolves to THAT process's memory, and the window
+    // manager paints whatever it finds there into a title bar.
+    char title[WM_TITLE_MAX];
     long visible;
     long bg;
     long accent;                        // title bar colour when focused
@@ -213,7 +231,14 @@ long wm_create(long x, long y, long w, long h, char *title) {
     g_win[i].used = 1;
     g_win[i].x = x; g_win[i].y = y; g_win[i].w = w; g_win[i].h = h;
     g_win[i].pix = buf;
-    g_win[i].title = title;
+    {
+        long t;
+        t = 0;
+        if (title) {
+            while (t < WM_TITLE_MAX - 1 && title[t]) { g_win[i].title[t] = title[t]; t = t + 1; }
+        }
+        g_win[i].title[t] = 0;
+    }
     g_win[i].visible = 1;
     g_win[i].bg = rgb(240, 240, 240);
     g_win[i].accent = rgb(40, 80, 160);

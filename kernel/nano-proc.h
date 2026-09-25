@@ -816,6 +816,22 @@ long proc_wait(long pid) {
 // one.
 #define SYS_NAP    18
 
+// The calls a GUI program needs that a shell never did.
+//
+// SYS_TRUNCATE and SYS_SYNC exist because an editor's Save is not a write --
+// it is "make the file be exactly these bytes". Without truncate, saving a
+// shorter file leaves the tail of the longer one behind it; without sync, the
+// write reaches an in-memory image and dies with the machine.
+//
+// SYS_MKDIR, SYS_RENAME and SYS_READDIR exist because a file manager cannot
+// be written without them. The kernel already had all five operations; there
+// was simply no way to ask for them from a process.
+#define SYS_TRUNCATE 19
+#define SYS_SYNC     20
+#define SYS_MKDIR    21
+#define SYS_RENAME   22
+#define SYS_READDIR  23
+
 // The window calls. Numbers exist whether or not a window manager was
 // compiled in; the IMPLEMENTATIONS are behind #ifdef NANO_WM_H and every one
 // of them answers -1 when it is absent. A syscall number that means one thing
@@ -1159,6 +1175,46 @@ long syscall_dispatch(long nr, long a, long b, long c, long d, long e) {
     // that owns g_ticks and is included after this one.
     if (nr == SYS_UNLINK) return fs_unlink(proc_path(slot, (char *)a));
 
+    if (nr == SYS_TRUNCATE) {
+        long ino;
+        ino = fs_lookup(proc_path(slot, (char *)a));
+        if (ino <= 0) return -1;
+        return fs_truncate(ino) ? 0 : -1;
+    }
+
+    // Returns the number of blocks written, or -1 if this filesystem is not
+    // on a disk at all -- which a caller that cares about durability has to
+    // be able to tell apart from "wrote nothing".
+    if (nr == SYS_SYNC) return fs_sync();
+
+    if (nr == SYS_MKDIR) return fs_mkdir(proc_path(slot, (char *)a)) ? 0 : -1;
+
+    // Both paths go through proc_path, and proc_path returns a pointer into
+    // ONE per-process buffer -- so resolving the second would overwrite the
+    // first. The source is copied out before the destination is resolved.
+    if (nr == SYS_RENAME) {
+        char from[128];
+        char *p2;
+        long i;
+        p2 = proc_path(slot, (char *)a);
+        i = 0;
+        while (p2[i] && i < 127) { from[i] = p2[i]; i = i + 1; }
+        from[i] = 0;
+        if (p2[i]) return -1;
+        return fs_rename(from, proc_path(slot, (char *)b)) ? 0 : -1;
+    }
+
+    // (path, index, name_out) -> 1 if there was an entry, 0 if not.
+    // The name buffer is the caller's, so it is range-checked: 64 bytes,
+    // which is the most fs_readdir will ever write.
+    if (nr == SYS_READDIR) {
+        long dir;
+        if (slot >= 0 && !user_range_ok(slot, c, 64)) return -1;
+        dir = fs_lookup(proc_path(slot, (char *)a));
+        if (dir <= 0) return -1;
+        return fs_readdir(dir, b, (char *)c);
+    }
+
 #ifdef NANO_WM_H
     // ---------- the window calls ----------
 
@@ -1301,8 +1357,14 @@ long syscall_dispatch(long nr, long a, long b, long c, long d, long e) {
             // background program eat the keys meant for whatever the user is
             // actually looking at. Same reason SYS_READ on fd 0 returns
             // end-of-file rather than the shell's keyboard.
+            // kbd_getKEY_nb, not kbd_getchar_nb. The char version
+            // deliberately drops anything above 255 so that a truncated
+            // arrow key cannot arrive as an unrelated letter -- correct for
+            // a program reading characters, and fatal for one reading keys,
+            // because out[3] is a long and every key an editor needs lives
+            // above 255. A process could not see an arrow key at all.
             out[3] = 0;
-            if (g_focus == a && kbd_available()) out[3] = kbd_getchar_nb();
+            if (g_focus == a && kbd_available()) out[3] = kbd_getkey_nb();
             out[4] = wm_client_w(a);
             out[5] = wm_client_h(a);
         }

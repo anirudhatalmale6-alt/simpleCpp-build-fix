@@ -40,3 +40,25 @@ syscall4:
     mov %rcx, %rdx
     int $0x80
     ret
+
+/* long syscall6(long nr, long a, long b, long c, long d, long e)
+ *
+ * Five arguments, for SYS_WINOPEN(x, y, w, h, title). C hands us
+ * (nr, a, b, c, d, e) in rdi, rsi, rdx, rcx, r8, r9; the kernel wants nr in
+ * rax and the arguments in rdi, rsi, rdx, r10, r8.
+ *
+ * ORDER MATTERS, and not in the obvious direction. The left-to-right shuffle
+ * that syscall4 uses works because each destination has already been read;
+ * here r8 is BOTH a source (argument d) and a destination (argument d), so it
+ * is moved through r10 first and r9 lands in r8 afterwards. Written the tidy
+ * way round, the fifth argument arrives as a copy of the fourth. */
+.globl syscall6
+syscall6:
+    mov %rdi, %rax              /* nr */
+    mov %rsi, %rdi              /* a */
+    mov %rdx, %rsi              /* b */
+    mov %rcx, %rdx              /* c */
+    mov %r8,  %r10              /* d -> r10, before r8 is overwritten */
+    mov %r9,  %r8               /* e */
+    int $0x80
+    ret

@@ -17,7 +17,8 @@ QEMU   := qemu-system-x86_64
 # nothing. The symptom was gshell64.bin assembling progs.s before the binaries
 # it .incbin's had been built -- "file not found: user/hello.elf" on a clean
 # tree, and a perfectly good build on the second attempt.
-UPROGS := user/hello.elf user/twin.elf user/wild.elf user/cc.elf user/as.elf
+UPROGS := user/hello.elf user/twin.elf user/wild.elf user/cc.elf user/as.elf \
+          user/uidemo.elf
 QFLAGS := -kernel kernel.elf -no-reboot
 
 # No built-in rules.
@@ -709,6 +710,38 @@ srvtest: srv.elf
 # Filesystem: a RAM disk, a Unix-shaped layout (superblock, bitmaps, inodes,
 # directory entries), and the operations the shell tools need.
 # ---------------------------------------------------------------------------
+# apps -- the widget toolkit running as a process, and the crash test.
+apps.s: apps.c nano-kernel.h nano-fb.h nano-mouse.h nano-int.h nano-mm.h \
+        nano-thread.h nano-fs.h nano-wm.h nano-wmin.h nano-term.h nano-proc.h $(NANO)
+	$(NANO) --kernel apps.c apps.s
+
+apps64.bin: boot64.s isr.s apps.s progs.s $(UPROGS) kernel64.ld
+	as --64 boot64.s -o boot64.o
+	as --64 isr.s    -o isr.o
+	as --64 apps.s   -o appsk.o
+	as --64 progs.s  -o progs.o
+	ld -T kernel64.ld -o apps64.elf boot64.o isr.o appsk.o progs.o
+	objcopy -O binary apps64.elf apps64.bin
+
+blob-apps.s:
+	@printf '.section .blob, "a"\n.incbin "apps64.bin"\n' > $@
+
+apps.elf: boot32.s blob-apps.s apps64.bin final.ld
+	as --32 boot32.s    -o boot32.o
+	as --32 blob-apps.s -o blob-apps.o
+	ld -m elf_i386 -T final.ld -o apps.elf boot32.o blob-apps.o
+
+apps: apps.elf
+
+appsrun: apps.elf
+	$(QEMU) -kernel apps.elf -no-reboot
+
+appstest: apps.elf
+	@rm -f apps-serial.log
+	@timeout 220 $(QEMU) -kernel apps.elf -no-reboot -display none \
+	   -serial file:apps-serial.log >/dev/null 2>&1; true
+	@tr -d '\r' < apps-serial.log
+
 # fsdisk -- the filesystem on a real ATA disk. Built like every other image,
 # but it is the only one that needs a DRIVE attached, and the only one whose
 # result depends on what a previous run left behind.
@@ -947,6 +980,18 @@ user/ustart.o: user/ustart.s
 # The `cd user` is needed too: nano_cc resolves #include against the working
 # directory, not against the file doing the including, so nano-user.h is only
 # findable from inside that directory.
+# A GUI program. The widget toolkit is NOT copied or forked for user space --
+# nano-ui.h and nano-font.h are refreshed from the kernel's own copies at
+# build time, the same way user/cc.elf refreshes nano-libc.h, so there is one
+# nano-ui.h in this tree and both the kernel images and the apps compile it.
+# The copies in user/ are build products and are gitignored.
+user/uidemo.elf: user/uidemo.c user/nano-uiapp.h user/nano-user.h nano-ui.h \
+                 nano-font.h user/ustart.o user/user.ld $(NANO)
+	@cp nano-ui.h nano-font.h user/
+	cd user && ../$(NANO) --kernel --bss uidemo.c uidemo.s
+	as --64 user/uidemo.s -o user/uidemo.o
+	ld -T user/user.ld -z max-page-size=0x1000 -o $@ user/ustart.o user/uidemo.o
+
 user/%.elf: user/%.c user/nano-user.h user/ustart.o user/user.ld $(NANO)
 	cd user && ../$(NANO) --kernel --bss $*.c $*.s
 	as --64 user/$*.s -o user/$*.o
