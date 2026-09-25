@@ -18,7 +18,7 @@ QEMU   := qemu-system-x86_64
 # it .incbin's had been built -- "file not found: user/hello.elf" on a clean
 # tree, and a perfectly good build on the second attempt.
 UPROGS := user/hello.elf user/twin.elf user/wild.elf user/cc.elf user/as.elf \
-          user/uidemo.elf user/edit.elf user/files.elf
+          user/uidemo.elf user/edit.elf user/files.elf user/sh.elf
 QFLAGS := -kernel kernel.elf -no-reboot
 
 # No built-in rules.
@@ -1019,6 +1019,13 @@ user/edit.elf: user/edit.c user/nano-uiapp.h user/nano-user.h nano-ui.h \
 	cd user && ../$(NANO) --kernel --bss edit.c edit.s
 	as --64 user/edit.s -o user/edit.o
 	ld -T user/user.ld -z max-page-size=0x1000 -o $@ user/ustart.o user/edit.o
+
+user/sh.elf: user/sh.c user/nano-uiapp.h user/nano-user.h nano-ui.h \
+             nano-font.h user/ustart.o user/user.ld $(NANO)
+	@cp nano-ui.h nano-font.h user/
+	cd user && ../$(NANO) --kernel --bss sh.c sh.s
+	as --64 user/sh.s -o user/sh.o
+	ld -T user/user.ld -z max-page-size=0x1000 -o $@ user/ustart.o user/sh.o
 
 user/files.elf: user/files.c user/nano-uiapp.h user/nano-user.h nano-ui.h \
                 nano-font.h user/ustart.o user/user.ld $(NANO)

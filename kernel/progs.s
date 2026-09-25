@@ -48,6 +48,11 @@ p_files:
     .incbin "user/files.elf"
 p_files_end:
 
+.align 16
+p_sh:
+    .incbin "user/sh.elf"
+p_sh_end:
+
 /* The C compiler. 131 KB, which is most of this image -- and 19.6 MB before
  * nano_cc learned to leave uninitialised globals in .bss instead of writing
  * their zero bytes into the object. */
@@ -229,6 +234,16 @@ prog_files_addr:
 .globl prog_files_size
 prog_files_size:
     mov $(p_files_end - p_files), %rax
+    ret
+
+.globl prog_sh_addr
+prog_sh_addr:
+    lea p_sh(%rip), %rax
+    ret
+
+.globl prog_sh_size
+prog_sh_size:
+    mov $(p_sh_end - p_sh), %rax
     ret
 
 .globl prog_cc_addr

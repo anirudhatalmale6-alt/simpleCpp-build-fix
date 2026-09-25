@@ -74,6 +74,8 @@ extern long prog_edit_addr();
 extern long prog_edit_size();
 extern long prog_files_addr();
 extern long prog_files_size();
+extern long prog_sh_addr();
+extern long prog_sh_size();
 
 // ALWAYS overwrite, and truncate first.
 //
@@ -107,6 +109,27 @@ long window_count() {
     return n;
 }
 
+// The window belonging to a named program, or -1.
+//
+// By TITLE, which only works because wm_create copies the title into the
+// window now rather than keeping the process's pointer. Before that fix this
+// helper could not have existed -- reading g_win[i].title from the kernel
+// would have been reading another address space.
+//
+// The alternative, "the highest-numbered window in use", is what I had, and
+// it quietly picked whichever app happened to sit at the top of the table.
+// The keystrokes went to that one instead of the shell and the shell simply
+// never saw them.
+long window_titled(char *want) {
+    long i;
+    i = 0;
+    while (i < WM_MAXWIN) {
+        if (g_win[i].used && !strcmp(g_win[i].title, want)) return i;
+        i = i + 1;
+    }
+    return -1;
+}
+
 // Run the app until it has been alive for `ticks`, polling the process table
 // the way a shell would. Returns 1 if it was still running at the end.
 long run_for(long pid, long ticks) {
@@ -115,10 +138,10 @@ long run_for(long pid, long ticks) {
     while (g_ticks - t0 < ticks) {
         proc_poll();
         wm_present();
-        if (!proc_alive(pid)) return 0;
+        if (!proc_running(pid)) return 0;
         thread_yield();
     }
-    return proc_alive(pid);
+    return proc_running(pid);
 }
 
 void main_thread(long unused) {
@@ -181,8 +204,8 @@ void main_thread(long unused) {
         if (hp) {
             long t0;
             t0 = g_ticks;
-            while (g_ticks - t0 < 30 && proc_alive(hp)) { proc_poll(); thread_yield(); }
-            expect_true("...and it finished", proc_alive(hp) == 0);
+            while (g_ticks - t0 < 30 && proc_running(hp)) { proc_poll(); thread_yield(); }
+            expect_true("...and it finished", proc_running(hp) == 0);
         }
     }
 
@@ -201,7 +224,7 @@ void main_thread(long unused) {
     // Give it long enough to open its window and draw a frame.
     run_for(pid, 40);
     expect("the PROCESS opened a window", window_count(), before + 1);
-    expect_true("...and is still running", proc_alive(pid) == 1);
+    expect_true("...and is still running", proc_running(pid) == 1);
 
     // It drew through the same nano-ui.h the kernel compiles. The evidence
     // that it drew at all is pixels in the window that are not the colour it
@@ -264,14 +287,14 @@ void main_thread(long unused) {
 
         kbd_push('x');
         t0 = g_ticks;
-        while (g_ticks - t0 < 60 && proc_alive(pid)) {
+        while (g_ticks - t0 < 60 && proc_running(pid)) {
             proc_poll();
             wm_present();
             thread_yield();
         }
     }
 
-    expect_true("the process is gone", proc_alive(pid) == 0);
+    expect_true("the process is gone", proc_running(pid) == 0);
 
     // THE CHECKS THAT MATTER. Each of these can only pass if the machine is
     // still working, rather than merely still printing.
@@ -299,7 +322,7 @@ void main_thread(long unused) {
     if (pid) {
         run_for(pid, 40);
         expect_true("...opens its window", window_count() == before + 1);
-        expect_true("...and is running", proc_alive(pid) == 1);
+        expect_true("...and is running", proc_running(pid) == 1);
     }
 
     // ---------- the two real apps ----------
@@ -337,7 +360,7 @@ void main_thread(long unused) {
         // BOTH at once, which a single-program demo could never show: two
         // independent address spaces, two windows, one compositor.
         expect("both opened windows, at the same time", window_count(), w0 + 2);
-        expect_true("...and both are running", proc_alive(ep) && proc_alive(fp));
+        expect_true("...and both are running", proc_running(ep) && proc_running(fp));
     }
 
     // ---------- does the app's Save outlive the machine ----------
@@ -387,6 +410,77 @@ void main_thread(long unused) {
         }
         expect_true("...and the apps are still installed",
                     fs_lookup("/bin/edit") > 0 && fs_lookup("/bin/files") > 0);
+    }
+
+    // ---------- the shell, and a process starting a process ----------
+    puts("\n-- 6. a PROCESS starting a process --\n");
+    install("/bin/sh", prog_sh_addr(), prog_sh_size());
+    fs_sync();
+
+    {
+        long sp;
+        char *sav[2];
+        long before_procs;
+
+        before_procs = proc_alive();
+        sav[0] = "/bin/sh";
+        sp = proc_spawn("/bin/sh", 1, sav, "sh", "/");
+        expect_true("the shell spawns", sp != 0);
+
+        if (sp) {
+            long t0;
+            t0 = g_ticks;
+            while (g_ticks - t0 < 40) { proc_poll(); wm_present(); thread_yield(); }
+            expect_true("...and opens its window", proc_running(sp) == 1);
+
+            // Type a command into it the way a person would, through the
+            // same keyboard ring: focus its window, send "ls", then Enter.
+            {
+                long hnd;
+                hnd = window_titled("shell");
+                expect_true("...and its window can be found by title", hnd >= 0);
+                if (hnd >= 0) wm_set_focus(hnd);
+            }
+            kbd_push('h'); kbd_push('e'); kbd_push('l'); kbd_push('p');
+            kbd_push('\n');
+            t0 = g_ticks;
+            while (g_ticks - t0 < 40) { proc_poll(); wm_present(); thread_yield(); }
+            expect_true("...and survives being typed at", proc_running(sp) == 1);
+
+            // THE CHECK THIS MILESTONE IS FOR: type a command that starts a
+            // PROGRAM and redirects its output to a FILE. If /out.txt ends up
+            // with hello's output in it, then a process spawned a process and
+            // fd 1 was redirected -- neither of which was possible before.
+            {
+                char *cmd;
+                long k;
+                long ino;
+                cmd = "hello > out.txt";
+                k = 0;
+                while (cmd[k]) { kbd_push(cmd[k]); k = k + 1; }
+                kbd_push('\n');
+
+                t0 = g_ticks;
+                while (g_ticks - t0 < 120) { proc_poll(); wm_present(); thread_yield(); }
+
+                ino = fs_lookup("/out.txt");
+                expect_true("the shell ran a program and redirected it to a file",
+                            ino > 0 && fs_size(ino) > 0);
+                if (ino > 0) {
+                    char b[128];
+                    long n;
+                    n = fs_read(ino, 0, b, 127);
+                    if (n < 0) n = 0;
+                    b[n] = 0;
+                    printf("  /out.txt holds %d bytes: %s", n, b);
+                    // hello prints a line starting "hello from a user program".
+                    expect_true("...and it is the program's own output",
+                                n > 10 && b[0] == 'h' && b[1] == 'e');
+                }
+                expect_true("...and the shell is still running afterwards",
+                            proc_running(sp) == 1);
+            }
+        }
     }
 
     printf("\nheap: %d pages mapped\n", heap_pages);

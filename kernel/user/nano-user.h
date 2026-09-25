@@ -48,6 +48,8 @@ extern long syscall6(long nr, long a, long b, long c, long d, long e);
 #define SYS_RENAME     22
 #define SYS_READDIR    23
 #define SYS_ISDIR      24
+#define SYS_SPAWN      25
+#define SYS_WAIT       26
 
 // The non-character keys, as delivered by SYS_WINPOLL in out[3].
 //
@@ -107,6 +109,20 @@ long readdir_(char *path, long i, char *nm) { return syscall4(SYS_READDIR, (long
 // Cannot be inferred from readdir_: calling that on a file reads the file's
 // own bytes as directory entries and answers from whatever it finds.
 long isdir_(char *path)                     { return syscall4(SYS_ISDIR, (long)path, 0, 0); }
+
+// ---------- starting other programs ----------
+//
+// spawn(path, argc, argv, outfd, infd) -> pid, or 0 if it could not start.
+//
+// outfd and infd are descriptors of YOURS to give the child as its stdout and
+// stdin; -1 means "inherit the console". That is the whole redirection
+// mechanism -- `prog > file` opens the file and passes that fd.
+long spawn(char *path, long argc, char **argv, long outfd, long infd) {
+    return syscall6(SYS_SPAWN, (long)path, argc, (long)argv, outfd, infd);
+}
+// The child's exit code once it has finished, or -1 while it is still
+// running. Does NOT block -- poll it.
+long waitpid_(long pid)                     { return syscall4(SYS_WAIT, pid, 0, 0); }
 
 // ---------- windows ----------
 long win_open(long x, long y, long w, long h, char *title) {

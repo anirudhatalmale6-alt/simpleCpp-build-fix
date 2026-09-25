@@ -230,3 +230,6 @@ user/edit.elf
 user/files.s
 user/files.o
 user/files.elf
+user/sh.s
+user/sh.o
+user/sh.elf

@@ -442,6 +442,12 @@ long elf_load(long root, char *img, long len, long *top_out) {
 // until a program included a header that included another one.
 #define MAX_FDS   16
 
+// Descriptor kinds. FD_NONE is 0 so a zeroed table is all-closed, which is
+// what proc_spawn relies on.
+#define FD_NONE    0
+#define FD_CONSOLE 1
+#define FD_FILE    2
+
 // argv. Eight arguments of 128 bytes is not a POSIX limit, it is a limit that
 // fits on the initial stack page without needing a second one.
 #define MAX_ARGS  8
@@ -461,7 +467,20 @@ struct Proc {
     long brk_base;             // first byte of its heap
     long brk;                  // current break
     long exitcode;
-    long fd_ino[MAX_FDS];      // 0 = closed; entries 0..2 are the console
+    // What each descriptor IS, not just what it points at.
+    //
+    // fd_ino alone could only ever mean "an inode", and fd 1 and 2 were
+    // hardcoded to the console inside SYS_WRITE -- not defaulted, hardcoded,
+    // with no indirection anywhere. That is fine until something wants to be
+    // redirected, and then there is nowhere to put the answer. A shell that
+    // can say `prog > file` needs fd 1 to be a THING rather than a special
+    // case, and a shell that can say `a | b` needs it to be a thing that is
+    // not a file at all.
+    //
+    // So a descriptor has a KIND. Today: closed, the console, or a file.
+    // A pipe end is the next kind and slots in without moving anything.
+    long fd_kind[MAX_FDS];
+    long fd_ino[MAX_FDS];      // the inode, when fd_kind is FD_FILE
     long fd_pos[MAX_FDS];
     char name[32];
     char cwd[64];              // what a relative path is relative to
@@ -683,7 +702,17 @@ long proc_spawn(char *path, long argc, char **argv, char *name, char *cwd) {
     {
         long i;
         i = 0;
-        while (i < MAX_FDS) { g_procs[slot].fd_ino[i] = 0; g_procs[slot].fd_pos[i] = 0; i = i + 1; }
+        while (i < MAX_FDS) {
+            g_procs[slot].fd_kind[i] = FD_NONE;
+            g_procs[slot].fd_ino[i] = 0;
+            g_procs[slot].fd_pos[i] = 0;
+            i = i + 1;
+        }
+        // stdin, stdout, stderr. Named rather than assumed, so that a caller
+        // that wants to redirect one has somewhere to write the change.
+        g_procs[slot].fd_kind[0] = FD_CONSOLE;
+        g_procs[slot].fd_kind[1] = FD_CONSOLE;
+        g_procs[slot].fd_kind[2] = FD_CONSOLE;
     }
     {
         long i;
@@ -753,6 +782,12 @@ long proc_poll() {
     return n;
 }
 
+// How many processes are running. Takes NO argument -- and nano_cc will
+// happily let a caller pass one and silently ignore it, so a
+// `proc_alive(pid)` reads like "is that process alive" and answers "how many
+// processes are there". Both were true at the same time in the apps test and
+// it passed for the wrong reason. Use proc_running(pid) when the question is
+// about a particular process.
 long proc_alive() {
     long i;
     long n;
@@ -760,6 +795,44 @@ long proc_alive() {
     i = 0;
     while (i < MAX_PROCS) { if (g_procs[i].state == P_RUNNING) n = n + 1; i = i + 1; }
     return n;
+}
+
+// Which slot holds this pid, or -1.
+long proc_slot_of(long pid) {
+    long i;
+    i = 0;
+    while (i < MAX_PROCS) {
+        if (g_procs[i].pid == pid && g_procs[i].state != P_FREE) return i;
+        i = i + 1;
+    }
+    return -1;
+}
+
+// Is THIS pid still running?
+long proc_running(long pid) {
+    long i;
+    i = 0;
+    while (i < MAX_PROCS) {
+        if (g_procs[i].pid == pid && g_procs[i].state == P_RUNNING) return 1;
+        i = i + 1;
+    }
+    return 0;
+}
+
+// The exit code of a finished process, or -1 if it is still running or was
+// never here. Reaped processes keep their slot's pid and exitcode until the
+// slot is reused, which is what lets a shell ask after the fact.
+long proc_exitcode(long pid) {
+    long i;
+    i = 0;
+    while (i < MAX_PROCS) {
+        if (g_procs[i].pid == pid) {
+            if (g_procs[i].state == P_RUNNING) return -1;
+            return g_procs[i].exitcode;
+        }
+        i = i + 1;
+    }
+    return -1;
 }
 
 // Wait for a pid, yielding meanwhile. Returns its exit code, or -1.
@@ -839,6 +912,27 @@ long proc_wait(long pid) {
 // directory entries -- which would answer, and answer wrongly, from whatever
 // the file happened to contain.
 #define SYS_ISDIR    24
+
+// A process starting another process, which the shell cannot exist without.
+//
+// SYS_SPAWN(path, argc, argv, outfd, infd) -> pid, or 0.
+//
+// Not fork+exec. fork duplicates an address space, and this kernel has no
+// copy-on-write -- a fork would have to copy every mapped page of the parent
+// so the child could immediately throw all of them away at exec. spawn says
+// the thing the shell actually means in one call.
+//
+// outfd and infd are the CALLER'S descriptors to give the child as its stdout
+// and stdin, or -1 to inherit the console. That is the whole redirection
+// mechanism: `prog > file` opens the file and passes that fd; `a | b` will
+// pass the two ends of a pipe. The child gets its own copy, so the parent
+// closing its end afterwards does not shut the child's.
+#define SYS_SPAWN    25
+// SYS_WAIT(pid) -> exit code once it has finished, or -1 while it runs.
+// Does not block: this OS is cooperative above the timer, and a syscall that
+// slept inside the kernel on a process that might never exit is a hang with
+// no way out. The shell polls, which is honest about what it is doing.
+#define SYS_WAIT     26
 
 // The window calls. Numbers exist whether or not a window manager was
 // compiled in; the IMPLEMENTATIONS are behind #ifdef NANO_WM_H and every one
@@ -974,9 +1068,13 @@ long sys_open(long slot, char *path, long flags) {
     // the file is a valid-looking splice of two different outputs -- which is
     // exactly what a compiler run over an earlier, longer output would produce.
     if ((flags & O_TRUNC) && fs_type(ino) == T_FILE) fs_truncate(ino);
+    // Search on the KIND, not on fd_ino. A descriptor that is a pipe end has
+    // no inode, so a free-slot search that looks at fd_ino alone would hand
+    // out a descriptor that is already in use.
     fd = 3;
     while (fd < MAX_FDS) {
-        if (!g_procs[slot].fd_ino[fd]) {
+        if (g_procs[slot].fd_kind[fd] == FD_NONE) {
+            g_procs[slot].fd_kind[fd] = FD_FILE;
             g_procs[slot].fd_ino[fd] = ino;
             g_procs[slot].fd_pos[fd] = 0;
             return fd;
@@ -1092,15 +1190,23 @@ long syscall_dispatch(long nr, long a, long b, long c, long d, long e) {
     if (nr == SYS_WRITE) {
         char *p;
         long i;
+        long kind;
         if (c < 0) return -1;
         if (!user_range_ok(slot, b, c)) return -1;
-        if (a == 1 || a == 2) {
+        if (a < 0 || a >= MAX_FDS) return -1;
+
+        // The kind decides, not the number. fd 1 is the console because
+        // nothing has redirected it, not because it is 1.
+        kind = (slot < 0) ? FD_CONSOLE : g_procs[slot].fd_kind[a];
+        if (slot < 0 && a > 2) return -1;
+
+        if (kind == FD_CONSOLE) {
             p = (char *)b;
             i = 0;
             while (i < c) { putc(p[i]); i = i + 1; }
             return c;
         }
-        if (slot < 0 || a < 3 || a >= MAX_FDS || !g_procs[slot].fd_ino[a]) return -1;
+        if (kind != FD_FILE || !g_procs[slot].fd_ino[a]) return -1;
         {
             long n;
             n = fs_write(g_procs[slot].fd_ino[a], g_procs[slot].fd_pos[a], (char *)b, c);
@@ -1110,12 +1216,17 @@ long syscall_dispatch(long nr, long a, long b, long c, long d, long e) {
     }
 
     if (nr == SYS_READ) {
-        // fd 0 is the console, and there is nothing behind it yet: a process
-        // has no terminal of its own, and handing it the shell's keyboard
-        // would let a background task eat the shell's keystrokes. Returning 0
-        // means end-of-file, which is at least a truthful answer.
-        if (a == 0) return 0;
-        if (slot < 0 || a < 3 || a >= MAX_FDS || !g_procs[slot].fd_ino[a]) return -1;
+        long kind;
+        if (a < 0 || a >= MAX_FDS) return -1;
+        kind = (slot < 0) ? FD_CONSOLE : g_procs[slot].fd_kind[a];
+
+        // A console read is end-of-file. A process has no terminal of its
+        // own, and handing it the shell's keyboard would let a background
+        // task eat the keystrokes meant for whatever the user is looking at.
+        // EOF is at least a truthful answer, and it is what makes a program
+        // reading stdin terminate rather than hang.
+        if (kind == FD_CONSOLE) return 0;
+        if (kind != FD_FILE || !g_procs[slot].fd_ino[a]) return -1;
         if (c < 0) return -1;
         if (!user_range_ok(slot, b, c)) return -1;
         {
@@ -1133,7 +1244,9 @@ long syscall_dispatch(long nr, long a, long b, long c, long d, long e) {
 
     if (nr == SYS_CLOSE) {
         if (slot < 0 || a < 3 || a >= MAX_FDS) return -1;
+        g_procs[slot].fd_kind[a] = FD_NONE;
         g_procs[slot].fd_ino[a] = 0;
+        g_procs[slot].fd_pos[a] = 0;
         return 0;
     }
 
@@ -1210,6 +1323,70 @@ long syscall_dispatch(long nr, long a, long b, long c, long d, long e) {
         from[i] = 0;
         if (p2[i]) return -1;
         return fs_rename(from, proc_path(slot, (char *)b)) ? 0 : -1;
+    }
+
+    if (nr == SYS_SPAWN) {
+        char *av[8];
+        long i;
+        long nav;
+        long pid;
+        long child;
+        char path[128];
+        long *uav;
+
+        if (slot < 0) return 0;
+        // The path is copied out FIRST: proc_path returns a pointer into the
+        // caller's one pathbuf, and resolving the argv strings below would
+        // overwrite it.
+        {
+            char *rp;
+            rp = proc_path(slot, (char *)a);
+            i = 0;
+            while (rp[i] && i < 127) { path[i] = rp[i]; i = i + 1; }
+            path[i] = 0;
+            if (rp[i]) return 0;
+        }
+
+        nav = b;
+        if (nav < 0) nav = 0;
+        if (nav > 8) nav = 8;
+        if (nav > 0) {
+            if (!user_range_ok(slot, c, nav * 8)) return 0;
+            uav = (long *)c;
+            i = 0;
+            while (i < nav) {
+                // Each argv entry is a pointer the process gave us. Checking
+                // the ARRAY is not checking the strings it points at.
+                if (!user_range_ok(slot, uav[i], 1)) return 0;
+                av[i] = (char *)uav[i];
+                i = i + 1;
+            }
+        }
+
+        pid = proc_spawn(path, nav, av, path, g_procs[slot].cwd);
+        if (!pid) return 0;
+
+        // Hand the child the descriptors the caller asked for. Done after the
+        // spawn, because the child's slot does not exist until then.
+        child = proc_slot_of(pid);
+        if (child >= 0) {
+            if (d >= 0 && d < MAX_FDS && g_procs[slot].fd_kind[d] != FD_NONE) {
+                g_procs[child].fd_kind[1] = g_procs[slot].fd_kind[d];
+                g_procs[child].fd_ino[1]  = g_procs[slot].fd_ino[d];
+                g_procs[child].fd_pos[1]  = g_procs[slot].fd_pos[d];
+            }
+            if (e >= 0 && e < MAX_FDS && g_procs[slot].fd_kind[e] != FD_NONE) {
+                g_procs[child].fd_kind[0] = g_procs[slot].fd_kind[e];
+                g_procs[child].fd_ino[0]  = g_procs[slot].fd_ino[e];
+                g_procs[child].fd_pos[0]  = g_procs[slot].fd_pos[e];
+            }
+        }
+        return pid;
+    }
+
+    if (nr == SYS_WAIT) {
+        if (proc_running(a)) return -1;
+        return proc_exitcode(a);
     }
 
     if (nr == SYS_ISDIR) {
