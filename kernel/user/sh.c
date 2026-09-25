@@ -359,7 +359,9 @@ void run(char *line) {
             close(fds[0]);
             close(fds[1]);
 
-            if (lpid && rpid) {
+            // > 0 rather than merely non-zero, to match start()'s other
+            // callers: a failed syscall reports -1, which is truthy.
+            if (lpid > 0 && rpid > 0) {
                 out_str("["); out_num(lpid); out_str(" | "); out_num(rpid); out_str("]\n");
                 g_child = rpid;
                 str_copy(g_childname, "pipeline", 64);

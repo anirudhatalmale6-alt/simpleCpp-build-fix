@@ -409,6 +409,15 @@ void main_thread(long unused) {
                 while (want[q]) { if (buf[q] != want[q]) same = 0; q = q + 1; }
                 if (buf[q] != 0) same = 0;
                 if (n != 26) same = 0;
+                // Print what came back whenever it is wrong. A bare FAIL here
+                // says only "not equal", and the three ways it can be unequal
+                // -- short read, right bytes with the wrong length, or the
+                // right length holding somebody else's data -- need completely
+                // different investigations.
+                if (!same) {
+                    printf("  read %d bytes (wanted 26), size %d: [%s]\n",
+                           n, fs_size(ino), buf);
+                }
                 expect_true("...byte for byte, and the right length", same);
             }
         }
@@ -422,6 +431,31 @@ void main_thread(long unused) {
     install("/bin/cat", prog_cat_addr(), prog_cat_size());
     install("/bin/bulk", prog_bulk_addr(), prog_bulk_size());
     fs_sync();
+
+    // Re-read the file written earlier in THIS boot, now that three more
+    // programs have been installed on top of it.
+    //
+    // Boot 2 was reporting the right file with the wrong contents, and that
+    // has two very different causes: the installs above trampling its blocks
+    // while everything is still in memory, or the disk round-trip losing it.
+    // Checking here, before the machine goes down, tells the two apart -- a
+    // failure on the next boot alone cannot.
+    {
+        long vino;
+        char vbuf[64];
+        long vn;
+        vino = fs_lookup("/by-app.txt");
+        if (vino > 0) {
+            vn = fs_read(vino, 0, vbuf, 63);
+            if (vn < 0) vn = 0;
+            vbuf[vn] = 0;
+            printf("  /by-app.txt in memory after the installs: %d bytes [%s]\n",
+                   vn, vbuf);
+            printf("  blocks free: %d\n", blocks_free());
+        } else if (!g_second_boot) {
+            printf("  /by-app.txt has GONE from the directory\n");
+        }
+    }
 
     {
         long sp;
