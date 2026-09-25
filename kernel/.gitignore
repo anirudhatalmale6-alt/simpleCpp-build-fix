@@ -221,4 +221,12 @@ apps.s
 apps.elf
 apps64.elf
 apps64.bin
-apps-serial.log
+apps-boot1.log
+apps-boot2.log
+apps-disk.img
+user/edit.s
+user/edit.o
+user/edit.elf
+user/files.s
+user/files.o
+user/files.elf

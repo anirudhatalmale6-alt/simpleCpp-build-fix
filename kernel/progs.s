@@ -38,6 +38,16 @@ p_uidemo:
     .incbin "user/uidemo.elf"
 p_uidemo_end:
 
+.align 16
+p_edit:
+    .incbin "user/edit.elf"
+p_edit_end:
+
+.align 16
+p_files:
+    .incbin "user/files.elf"
+p_files_end:
+
 /* The C compiler. 131 KB, which is most of this image -- and 19.6 MB before
  * nano_cc learned to leave uninitialised globals in .bss instead of writing
  * their zero bytes into the object. */
@@ -199,6 +209,26 @@ prog_wild_size:
 .globl prog_uidemo_size
 prog_uidemo_size:
     mov $(p_uidemo_end - p_uidemo), %rax
+    ret
+
+.globl prog_edit_addr
+prog_edit_addr:
+    lea p_edit(%rip), %rax
+    ret
+
+.globl prog_edit_size
+prog_edit_size:
+    mov $(p_edit_end - p_edit), %rax
+    ret
+
+.globl prog_files_addr
+prog_files_addr:
+    lea p_files(%rip), %rax
+    ret
+
+.globl prog_files_size
+prog_files_size:
+    mov $(p_files_end - p_files), %rax
     ret
 
 .globl prog_cc_addr

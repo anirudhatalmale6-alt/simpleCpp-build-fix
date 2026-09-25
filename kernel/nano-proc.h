@@ -831,6 +831,14 @@ long proc_wait(long pid) {
 #define SYS_MKDIR    21
 #define SYS_RENAME   22
 #define SYS_READDIR  23
+// Is this path a directory? The file manager has to know, to decide between
+// a folder icon and a document icon and between "go into it" and "open it".
+//
+// It cannot be worked out from SYS_READDIR: that returns the entry's INODE
+// number, and calling it on a FILE would read the file's own bytes as
+// directory entries -- which would answer, and answer wrongly, from whatever
+// the file happened to contain.
+#define SYS_ISDIR    24
 
 // The window calls. Numbers exist whether or not a window manager was
 // compiled in; the IMPLEMENTATIONS are behind #ifdef NANO_WM_H and every one
@@ -1204,7 +1212,16 @@ long syscall_dispatch(long nr, long a, long b, long c, long d, long e) {
         return fs_rename(from, proc_path(slot, (char *)b)) ? 0 : -1;
     }
 
-    // (path, index, name_out) -> 1 if there was an entry, 0 if not.
+    if (nr == SYS_ISDIR) {
+        long ino;
+        ino = fs_lookup(proc_path(slot, (char *)a));
+        if (ino <= 0) return -1;
+        return fs_type(ino) == T_DIR ? 1 : 0;
+    }
+
+    // (path, index, name_out) -> the entry's INODE number, or 0 when there is
+    // no entry at that index. Not a boolean: callers that want one must test
+    // for > 0, and the kernel-side file manager does.
     // The name buffer is the caller's, so it is range-checked: 64 bytes,
     // which is the most fs_readdir will ever write.
     if (nr == SYS_READDIR) {

@@ -18,7 +18,7 @@ QEMU   := qemu-system-x86_64
 # it .incbin's had been built -- "file not found: user/hello.elf" on a clean
 # tree, and a perfectly good build on the second attempt.
 UPROGS := user/hello.elf user/twin.elf user/wild.elf user/cc.elf user/as.elf \
-          user/uidemo.elf
+          user/uidemo.elf user/edit.elf user/files.elf
 QFLAGS := -kernel kernel.elf -no-reboot
 
 # No built-in rules.
@@ -712,7 +712,8 @@ srvtest: srv.elf
 # ---------------------------------------------------------------------------
 # apps -- the widget toolkit running as a process, and the crash test.
 apps.s: apps.c nano-kernel.h nano-fb.h nano-mouse.h nano-int.h nano-mm.h \
-        nano-thread.h nano-fs.h nano-wm.h nano-wmin.h nano-term.h nano-proc.h $(NANO)
+        nano-thread.h nano-ata.h nano-fs.h nano-wm.h nano-wmin.h nano-term.h \
+        nano-proc.h $(NANO)
 	$(NANO) --kernel apps.c apps.s
 
 apps64.bin: boot64.s isr.s apps.s progs.s $(UPROGS) kernel64.ld
@@ -733,14 +734,34 @@ apps.elf: boot32.s blob-apps.s apps64.bin final.ld
 
 apps: apps.elf
 
-appsrun: apps.elf
-	$(QEMU) -kernel apps.elf -no-reboot
+apps-disk.img:
+	dd if=/dev/zero of=apps-disk.img bs=1M count=8 2>/dev/null
 
+appsrun: apps.elf apps-disk.img
+	$(QEMU) -kernel apps.elf -no-reboot \
+	  -drive file=apps-disk.img,format=raw,if=ide
+
+# Two boots on one drive, like fsdisktest and edittest: the first runs the
+# apps and crashes one on purpose, the second has to find what it left.
 appstest: apps.elf
-	@rm -f apps-serial.log
+	@rm -f apps-disk.img apps-boot1.log apps-boot2.log
+	@dd if=/dev/zero of=apps-disk.img bs=1M count=8 2>/dev/null
+	@echo "--- boot 1: blank drive"
 	@timeout 220 $(QEMU) -kernel apps.elf -no-reboot -display none \
-	   -serial file:apps-serial.log >/dev/null 2>&1; true
-	@tr -d '\r' < apps-serial.log
+	   -serial file:apps-boot1.log \
+	   -drive file=apps-disk.img,format=raw,if=ide >/dev/null 2>&1; true
+	@echo "--- boot 2: same drive"
+	@timeout 220 $(QEMU) -kernel apps.elf -no-reboot -display none \
+	   -serial file:apps-boot2.log \
+	   -drive file=apps-disk.img,format=raw,if=ide >/dev/null 2>&1; true
+	@tr -d '\r' < apps-boot1.log
+	@tr -d '\r' < apps-boot2.log
+	@fail=0; \
+	grep -q "CHECKS FAILED" apps-boot1.log && { echo "FAIL: boot 1"; fail=1; }; \
+	grep -q "CHECKS FAILED" apps-boot2.log && { echo "FAIL: boot 2"; fail=1; }; \
+	grep -q "the file survived the reboot" apps-boot2.log || { echo "FAIL: boot 2 did not check persistence"; fail=1; }; \
+	if [ $$fail -eq 0 ]; then echo "PASS: apps, a survivable crash, and persistence"; \
+	else echo "APPS SEQUENCE FAILED"; exit 1; fi
 
 # fsdisk -- the filesystem on a real ATA disk. Built like every other image,
 # but it is the only one that needs a DRIVE attached, and the only one whose
@@ -991,6 +1012,20 @@ user/uidemo.elf: user/uidemo.c user/nano-uiapp.h user/nano-user.h nano-ui.h \
 	cd user && ../$(NANO) --kernel --bss uidemo.c uidemo.s
 	as --64 user/uidemo.s -o user/uidemo.o
 	ld -T user/user.ld -z max-page-size=0x1000 -o $@ user/ustart.o user/uidemo.o
+
+user/edit.elf: user/edit.c user/nano-uiapp.h user/nano-user.h nano-ui.h \
+               nano-font.h user/ustart.o user/user.ld $(NANO)
+	@cp nano-ui.h nano-font.h user/
+	cd user && ../$(NANO) --kernel --bss edit.c edit.s
+	as --64 user/edit.s -o user/edit.o
+	ld -T user/user.ld -z max-page-size=0x1000 -o $@ user/ustart.o user/edit.o
+
+user/files.elf: user/files.c user/nano-uiapp.h user/nano-user.h nano-ui.h \
+                nano-font.h user/ustart.o user/user.ld $(NANO)
+	@cp nano-ui.h nano-font.h user/
+	cd user && ../$(NANO) --kernel --bss files.c files.s
+	as --64 user/files.s -o user/files.o
+	ld -T user/user.ld -z max-page-size=0x1000 -o $@ user/ustart.o user/files.o
 
 user/%.elf: user/%.c user/nano-user.h user/ustart.o user/user.ld $(NANO)
 	cd user && ../$(NANO) --kernel --bss $*.c $*.s

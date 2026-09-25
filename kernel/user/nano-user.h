@@ -47,6 +47,7 @@ extern long syscall6(long nr, long a, long b, long c, long d, long e);
 #define SYS_MKDIR      21
 #define SYS_RENAME     22
 #define SYS_READDIR    23
+#define SYS_ISDIR      24
 
 // The non-character keys, as delivered by SYS_WINPOLL in out[3].
 //
@@ -99,8 +100,13 @@ long ftruncate_(char *path)                 { return syscall4(SYS_TRUNCATE, (lon
 long fsync_()                               { return syscall4(SYS_SYNC, 0, 0, 0); }
 long mkdir_(char *path)                     { return syscall4(SYS_MKDIR, (long)path, 0, 0); }
 long rename_(char *from, char *to)          { return syscall4(SYS_RENAME, (long)from, (long)to, 0); }
-// (path, index, name_out[64]) -> 1 if there was an entry there.
+// (path, index, name_out[64]) -> the entry's INODE number, or 0 if there is
+// no entry at that index. NOT a boolean -- test for > 0.
 long readdir_(char *path, long i, char *nm) { return syscall4(SYS_READDIR, (long)path, i, (long)nm); }
+// 1 if the path is a directory, 0 if it is a file, -1 if it does not exist.
+// Cannot be inferred from readdir_: calling that on a file reads the file's
+// own bytes as directory entries and answers from whatever it finds.
+long isdir_(char *path)                     { return syscall4(SYS_ISDIR, (long)path, 0, 0); }
 
 // ---------- windows ----------
 long win_open(long x, long y, long w, long h, char *title) {

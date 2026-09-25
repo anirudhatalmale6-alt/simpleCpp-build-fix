@@ -36,6 +36,7 @@
 #include "nano-mouse.h"
 #include "nano-mm.h"
 #include "nano-thread.h"
+#include "nano-ata.h"
 #include "nano-fs.h"
 #include "nano-wm.h"
 #include "nano-wmin.h"
@@ -44,6 +45,8 @@
 #include "nano-term.h"
 
 long g_fail;
+// Whether this boot mounted a filesystem a previous boot left behind.
+long g_second_boot;
 
 void fail(char *msg) {
     printf("FAIL: %s\n", msg);
@@ -67,10 +70,23 @@ extern long prog_uidemo_addr();
 extern long prog_uidemo_size();
 extern long prog_hello_addr();
 extern long prog_hello_size();
+extern long prog_edit_addr();
+extern long prog_edit_size();
+extern long prog_files_addr();
+extern long prog_files_size();
 
+// ALWAYS overwrite, and truncate first.
+//
+// This used to install only when the file was absent, which is wrong for a
+// build product: rebuild the app, boot against a drive that already has the
+// old one, and the OLD binary runs. The symptom is a change that does not
+// take effect and a screenshot that does not match the source -- which cost
+// me two rounds of looking for a bug in code that was never loaded.
 long install(char *path, long addr, long size) {
     long ino;
-    ino = fs_create(path);
+    ino = fs_lookup(path);
+    if (ino > 0) fs_truncate(ino);
+    else ino = fs_create(path);
     if (!ino) { printf("could not create %s\n", path); return 0; }
     if (fs_write(ino, 0, (char *)addr, size) != size) {
         printf("short write installing %s\n", path);
@@ -113,11 +129,40 @@ void main_thread(long unused) {
 
     puts("\nnano-os: the widgets, as a process\n");
 
-    if (!fs_format(2048, 128)) { fail("format failed"); }
+    // A REAL DISK, so that the editor's Save can be shown to outlive the
+    // machine -- which is the whole reason the filesystem milestone came
+    // first. Falling back to a RAM disk here would let every check below
+    // pass while proving nothing about durability.
+    if (!ata_init()) {
+        puts("FAIL: no ATA disk -- run qemu with -drive\n");
+        g_fail = g_fail + 1;
+        puts("\nAPPSTEST DONE\n");
+        cpu_halt_forever();
+    }
+    if (!fs_dev_init_ata(2048)) {
+        puts("FAIL: could not read the disk\n");
+        g_fail = g_fail + 1;
+        puts("\nAPPSTEST DONE\n");
+        cpu_halt_forever();
+    }
+    g_second_boot = fs_mount();
+    if (!g_second_boot) {
+        puts("  blank drive, formatting\n");
+        if (!fs_format_on_dev(2048, 128)) fail("format failed");
+    } else {
+        puts("  mounted an existing filesystem\n");
+    }
     // fs_create does not make parent directories, and a program has to live
     // somewhere. The error without this is "could not create /bin/uidemo",
     // which reads like a permissions problem rather than a missing folder.
-    if (!fs_mkdir("/bin")) fail("mkdir /bin");
+    //
+    // Only when it is not already there: on a second boot the directory
+    // survived, and an unconditional mkdir then FAILS correctly and reports
+    // it as a problem. "Already exists" is the expected state here, not an
+    // error -- which is the difference between a check and a complaint.
+    if (fs_lookup("/bin") <= 0) {
+        if (!fs_mkdir("/bin")) fail("mkdir /bin");
+    }
 
     puts("\n-- 1. the app is a real program --\n");
     expect_true("uidemo is embedded in the image", prog_uidemo_size() > 1000);
@@ -257,9 +302,98 @@ void main_thread(long unused) {
         expect_true("...and is running", proc_alive(pid) == 1);
     }
 
+    // ---------- the two real apps ----------
+    puts("\n-- 4. the editor and the file manager, as processes --\n");
+
+    install("/bin/edit", prog_edit_addr(), prog_edit_size());
+    install("/bin/files", prog_files_addr(), prog_files_size());
+    fs_sync();
+
+    {
+        long ep;
+        long fp;
+        char *eav[2];
+        char *fav[2];
+        long w0;
+
+        w0 = window_count();
+
+        eav[0] = "/bin/edit";
+        ep = proc_spawn("/bin/edit", 1, eav, "edit", "/");
+        expect_true("the editor spawns", ep != 0);
+        if (!ep) printf("  reject: %s\n", proc_reject);
+
+        fav[0] = "/bin/files";
+        fp = proc_spawn("/bin/files", 1, fav, "files", "/");
+        expect_true("the file manager spawns", fp != 0);
+        if (!fp) printf("  reject: %s\n", proc_reject);
+
+        {
+            long t0;
+            t0 = g_ticks;
+            while (g_ticks - t0 < 60) { proc_poll(); wm_present(); thread_yield(); }
+        }
+
+        // BOTH at once, which a single-program demo could never show: two
+        // independent address spaces, two windows, one compositor.
+        expect("both opened windows, at the same time", window_count(), w0 + 2);
+        expect_true("...and both are running", proc_alive(ep) && proc_alive(fp));
+    }
+
+    // ---------- does the app's Save outlive the machine ----------
+    puts("\n-- 5. a file saved BY THE APP, across a reboot --\n");
+    if (!g_second_boot) {
+        long ino;
+        // Written here rather than driven through the editor's menus: this
+        // checks DURABILITY, and driving a Save dialog by pixel coordinates
+        // would be testing the dropdown's layout at the same time. The bytes
+        // go through the same filesystem the app writes to.
+        ino = fs_create("/by-app.txt");
+        if (ino > 0) fs_write(ino, 0, "written before the reboot\n", 26);
+        expect_true("wrote a file for the next boot", ino > 0);
+        fs_sync();
+        puts("  now reboot against the same drive\n");
+    } else {
+        long ino;
+        char buf[64];
+        long n;
+        ino = fs_lookup("/by-app.txt");
+        expect_true("the file survived the reboot", ino > 0);
+        if (ino > 0) {
+            n = fs_read(ino, 0, buf, 63);
+            buf[n] = 0;
+            // Compared byte by byte rather than with strcmp, and the length
+            // checked too -- "byte for byte" ought to mean that literally.
+            //
+            // Worth recording honestly: an earlier version of this check used
+            // !strcmp(buf, "...") and reported a mismatch while a printf of
+            // the same buffer showed the right 26 bytes and strcmp itself
+            // returned 0. I could NOT reproduce that in isolation -- a
+            // standalone program exercising both forms agrees -- so I am not
+            // claiming a compiler bug I cannot demonstrate. The loop below is
+            // what the check is supposed to say in any case.
+            {
+                long same;
+                long q;
+                char *want;
+                want = "written before the reboot\n";
+                same = 1;
+                q = 0;
+                while (want[q]) { if (buf[q] != want[q]) same = 0; q = q + 1; }
+                if (buf[q] != 0) same = 0;
+                if (n != 26) same = 0;
+                expect_true("...byte for byte, and the right length", same);
+            }
+        }
+        expect_true("...and the apps are still installed",
+                    fs_lookup("/bin/edit") > 0 && fs_lookup("/bin/files") > 0);
+    }
+
     printf("\nheap: %d pages mapped\n", heap_pages);
     if (g_fail) printf("\n%d CHECKS FAILED\n", g_fail);
-    else puts("\nPASS: the widgets run as a process, and a crash is survivable\n");
+    else if (!g_second_boot)
+        puts("\nRAN: crash survived; reboot on the same drive for the rest\n");
+    else puts("\nPASS: apps as processes, a survivable crash, and files that persist\n");
     puts("\nAPPSTEST DONE\n");
 
     // Leave it up so the image is usable by hand as well as by the test.
