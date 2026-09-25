@@ -77,6 +77,8 @@ struct Ui {
     // editor and the file manager; a second concurrent list would need this
     // keyed by id, and that is the moment to change it rather than now.
     long list_top;
+    // First visible ROW of the icon grid.
+    long grid_top;
 
     long id;                   // auto-id counter, reset every frame
     long ox;                   // panel origin, window coordinates
@@ -1009,6 +1011,98 @@ long ed_key(struct Edit *e, long k) {
     return e->caret != before;
 }
 
+// ============================================================
+// scrollbars
+// ============================================================
+//
+// Not a widget the caller places -- a part of every widget that scrolls. A
+// scrollbar you have to remember to add is one that is missing from whichever
+// view got written last, and the caller would have to duplicate the
+// arithmetic that decides where the thumb goes, which is the arithmetic most
+// likely to disagree with the view beside it.
+//
+// So ui_edit, ui_list and ui_icongrid each reserve UI_SB_W down their right
+// edge and call these two. Nothing else has to know.
+
+#define UI_SB_W 10
+
+// The scroll state, as a struct rather than three loose arguments.
+//
+// nano_cc stops at six call arguments, and a scrollbar wants a window rect
+// (four) plus top/total/visible (three) plus the context and an id -- nine.
+// Bundling the three that always travel together is the fix, and it is the
+// better shape anyway: a view's scroll position, its extent and its height
+// are one thing and get passed around as one.
+struct Scroll {
+    long top;        // first visible unit
+    long total;      // units there are
+    long visible;    // units that fit
+};
+
+// Where the thumb sits. Through globals because nano_cc has no out-parameters
+// worth the name and both callers want both numbers.
+long g_sb_y;
+long g_sb_h;
+
+void ui_scroll_geom(long y, long h, struct Scroll *sc) {
+    long th;
+    long top; long total; long visible;
+    top = sc->top; total = sc->total; visible = sc->visible;
+    if (total <= visible || total <= 0) { g_sb_y = y; g_sb_h = h; return; }
+    // Proportional, with a floor: a thumb for a 4000-line file would be one
+    // pixel tall and impossible to grab.
+    th = (h * visible) / total;
+    if (th < 12) th = 12;
+    if (th > h) th = h;
+    g_sb_h = th;
+    g_sb_y = y + ((h - th) * top) / (total - visible);
+    if (g_sb_y < y) g_sb_y = y;
+    if (g_sb_y + th > y + h) g_sb_y = y + h - th;
+}
+
+void ui_scroll_draw(struct Ui *ui, long x, long y, long h, struct Scroll *sc) {
+    long w;
+    w = UI_SB_W;
+    wm_win_fill(ui->win, x, y, w, h, rgb(232, 232, 238));
+    wm_win_frame(ui->win, x, y, w, h, ui->edge);
+    if (sc->total <= sc->visible) return;  // nothing to scroll: track only
+    ui_scroll_geom(y, h, sc);
+    wm_win_fill(ui->win, x + 2, g_sb_y + 1, w - 4, g_sb_h - 2, rgb(150, 150, 165));
+    wm_win_frame(ui->win, x + 2, g_sb_y + 1, w - 4, g_sb_h - 2, ui->edge);
+}
+
+// Handle a press or a drag on the track. Returns the new `top`.
+//
+// Dragging uses ui->active, the same ownership rule as the slider: once the
+// bar owns the pointer it keeps it, so sliding off the side mid-drag does not
+// hand the pointer to whatever is next to it.
+long ui_scroll_input(struct Ui *ui, long id, long x, long y, long h,
+                     struct Scroll *sc) {
+    long on;
+    long top;
+    long total;
+    long visible;
+    top = sc->top; total = sc->total; visible = sc->visible;
+    if (total <= visible) return top;
+    on = ui_hit(ui, x, y, UI_SB_W, h);
+    if (on && ui->mpressed && ui->active < 0) ui->active = id;
+    if (ui->active == id && ui->mdown) {
+        long want;
+        long th;
+        ui_scroll_geom(y, h, sc);
+        th = g_sb_h;
+        // Centre the thumb on the pointer, then convert back to a line.
+        want = ui->my - y - th / 2;
+        if (want < 0) want = 0;
+        if (want > h - th) want = h - th;
+        if (h - th > 0) top = (want * (total - visible)) / (h - th);
+        else top = 0;
+        if (top < 0) top = 0;
+        if (top > total - visible) top = total - visible;
+    }
+    return top;
+}
+
 // The editing area. Returns 1 if this frame changed the buffer or the caret.
 //
 // The state hash is the whole reason this is cheap: it folds the caret, the
@@ -1038,13 +1132,15 @@ long ui_edit(struct Ui *ui, struct Edit *e, long h) {
     focused = (ui->focus == id);
 
     e->rows = (h - 4) / FONT_H;
-    e->cols = (w - 6) / FONT_W;
+    // Minus the scrollbar: the text stops where the bar starts, or the last
+    // column of every long line is drawn underneath it.
+    e->cols = (w - 6 - UI_SB_W) / FONT_W;
     if (e->rows < 1) e->rows = 1;
     if (e->cols < 1) e->cols = 1;
 
     // Clicking inside puts the caret where the click was, which is the one
     // piece of mouse editing worth having before selection exists.
-    if (hot && ui->mpressed) {
+    if (hot && ui->mpressed && ui->mx < ui->x + w - UI_SB_W) {
         long row;
         long col;
         long ln;
@@ -1063,10 +1159,19 @@ long ui_edit(struct Ui *ui, struct Edit *e, long h) {
         if (ed_key(e, ui->key)) changed = 1;
     }
 
+    {
+        struct Scroll sc;
+        long nt;
+        sc.top = e->top; sc.total = e->nlines; sc.visible = e->rows;
+        nt = ui_scroll_input(ui, id + 900, ui->x + w - UI_SB_W, ui->y, h, &sc);
+        if (nt != e->top) { e->top = nt; changed = 1; }
+    }
+
     hash = 5381;
     hash = ((hash * 33) + e->caret) & 0xFFFFFFF;
     hash = ((hash * 33) + e->top) & 0xFFFFFFF;
     hash = ((hash * 33) + e->len) & 0xFFFFFFF;
+    hash = ((hash * 33) + e->nlines) & 0xFFFFFFF;
     r = 0;
     while (r < e->rows && e->top + r < e->nlines) {
         long ln;
@@ -1116,6 +1221,11 @@ long ui_edit(struct Ui *ui, struct Edit *e, long h) {
             if (cl >= e->top && cl < e->top + e->rows)
                 wm_win_fill(ui->win, ui->x + 3 + cc * FONT_W,
                             ui->y + 2 + (cl - e->top) * FONT_H, 1, FONT_H, ui->fg);
+        }
+        {
+            struct Scroll sc;
+            sc.top = e->top; sc.total = e->nlines; sc.visible = e->rows;
+            ui_scroll_draw(ui, ui->x + w - UI_SB_W, ui->y, h, &sc);
         }
     }
     ui_advance_h(ui, w, h);
@@ -1325,13 +1435,21 @@ long ui_list(struct Ui *ui, char *names, long count, long *sel, long h) {
         if (*sel >= ui->list_top + rows) ui->list_top = *sel - rows + 1;
     }
 
-    if (hot && ui->mpressed) {
+    // Not over the scrollbar: a click on the bar scrolls, it does not pick
+    // whatever row happens to be beside the thumb.
+    if (hot && ui->mpressed && ui->mx < ui->x + w - UI_SB_W) {
         long row;
         row = (ui->my - ui->y - 2) / UI_ROW_H;
         if (row >= 0 && ui->list_top + row < count) {
             *sel = ui->list_top + row;
             activated = *sel;
         }
+    }
+    {
+        struct Scroll sc;
+        sc.top = ui->list_top; sc.total = count; sc.visible = rows;
+        ui->list_top = ui_scroll_input(ui, id + 910, ui->x + w - UI_SB_W,
+                                       ui->y, h, &sc);
     }
 
     hash = 5381;
@@ -1358,9 +1476,16 @@ long ui_list(struct Ui *ui, char *names, long count, long *sel, long h) {
             iy = ui->y + 2 + i * UI_ROW_H;
             off = ui_list_name_at(names, idx);
             if (idx == *sel)
-                wm_win_fill(ui->win, ui->x + 1, iy, w - 2, UI_ROW_H, ui->accent);
-            ui_text_clip(ui, ui->x + 3, iy, UI_ROW_H, names + off, w - 6);
+                wm_win_fill(ui->win, ui->x + 1, iy, w - 2 - UI_SB_W, UI_ROW_H,
+                            ui->accent);
+            ui_text_clip(ui, ui->x + 3, iy, UI_ROW_H, names + off,
+                         w - 6 - UI_SB_W);
             i = i + 1;
+        }
+        {
+            struct Scroll sc;
+            sc.top = ui->list_top; sc.total = count; sc.visible = rows;
+            ui_scroll_draw(ui, ui->x + w - UI_SB_W, ui->y, h, &sc);
         }
     }
     ui_advance_h(ui, w, h);
@@ -1426,10 +1551,200 @@ long ui_tabs(struct Ui *ui, char *names, long count, long active) {
     return result;
 }
 
+// ============================================================
+// icons, and a grid of them
+// ============================================================
+//
+// The icons are DRAWN, not loaded. A 32x32 bitmap per file type would be
+// about 4KB of table each, and there is no image loader in this OS yet -- so
+// a folder is a rectangle with a tab on it and a document is a rectangle with
+// a folded corner and some lines, built from wm_win_fill. Crude, and it costs
+// nothing to ship and nothing to store.
+//
+// They are also drawn at a size the caller picks rather than at one fixed
+// size, because a file manager and a file picker want different ones and
+// scaling a bitmap without a resampler looks worse than redrawing a shape.
+
+// 64 wide, not 48. At 48 and an 8px font the label fits five characters, so
+// "readme.txt" renders as "readm" and two files whose names differ after the
+// fifth character are indistinguishable on screen -- which is worse than a
+// wider grid.
+#define ICON_W   64
+#define ICON_H   52          // icon box plus one row of label
+
+// Rows of icons visible and rows there are, worked out once per frame from
+// the width. Globals because they are derived, not state.
+long g_grid_vis;
+long g_grid_rows;
+
+// A folder: a body, and a tab along the top-left of it.
+void ui_icon_folder(struct Ui *ui, long x, long y, long w, long h, long open) {
+    long tabw;
+    long tabh;
+    long body;
+    tabw = w / 2;
+    tabh = h / 5;
+    body = y + tabh;
+    wm_win_fill(ui->win, x, y, tabw, tabh, rgb(196, 160, 64));
+    wm_win_fill(ui->win, x, body, w, h - tabh, rgb(228, 190, 86));
+    wm_win_frame(ui->win, x, body, w, h - tabh, rgb(120, 96, 32));
+    // An open folder gets a lighter mouth, so "which one am I in" is visible
+    // without reading the label.
+    if (open) wm_win_fill(ui->win, x + 3, body + 3, w - 6, h - tabh - 6,
+                          rgb(245, 220, 150));
+}
+
+// A document: a page with the top-right corner folded off, and three lines of
+// pretend text.
+void ui_icon_file(struct Ui *ui, long x, long y, long w, long h) {
+    long fold;
+    long i;
+    fold = w / 3;
+    wm_win_fill(ui->win, x, y, w, h, rgb(248, 248, 252));
+    wm_win_frame(ui->win, x, y, w, h, rgb(130, 130, 145));
+    // The fold: a triangle cut out of the top right, drawn as rows so that no
+    // diagonal-line routine is needed.
+    i = 0;
+    while (i < fold) {
+        wm_win_fill(ui->win, x + w - fold + i, y + i, fold - i, 1, ui->bg);
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 3) {
+        wm_win_fill(ui->win, x + 4, y + h / 2 + i * 5, w - 10, 2,
+                    rgb(170, 170, 185));
+        i = i + 1;
+    }
+}
+
+// A grid of icons. Returns the index CLICKED, or -1; `sel` is in/out.
+//
+// Selection and activation are separate, as in the list box: clicking picks,
+// and the caller decides what a second click on an already-selected item
+// means. There is no double-click timer in this machine and inventing one
+// here would put a clock in a widget.
+long ui_icongrid(struct Ui *ui, char *names, long *kinds, long count,
+                 long *sel, long h) {
+    long id;
+    long w;
+    long cols;
+    long i;
+    long hash;
+    long clicked;
+    long hot;
+
+    id = ui_next_id(ui);
+    w = ui_slot(ui);
+    hot = ui_hit(ui, ui->x, ui->y, w, h);
+    clicked = 0 - 1;
+    cols = (w - UI_SB_W) / ICON_W;
+    if (cols < 1) cols = 1;
+    // Rows of icons that fit, and rows there are -- the units this grid
+    // scrolls in. A grid scrolls by ROW, not by icon, or dragging the bar
+    // shuffles items sideways.
+    {
+        long vis;
+        long tot;
+        vis = h / ICON_H;
+        if (vis < 1) vis = 1;
+        tot = (count + cols - 1) / cols;
+        g_grid_vis = vis;
+        g_grid_rows = tot;
+    }
+
+    if (hot) ui->hot = id;
+    if (ui->mpressed) {
+        if (hot && ui->active < 0) { ui->focus = id; ui->active = id; }
+        else if (!hot && ui->focus == id) ui->focus = -1;
+    }
+
+    if (*sel < 0) *sel = 0;
+    if (*sel >= count) *sel = count - 1;
+
+    if (hot && ui->mpressed && ui->mx < ui->x + w - UI_SB_W) {
+        long cx;
+        long cy;
+        long idx;
+        cx = (ui->mx - ui->x) / ICON_W;
+        cy = (ui->my - ui->y) / ICON_H + ui->grid_top;
+        idx = cy * cols + cx;
+        if (cx >= 0 && cx < cols && cy >= 0 && idx >= 0 && idx < count) {
+            *sel = idx;
+            clicked = idx;
+        }
+    }
+
+    if (ui->focus == id && ui->key) {
+        if (ui->key == KEY_LEFT && *sel > 0) *sel = *sel - 1;
+        else if (ui->key == KEY_RIGHT && *sel < count - 1) *sel = *sel + 1;
+        else if (ui->key == KEY_UP && *sel - cols >= 0) *sel = *sel - cols;
+        else if (ui->key == KEY_DOWN && *sel + cols < count) *sel = *sel + cols;
+        else if (ui->key == '\n' || ui->key == '\r') clicked = *sel;
+        // Follow the selection, the same rule the list box and the editor use.
+        if (*sel / cols < ui->grid_top) ui->grid_top = *sel / cols;
+        if (*sel / cols >= ui->grid_top + g_grid_vis)
+            ui->grid_top = *sel / cols - g_grid_vis + 1;
+    }
+    {
+        struct Scroll sc;
+        sc.top = ui->grid_top; sc.total = g_grid_rows; sc.visible = g_grid_vis;
+        ui->grid_top = ui_scroll_input(ui, id + 920, ui->x + w - UI_SB_W,
+                                       ui->y, h, &sc);
+    }
+    if (ui->grid_top < 0) ui->grid_top = 0;
+
+    hash = 5381;
+    hash = ((hash * 33) + *sel) & 0xFFFFFFF;
+    hash = ((hash * 33) + count) & 0xFFFFFFF;
+    hash = ((hash * 33) + ui->grid_top) & 0xFFFFFFF;
+    i = 0;
+    while (i < count) {
+        long off;
+        hash = ((hash * 33) + kinds[i]) & 0xFFFFFFF;
+        off = ui_list_name_at(names, i);
+        while (names[off]) { hash = ((hash * 33) + (names[off] & 255)) & 0xFFFFFFF; off = off + 1; }
+        i = i + 1;
+    }
+
+    if (ui_paint(ui, id, hash)) {
+        wm_win_fill(ui->win, ui->x, ui->y, w, h, rgb(255, 255, 255));
+        wm_win_frame(ui->win, ui->x, ui->y, w, h, ui->edge);
+        i = 0;
+        while (i < count) {
+            long cx;
+            long cy;
+            long ix;
+            long iy;
+            long off;
+            cx = i % cols;
+            cy = i / cols - ui->grid_top;
+            if (cy < 0) { i = i + 1; continue; }
+            ix = ui->x + cx * ICON_W;
+            iy = ui->y + cy * ICON_H;
+            if (iy + ICON_H > ui->y + h) { i = count; continue; }   // clipped
+            if (i == *sel)
+                wm_win_fill(ui->win, ix, iy, ICON_W - 2, ICON_H - 2, ui->accent);
+            if (kinds[i]) ui_icon_folder(ui, ix + 20, iy + 4, 24, 22, 0);
+            else          ui_icon_file(ui, ix + 22, iy + 4, 20, 24);
+            off = ui_list_name_at(names, i);
+            ui_text_clip(ui, ix + 2, iy + 30, FONT_H + 4, names + off, ICON_W - 6);
+            i = i + 1;
+        }
+        {
+            struct Scroll sc;
+            sc.top = ui->grid_top; sc.total = g_grid_rows; sc.visible = g_grid_vis;
+            ui_scroll_draw(ui, ui->x + w - UI_SB_W, ui->y, h, &sc);
+        }
+    }
+    ui_advance_h(ui, w, h);
+    return clicked;
+}
+
 void ui_init(struct Ui *ui) {
     ui->menu_open = UI_MENU_NONE;
     ui->swallow = 0;
     ui->list_top = 0;
+    ui->grid_top = 0;
     ui->always = 0;
     ui->skipped = 0;
     ui->ovwin = -1;

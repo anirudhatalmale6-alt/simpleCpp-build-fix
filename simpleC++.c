@@ -885,6 +885,18 @@ static Node *parse_primary(void) {
         if (eat(T_LP)) {                       // function call
             Node *n = new_node(N_CALL); snprintf(n->name, sizeof(n->name), "%s", nm);
             while (!at(T_RP)) {
+                /* The bound, checked HERE and not only at codegen.
+                   n->args is Node*[8] and this loop had no limit, so a call
+                   with nine or more arguments wrote past the end of the Node
+                   and the compiler segfaulted -- while seven or eight gave
+                   the clean "more than 6 call arguments" error from the code
+                   generator, because they still fit the array. The message a
+                   caller got therefore depended on HOW FAR over the limit
+                   they were, which is the least useful possible behaviour.
+                   Same shape as add_tok: the check existed downstream of the
+                   write that overflows. */
+                if (n->nargs >= (int)(sizeof n->args / sizeof n->args[0]))
+                    die("more than 6 call arguments is not supported yet");
                 n->args[n->nargs++] = parse_assign();
                 if (!eat(T_COMMA)) break;
             }

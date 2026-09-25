@@ -203,3 +203,11 @@ edit64.bin
 edit-disk.img
 edit-boot1.log
 edit-boot2.log
+blob-files.s
+files.s
+files.elf
+files64.elf
+files64.bin
+files-disk.img
+files-boot1.log
+files-boot2.log

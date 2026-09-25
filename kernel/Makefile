@@ -712,6 +712,57 @@ srvtest: srv.elf
 # fsdisk -- the filesystem on a real ATA disk. Built like every other image,
 # but it is the only one that needs a DRIVE attached, and the only one whose
 # result depends on what a previous run left behind.
+# files -- the file manager. Needs a DRIVE, like edit and fsdisk.
+files.s: files.c nano-kernel.h nano-fb.h nano-mouse.h nano-int.h nano-mm.h \
+         nano-thread.h nano-ata.h nano-fs.h nano-wm.h nano-wmin.h nano-term.h \
+         nano-ui.h $(NANO)
+	$(NANO) --kernel files.c files.s
+
+files64.bin: boot64.s isr.s files.s kernel64.ld
+	as --64 boot64.s -o boot64.o
+	as --64 isr.s    -o isr.o
+	as --64 files.s  -o files.o
+	ld -T kernel64.ld -o files64.elf boot64.o isr.o files.o
+	objcopy -O binary files64.elf files64.bin
+
+blob-files.s:
+	@printf '.section .blob, "a"\n.incbin "files64.bin"\n' > $@
+
+files.elf: boot32.s blob-files.s files64.bin final.ld
+	as --32 boot32.s     -o boot32.o
+	as --32 blob-files.s -o blob-files.o
+	ld -m elf_i386 -T final.ld -o files.elf boot32.o blob-files.o
+
+files: files.elf
+
+files-disk.img:
+	dd if=/dev/zero of=files-disk.img bs=1M count=8 2>/dev/null
+
+filesrun: files.elf files-disk.img
+	$(QEMU) -kernel files.elf -no-reboot \
+	  -drive file=files-disk.img,format=raw,if=ide
+
+filestest: files.elf
+	@rm -f files-disk.img files-boot1.log files-boot2.log
+	@dd if=/dev/zero of=files-disk.img bs=1M count=8 2>/dev/null
+	@echo "--- boot 1: blank drive"
+	@timeout 220 $(QEMU) -kernel files.elf -no-reboot -display none \
+	   -serial file:files-boot1.log \
+	   -drive file=files-disk.img,format=raw,if=ide >/dev/null 2>&1; true
+	@echo "--- boot 2: same drive, the folder must still be there"
+	@timeout 220 $(QEMU) -kernel files.elf -no-reboot -display none \
+	   -serial file:files-boot2.log \
+	   -drive file=files-disk.img,format=raw,if=ide >/dev/null 2>&1; true
+	@tr -d '\r' < files-boot1.log
+	@tr -d '\r' < files-boot2.log
+	@fail=0; \
+	grep -q "FIRST BOOT" files-boot1.log || { echo "FAIL: boot 1 not from a blank drive"; fail=1; }; \
+	grep -q "LATER BOOT" files-boot2.log || { echo "FAIL: boot 2 did not find the folder"; fail=1; }; \
+	grep -q "CHECKS FAILED" files-boot1.log && { echo "FAIL: boot 1 had failures"; fail=1; }; \
+	grep -q "CHECKS FAILED" files-boot2.log && { echo "FAIL: boot 2 had failures"; fail=1; }; \
+	if [ $$fail -eq 0 ]; then echo "PASS: made a folder, rebooted, it was still there"; \
+	else echo "FILES SEQUENCE FAILED"; exit 1; fi
+
 # edit -- the text editor. Needs a DRIVE, like fsdisk, because saving to a
 # disk that outlives the machine is the point of it.
 edit.s: edit.c nano-kernel.h nano-fb.h nano-mouse.h nano-int.h nano-mm.h \

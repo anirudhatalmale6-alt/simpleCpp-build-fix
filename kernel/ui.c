@@ -673,6 +673,73 @@ void event_loop() {
     }
 }
 
+
+// ============================================================
+// scrollbars: the geometry, not the pixels
+// ============================================================
+//
+// A screenshot of a scrollbar shows a grey rectangle in roughly the right
+// place, and roughly is exactly what is wrong with checking it that way. The
+// thumb's position and size are arithmetic and the arithmetic is assertable,
+// so it is asserted.
+void test_scrollbar() {
+    struct Scroll sc;
+
+    puts("\n-- scrollbars --\n");
+
+    // Nothing to scroll: the thumb fills the track, and there is no division
+    // by (total - visible) to go wrong.
+    sc.top = 0; sc.total = 10; sc.visible = 10;
+    ui_scroll_geom(100, 200, &sc);
+    expect("nothing to scroll: the thumb fills the track", g_sb_h, 200);
+    expect("...and sits at the top", g_sb_y, 100);
+
+    // Half the content visible, scrolled to the top.
+    sc.top = 0; sc.total = 40; sc.visible = 20;
+    ui_scroll_geom(0, 200, &sc);
+    expect("half visible: the thumb is half the track", g_sb_h, 100);
+    expect("...at the top when top is 0", g_sb_y, 0);
+
+    // Scrolled to the bottom: the thumb must END flush with the track, not
+    // start flush with it. Getting this wrong leaves a gap at the bottom that
+    // says "there is more" when there is not.
+    sc.top = 20; sc.total = 40; sc.visible = 20;
+    ui_scroll_geom(0, 200, &sc);
+    expect("scrolled to the end, the thumb ends flush", g_sb_y + g_sb_h, 200);
+
+    // A long file: the proportional thumb would be sub-pixel, so a floor
+    // applies. Without it the thumb is impossible to grab.
+    sc.top = 0; sc.total = 4000; sc.visible = 30;
+    ui_scroll_geom(0, 200, &sc);
+    expect_true("a 4000-line file still gets a grabbable thumb", g_sb_h >= 12);
+    expect_true("...and not a whole-track one", g_sb_h < 200);
+
+    // And with the floor applied, the bottom must STILL be flush -- this is
+    // the case where a naive (h * top / total) puts the thumb off the end.
+    sc.top = 4000 - 30; sc.total = 4000; sc.visible = 30;
+    ui_scroll_geom(0, 200, &sc);
+    expect("...and at the end it is still flush", g_sb_y + g_sb_h, 200);
+    expect_true("...and has not run past the track", g_sb_y + g_sb_h <= 200);
+
+    // Monotonic: scrolling down never moves the thumb up.
+    {
+        long prev;
+        long i;
+        long bad;
+        bad = 0;
+        prev = 0 - 1;
+        i = 0;
+        while (i <= 3970) {
+            sc.top = i; sc.total = 4000; sc.visible = 30;
+            ui_scroll_geom(0, 200, &sc);
+            if (g_sb_y < prev) bad = bad + 1;
+            prev = g_sb_y;
+            i = i + 10;
+        }
+        expect("the thumb never moves backwards as you scroll forwards", bad, 0);
+    }
+}
+
 void run_tests() {
     printf("FB: %dx%d at %d bpp\n", fb_width, fb_height, fb_bpp);
     printf("a full repaint is %d pixels\n", wm_screen_pixels());
@@ -683,6 +750,7 @@ void run_tests() {
     test_text();
     test_damage();
     test_ids();
+    test_scrollbar();
 
     printf("\nheap: %d pages mapped, %d bytes free\n", heap_pages, heap_bytes_free());
 
