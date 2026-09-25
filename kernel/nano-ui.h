@@ -864,6 +864,10 @@ struct Edit {
     long dirty;                // edited since the last save
     long rows;                 // visible rows, set by the widget each frame
     long cols;
+    // Show a line-number gutter. Off by default, because a widget that
+    // changes its own text area depending on a flag the caller did not set
+    // is a surprise.
+    long nums;
     // Line starts, recomputed each frame. line[i] is the offset of the first
     // byte of line i; nlines is how many there are. Always at least one line,
     // because an empty buffer still has a place to type.
@@ -881,6 +885,7 @@ void ed_init(struct Edit *e, char *storage) {
     e->dirty = 0;
     e->rows = 1;
     e->cols = 1;
+    e->nums = 0;
     e->nlines = 1;
     i = 0;
     while (i < ED_MAXLN) { e->line[i] = 0; i = i + 1; }
@@ -1103,6 +1108,21 @@ long ui_scroll_input(struct Ui *ui, long id, long x, long y, long h,
     return top;
 }
 
+// How wide the line-number gutter is, in pixels, for a buffer of this many
+// lines. Sized to the LARGEST number it will show rather than to a constant:
+// a 4-digit gutter on a 12-line file wastes a fifth of a narrow window, and a
+// fixed 3-digit one starts overlapping the text at line 1000.
+long ui_gutter_w(struct Edit *e) {
+    long digits;
+    long n;
+    if (!e->nums) return 0;
+    digits = 1;
+    n = e->nlines;
+    while (n >= 10) { n = n / 10; digits = digits + 1; }
+    if (digits < 2) digits = 2;
+    return digits * FONT_W + 6;
+}
+
 // The editing area. Returns 1 if this frame changed the buffer or the caret.
 //
 // The state hash is the whole reason this is cheap: it folds the caret, the
@@ -1134,7 +1154,7 @@ long ui_edit(struct Ui *ui, struct Edit *e, long h) {
     e->rows = (h - 4) / FONT_H;
     // Minus the scrollbar: the text stops where the bar starts, or the last
     // column of every long line is drawn underneath it.
-    e->cols = (w - 6 - UI_SB_W) / FONT_W;
+    e->cols = (w - 6 - UI_SB_W - ui_gutter_w(e)) / FONT_W;
     if (e->rows < 1) e->rows = 1;
     if (e->cols < 1) e->cols = 1;
 
@@ -1145,7 +1165,7 @@ long ui_edit(struct Ui *ui, struct Edit *e, long h) {
         long col;
         long ln;
         row = (ui->my - ui->y - 2) / FONT_H;
-        col = (ui->mx - ui->x - 3) / FONT_W;
+        col = (ui->mx - ui->x - 3 - ui_gutter_w(e)) / FONT_W;
         if (row < 0) row = 0;
         if (col < 0) col = 0;
         ln = e->top + row;
@@ -1172,6 +1192,7 @@ long ui_edit(struct Ui *ui, struct Edit *e, long h) {
     hash = ((hash * 33) + e->top) & 0xFFFFFFF;
     hash = ((hash * 33) + e->len) & 0xFFFFFFF;
     hash = ((hash * 33) + e->nlines) & 0xFFFFFFF;
+    hash = ((hash * 33) + e->nums) & 0xFFFFFFF;
     r = 0;
     while (r < e->rows && e->top + r < e->nlines) {
         long ln;
@@ -1187,7 +1208,13 @@ long ui_edit(struct Ui *ui, struct Edit *e, long h) {
     }
 
     if (ui_paint(ui, id, (hash << 2) + (focused ? 2 : 0))) {
+        long gw;
+        gw = ui_gutter_w(e);
         wm_win_fill(ui->win, ui->x, ui->y, w, h, rgb(255, 255, 255));
+        if (gw) {
+            wm_win_fill(ui->win, ui->x, ui->y, gw, h, rgb(242, 242, 246));
+            wm_win_fill(ui->win, ui->x + gw - 1, ui->y, 1, h, ui->edge);
+        }
         wm_win_frame(ui->win, ui->x, ui->y, w, h,
                      focused ? ui->accent : ui->edge);
         r = 0;
@@ -1207,9 +1234,29 @@ long ui_edit(struct Ui *ui, struct Edit *e, long h) {
             // of the text that can disagree with the first.
             save = e->buf[st + n];
             e->buf[st + n] = 0;
-            ui_text_clip(ui, ui->x + 3, ui->y + 2 + r * FONT_H - (UI_ROW_H - FONT_H) / 2,
-                         UI_ROW_H, e->buf + st, w - 6);
+            ui_text_clip(ui, ui->x + 3 + gw,
+                         ui->y + 2 + r * FONT_H - (UI_ROW_H - FONT_H) / 2,
+                         UI_ROW_H, e->buf + st, w - 6 - gw);
             e->buf[st + n] = save;
+            if (gw) {
+                // Right-aligned, the way every editor does it, so the digits
+                // line up against the text instead of against the margin.
+                char num[12];
+                long v;
+                long d;
+                long k;
+                v = ln + 1;
+                d = 0;
+                while (v > 0 && d < 11) { num[d] = '0' + (v % 10); v = v / 10; d = d + 1; }
+                if (d == 0) { num[0] = '0'; d = 1; }
+                k = 0;
+                while (k < d) {
+                    wm_win_glyph(ui->win, ui->x + 3 + (d - 1 - k) * FONT_W,
+                                 ui->y + 2 + r * FONT_H, num[k],
+                                 rgb(150, 150, 165));
+                    k = k + 1;
+                }
+            }
             r = r + 1;
         }
         if (focused) {
@@ -1219,7 +1266,7 @@ long ui_edit(struct Ui *ui, struct Edit *e, long h) {
             cc = e->caret - e->line[cl];
             if (cc > e->cols) cc = e->cols;
             if (cl >= e->top && cl < e->top + e->rows)
-                wm_win_fill(ui->win, ui->x + 3 + cc * FONT_W,
+                wm_win_fill(ui->win, ui->x + 3 + gw + cc * FONT_W,
                             ui->y + 2 + (cl - e->top) * FONT_H, 1, FONT_H, ui->fg);
         }
         {

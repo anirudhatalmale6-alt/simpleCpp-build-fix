@@ -740,6 +740,36 @@ void test_scrollbar() {
     }
 }
 
+
+// The line-number gutter sizes itself to the largest number it will show.
+void test_gutter() {
+    struct Edit e;
+    static char buf[ED_CAP];
+
+    puts("\n-- the line-number gutter --\n");
+
+    ed_init(&e, buf);
+    expect("off by default, it costs nothing", ui_gutter_w(&e), 0);
+
+    e.nums = 1;
+    expect("an empty buffer still reserves two digits", ui_gutter_w(&e), 2 * FONT_W + 6);
+
+    // Grow past ten and past a hundred lines and watch it widen ONCE each
+    // time, rather than at some constant.
+    {
+        long i;
+        i = 0;
+        while (i < 9) { ed_key(&e, '\n'); i = i + 1; }
+        expect("ten lines still fits two digits", ui_gutter_w(&e), 2 * FONT_W + 6);
+        ed_key(&e, '\n');
+        expect("eleven lines needs no more either", ui_gutter_w(&e), 2 * FONT_W + 6);
+        while (e.nlines < 100) ed_key(&e, '\n');
+        expect("a hundred lines needs three", ui_gutter_w(&e), 3 * FONT_W + 6);
+        while (e.nlines < 1000) ed_key(&e, '\n');
+        expect("a thousand needs four", ui_gutter_w(&e), 4 * FONT_W + 6);
+    }
+}
+
 void run_tests() {
     printf("FB: %dx%d at %d bpp\n", fb_width, fb_height, fb_bpp);
     printf("a full repaint is %d pixels\n", wm_screen_pixels());
@@ -751,6 +781,7 @@ void run_tests() {
     test_damage();
     test_ids();
     test_scrollbar();
+    test_gutter();
 
     printf("\nheap: %d pages mapped, %d bytes free\n", heap_pages, heap_bytes_free());
 

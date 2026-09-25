@@ -160,8 +160,13 @@ void rebuild_tabnames() {
 }
 
 long new_tab() {
+    long inherit;
     if (g_ntabs >= MAXTABS) { set_status("no free tab"); return 0 - 1; }
+    // Inherit the gutter setting from the tab in front, or turning it on once
+    // is undone by every File > New.
+    inherit = (g_ntabs > 0) ? g_ed[g_tab].nums : 0;
     ed_init(&g_ed[g_ntabs], g_edbuf + g_ntabs * ED_CAP);
+    g_ed[g_ntabs].nums = inherit;
     g_paths[g_ntabs * 64] = 0;
     g_ntabs = g_ntabs + 1;
     g_tab = g_ntabs - 1;
@@ -205,7 +210,12 @@ long load_into_tab(long t, char *path) {
     if (ino <= 0) { set_status("no such file"); return 0; }
     n = fs_size(ino);
     if (n > ED_CAP - 1) n = ED_CAP - 1;
-    ed_init(&g_ed[t], g_edbuf + t * ED_CAP);
+    {
+        long keep;
+        keep = g_ed[t].nums;
+        ed_init(&g_ed[t], g_edbuf + t * ED_CAP);
+        g_ed[t].nums = keep;
+    }
     if (n > 0) fs_read(ino, 0, g_ed[t].buf, n);
     g_ed[t].buf[n] = 0;
     g_ed[t].len = n;
@@ -244,8 +254,8 @@ long save_tab(long t, char *path) {
 // No function pointers, so this is a table and a switch, the same shape as
 // the display-list opcodes.
 char *g_menu_tops[3];
-char *g_menu_items[9];
-long  g_menu_owner[9];
+char *g_menu_items[10];
+long  g_menu_owner[10];
 
 #define M_NEW   0
 #define M_OPEN  1
@@ -256,6 +266,7 @@ long  g_menu_owner[9];
 #define M_HOME  6
 #define M_END   7
 #define M_ABOUT 8
+#define M_NUMS  9
 
 void menus_init() {
     g_menu_tops[0] = "File";
@@ -270,6 +281,7 @@ void menus_init() {
     g_menu_items[M_HOME]   = "Top";      g_menu_owner[M_HOME]   = 1;
     g_menu_items[M_END]    = "Bottom";   g_menu_owner[M_END]    = 1;
     g_menu_items[M_ABOUT]  = "About";    g_menu_owner[M_ABOUT]  = 2;
+    g_menu_items[M_NUMS]   = "Line Numbers"; g_menu_owner[M_NUMS] = 1;
 }
 
 void do_menu(long item) {
@@ -293,6 +305,12 @@ void do_menu(long item) {
         ed_scroll_to_caret(&g_ed[g_tab]);
     }
     else if (item == M_ABOUT) set_status("nano-os editor");
+    else if (item == M_NUMS) {
+        // Per TAB, not global: one file open at line 4000 wants numbers and
+        // the scratch buffer beside it does not.
+        g_ed[g_tab].nums = !g_ed[g_tab].nums;
+        set_status(g_ed[g_tab].nums ? "line numbers on" : "line numbers off");
+    }
 }
 
 // ---------- one frame of interface ----------
@@ -306,7 +324,7 @@ void frame_ui() {
 
     ui_begin(&g_ui, g_winh, WM_BORDER + 6, WM_TITLE_H + 6, PANW);
 
-    chosen = ui_menubar(&g_ui, g_menu_tops, 3, g_menu_items, g_menu_owner, 9);
+    chosen = ui_menubar(&g_ui, g_menu_tops, 3, g_menu_items, g_menu_owner, 10);
     do_menu(chosen);
 
     if (g_modal == MODAL_NONE) {
@@ -705,6 +723,10 @@ void main_thread(long unused) {
     // an empty editor rather than the last assertion's leftovers.
     g_ntabs = 0;
     new_tab();
+    // On by default, and set HERE rather than before run_tests -- the tests
+    // reset the tab table, so anything set earlier is wiped before the window
+    // ever opens. Found by screenshotting and seeing no gutter.
+    g_ed[0].nums = 1;
     set_status("ready");
     fs_sync();
 
