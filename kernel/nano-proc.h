@@ -1026,6 +1026,8 @@ long proc_wait(long pid) {
 // SYS_PIPE(out) -> 0, writing two descriptors into out[0] (read) and out[1]
 // (write). Two at once because a pipe with only one end is not a pipe.
 #define SYS_PIPE     27
+#define SYS_DUP      28
+#define SYS_DUP2     29
 
 // The window calls. Numbers exist whether or not a window manager was
 // compiled in; the IMPLEMENTATIONS are behind #ifdef NANO_WM_H and every one
@@ -1534,6 +1536,65 @@ long syscall_dispatch(long nr, long a, long b, long c, long d, long e) {
             }
         }
         return pid;
+    }
+
+    // dup and dup2 -- a second NAME for the same open thing.
+    //
+    // A shell needs these to redirect a BUILTIN: it has no child to set up, so
+    // it saves its own fd 1 with dup(), points fd 1 at the file with dup2(),
+    // runs the builtin, and puts fd 1 back. Without them the only redirectable
+    // thing is a spawned program, whose descriptors are chosen by the spawn.
+    //
+    // The position is COPIED, not shared. Real dup2 gives both descriptors one
+    // file offset, so a write through either advances both; here they start
+    // level and then drift apart. Every use in a shell closes one of the pair
+    // immediately, so the difference does not arise -- but it IS a difference,
+    // and sharing it would need the fd table to hold a pointer to an open-file
+    // object rather than the offset itself.
+    if (nr == SYS_DUP2) {
+        if (slot < 0) return -1;
+        if (a < 0 || a >= MAX_FDS || b < 0 || b >= MAX_FDS) return -1;
+        if (g_procs[slot].fd_kind[a] == FD_NONE) return -1;
+        if (a == b) return b;
+
+        // The destination is closed first, exactly as dup2 promises. Skipping
+        // this would leak a pipe end: the reference stays counted and the
+        // buffer is never freed.
+        if (g_procs[slot].fd_kind[b] == FD_PIPE_R || g_procs[slot].fd_kind[b] == FD_PIPE_W)
+            pipe_release(g_procs[slot].fd_ino[b], g_procs[slot].fd_kind[b]);
+
+        g_procs[slot].fd_kind[b] = g_procs[slot].fd_kind[a];
+        g_procs[slot].fd_ino[b]  = g_procs[slot].fd_ino[a];
+        g_procs[slot].fd_pos[b]  = g_procs[slot].fd_pos[a];
+
+        // The copy is a new reference to the same pipe end.
+        if (g_procs[slot].fd_kind[a] == FD_PIPE_R)
+            g_pipe_readers[g_procs[slot].fd_ino[a]] = g_pipe_readers[g_procs[slot].fd_ino[a]] + 1;
+        if (g_procs[slot].fd_kind[a] == FD_PIPE_W)
+            g_pipe_writers[g_procs[slot].fd_ino[a]] = g_pipe_writers[g_procs[slot].fd_ino[a]] + 1;
+        return b;
+    }
+
+    if (nr == SYS_DUP) {
+        long fd;
+        if (slot < 0) return -1;
+        if (a < 0 || a >= MAX_FDS) return -1;
+        if (g_procs[slot].fd_kind[a] == FD_NONE) return -1;
+        fd = 3;
+        while (fd < MAX_FDS) {
+            if (g_procs[slot].fd_kind[fd] == FD_NONE) {
+                g_procs[slot].fd_kind[fd] = g_procs[slot].fd_kind[a];
+                g_procs[slot].fd_ino[fd]  = g_procs[slot].fd_ino[a];
+                g_procs[slot].fd_pos[fd]  = g_procs[slot].fd_pos[a];
+                if (g_procs[slot].fd_kind[a] == FD_PIPE_R)
+                    g_pipe_readers[g_procs[slot].fd_ino[a]] = g_pipe_readers[g_procs[slot].fd_ino[a]] + 1;
+                if (g_procs[slot].fd_kind[a] == FD_PIPE_W)
+                    g_pipe_writers[g_procs[slot].fd_ino[a]] = g_pipe_writers[g_procs[slot].fd_ino[a]] + 1;
+                return fd;
+            }
+            fd = fd + 1;
+        }
+        return -1;
     }
 
     if (nr == SYS_PIPE) {

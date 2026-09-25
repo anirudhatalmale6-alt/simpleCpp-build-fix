@@ -80,6 +80,8 @@ extern long prog_cat_addr();
 extern long prog_cat_size();
 extern long prog_bulk_addr();
 extern long prog_bulk_size();
+extern long prog_msh_addr();
+extern long prog_msh_size();
 
 // ALWAYS overwrite, and truncate first.
 //
@@ -430,6 +432,7 @@ void main_thread(long unused) {
     install("/bin/sh", prog_sh_addr(), prog_sh_size());
     install("/bin/cat", prog_cat_addr(), prog_cat_size());
     install("/bin/bulk", prog_bulk_addr(), prog_bulk_size());
+    install("/bin/msh", prog_msh_addr(), prog_msh_size());
     fs_sync();
 
     // Re-read the file written earlier in THIS boot, now that three more
@@ -659,6 +662,78 @@ void main_thread(long unused) {
                             proc_running(sp) == 1);
             }
         }
+    }
+
+    // ---------- the CLIENT'S miniShell, ported ----------
+    //
+    // Not the 200-line parser in user/sh.c -- this is his own 5554-line
+    // main.c, compiled by nano_cc and running as a process. Driven with -c
+    // rather than interactively because a console read here returns
+    // end-of-file by design; a script or -c is how it takes input.
+    puts("\n-- 8. the ported miniShell --\n");
+    {
+        long mp;
+        char *mav[4];
+        long ino;
+
+        expect_true("msh is installed", fs_lookup("/bin/msh") > 0);
+
+        // A BUILTIN with a redirection. This is the case that needed dup2:
+        // echo runs inside the shell itself, so there is no child whose
+        // descriptors the spawn could have set.
+        mav[0] = "msh";
+        mav[1] = "-c";
+        mav[2] = "echo ported > /msh1.txt";
+        mav[3] = 0;
+        mp = proc_spawn("/bin/msh", 3, mav, "msh", "/");
+        if (mp) {
+            long t1;
+            t1 = g_ticks;
+            while (g_ticks - t1 < 300 && proc_running(mp)) {
+                proc_poll(); wm_present(); thread_yield();
+            }
+        }
+        expect_true("it ran a builtin with a redirection", mp != 0);
+        ino = fs_lookup("/msh1.txt");
+        expect_true("...and wrote the file", ino > 0 && fs_size(ino) > 0);
+        if (ino > 0) {
+            char mb[64];
+            long mn;
+            mn = fs_read(ino, 0, mb, 63);
+            if (mn < 0) mn = 0;
+            mb[mn] = 0;
+            printf("  /msh1.txt holds %d bytes: %s", mn, mb);
+            expect_true("...and it says what echo was given",
+                        mn >= 6 && mb[0] == 'p' && mb[1] == 'o');
+        }
+
+        // A PIPELINE through his shell, between two external programs.
+        mav[0] = "msh";
+        mav[1] = "-c";
+        mav[2] = "hello | cat > /msh2.txt";
+        mav[3] = 0;
+        mp = proc_spawn("/bin/msh", 3, mav, "msh", "/");
+        if (mp) {
+            long t2;
+            t2 = g_ticks;
+            while (g_ticks - t2 < 400 && proc_running(mp)) {
+                proc_poll(); wm_present(); thread_yield();
+            }
+        }
+        ino = fs_lookup("/msh2.txt");
+        expect_true("a PIPELINE through the ported shell", ino > 0 && fs_size(ino) > 0);
+        if (ino > 0) {
+            char pb2[96];
+            long pn2;
+            pn2 = fs_read(ino, 0, pb2, 95);
+            if (pn2 < 0) pn2 = 0;
+            pb2[pn2] = 0;
+            printf("  /msh2.txt holds %d bytes: %s", pn2, pb2);
+            expect_true("...and it is hello's output, through cat",
+                        pn2 > 10 && pb2[0] == 'h' && pb2[1] == 'e');
+        }
+
+        expect_true("...and the machine is still up", g_ticks > 0);
     }
 
     printf("\nheap: %d pages mapped\n", heap_pages);

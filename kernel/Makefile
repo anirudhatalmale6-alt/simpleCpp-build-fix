@@ -19,7 +19,7 @@ QEMU   := qemu-system-x86_64
 # tree, and a perfectly good build on the second attempt.
 UPROGS := user/hello.elf user/twin.elf user/wild.elf user/cc.elf user/as.elf \
           user/uidemo.elf user/edit.elf user/files.elf user/sh.elf \
-          user/cat.elf user/bulk.elf
+          user/cat.elf user/bulk.elf user/msh.elf
 QFLAGS := -kernel kernel.elf -no-reboot
 
 # No built-in rules.
@@ -763,6 +763,18 @@ appstest: apps.elf
 	grep -q "the file survived the reboot" apps-boot2.log || { echo "FAIL: boot 2 did not check persistence"; fail=1; }; \
 	if [ $$fail -eq 0 ]; then echo "PASS: apps, a survivable crash, and persistence"; \
 	else echo "APPS SEQUENCE FAILED"; exit 1; fi
+
+# msh -- the client's miniShell, ported.
+#
+# Built like user/cc.elf rather than like the other programs: main.c is HIS
+# source, with its POSIX #includes intact, and the build stages a copy with
+# those includes replaced by msh-compat.h. Keeping it that way means his file
+# stays diffable against upstream instead of becoming a fork of it.
+user/msh.elf: user/msh/minishell.c user/msh/msh-compat.h user/msh/build.sh \
+              ../nano-libc.h user/os-base.h user/ustart.o user/user.ld $(NANO)
+	user/msh/build.sh
+	as --64 user/mshbuild/msh.s -o user/mshbuild/msh.o
+	ld -T user/user.ld -z max-page-size=0x1000 -o $@ user/ustart.o user/mshbuild/msh.o
 
 # fsdisk -- the filesystem on a real ATA disk. Built like every other image,
 # but it is the only one that needs a DRIVE attached, and the only one whose

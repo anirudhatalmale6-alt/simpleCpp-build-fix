@@ -65,6 +65,13 @@ p_bulk:
     .incbin "user/bulk.elf"
 p_bulk_end:
 
+/* The client's miniShell, ported. 194 KB -- the second largest thing in the
+ * image after the C compiler. */
+.align 16
+p_msh:
+    .incbin "user/msh.elf"
+p_msh_end:
+
 /* The C compiler. 131 KB, which is most of this image -- and 19.6 MB before
  * nano_cc learned to leave uninitialised globals in .bss instead of writing
  * their zero bytes into the object. */
@@ -276,6 +283,16 @@ prog_bulk_addr:
 .globl prog_bulk_size
 prog_bulk_size:
     mov $(p_bulk_end - p_bulk), %rax
+    ret
+
+.globl prog_msh_addr
+prog_msh_addr:
+    lea p_msh(%rip), %rax
+    ret
+
+.globl prog_msh_size
+prog_msh_size:
+    mov $(p_msh_end - p_msh), %rax
     ret
 
 .globl prog_cc_addr
